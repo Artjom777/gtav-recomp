@@ -1,6 +1,6 @@
-# GTA V (Xbox 360, TU27) static recompilation on Linux
+# GTA V (Xbox 360, TU27) static recompilation
 
-Native Linux build of GTA V's Xbox 360 executable, statically recompiled with
+Native build of GTA V's Xbox 360 executable (Linux first, other platforms planned), statically recompiled with
 [ReXGlue](https://github.com/rexglue/rexglue-sdk) v0.10.0. No game files or generated code
 are in this repo; you need your own copy of the game.
 
