@@ -1,0 +1,15 @@
+# Game files and anything derived from them stay local (copyrighted).
+gtav/assets/
+gtav/generated/
+derive/*.bin
+tools/scripttools/*.dis
+tools/scripttools/*.code
+tools/scripttools/dl/
+tools/scripttools/bk
+tools/scripttools/scan
+# Build output, logs, the SDK checkout (our changes live in rexglue-sdk-gtav-linux.patch).
+build/
+logs/
+rexglue-sdk/
+*.log
+__pycache__/
