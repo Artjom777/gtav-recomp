@@ -364,6 +364,7 @@ struct Backend::Impl {
   std::unordered_map<uint64_t, std::shared_ptr<PipelineJob>> pending_pipelines;
   PipelineCompiler pipeline_compiler;
   std::unordered_map<uint64_t, RenderTarget> targets;
+  std::unordered_set<uint64_t> depth_formats_seen;  // diagnostic log of depth target variants
   RenderCommandList* grow_list = nullptr;  // the frame's command list (Target copies grown targets on it)
   uint32_t grow_logged_ = 0;
   std::unordered_map<uint64_t, std::unique_ptr<RenderFramebuffer>> framebuffers;
@@ -805,6 +806,14 @@ struct Backend::Impl {
 
   RenderTarget* Target(uint32_t base, uint32_t format, bool depth, uint32_t pitch, uint32_t msaa, uint32_t height) {
     if (!depth) format = StorageFormat(format);
+    // Depth: D24S8 and D24FS8 at one EDRAM base are the same memory (and one host format here), so
+    // they share a target; keyed apart, a pass naming the other format tested an empty depth buffer.
+    if (depth) {
+      uint64_t seen = uint64_t(base) | uint64_t(format) << 12 | uint64_t(pitch) << 17 | uint64_t(msaa) << 31;
+      if (depth_formats_seen.insert(seen).second && depth_formats_seen.size() <= 40)
+        REXLOG_INFO("[native] depth target base {:03X} pitch {} msaa {} float24 {}", base, pitch, msaa, format);
+      format = 0;
+    }
     uint64_t key = uint64_t(base) | uint64_t(format) << 12 | uint64_t(depth) << 16 | uint64_t(pitch) << 17 |
                    uint64_t(msaa) << 31;
     auto& t = targets[key];
