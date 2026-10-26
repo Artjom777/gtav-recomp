@@ -1,0 +1,154 @@
+diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
+index 4fdc4bf..b9ba4b2 100644
+--- a/plume_vulkan.cpp
++++ b/plume_vulkan.cpp
+@@ -28,6 +28,11 @@
+ // - Fix resource pools.
+ 
+ namespace plume {
++    static std::vector<uint8_t> &pipelineCacheSeed() {
++        static std::vector<uint8_t> seed;
++        return seed;
++    }
++
+     // Backend constants.
+ 
+     // Required buffer alignment for acceleration structures.
+@@ -835,7 +840,7 @@ namespace plume {
+         bufferInfo.usage |= (desc.flags & RenderBufferFlag::ACCELERATION_STRUCTURE_INPUT) ? VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR : 0;
+         bufferInfo.usage |= (desc.flags & RenderBufferFlag::SHADER_BINDING_TABLE) ? VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR : 0;
+         
+-        const uint32_t deviceAddressMask = RenderBufferFlag::CONSTANT | RenderBufferFlag::ACCELERATION_STRUCTURE | RenderBufferFlag::ACCELERATION_STRUCTURE_SCRATCH | RenderBufferFlag::ACCELERATION_STRUCTURE_INPUT | RenderBufferFlag::SHADER_BINDING_TABLE;
++        const uint32_t deviceAddressMask = RenderBufferFlag::CONSTANT | RenderBufferFlag::DEVICE_ADDRESSABLE | RenderBufferFlag::ACCELERATION_STRUCTURE | RenderBufferFlag::ACCELERATION_STRUCTURE_SCRATCH | RenderBufferFlag::ACCELERATION_STRUCTURE_INPUT | RenderBufferFlag::SHADER_BINDING_TABLE;
+         const bool useDeviceAddress = device->capabilities.bufferDeviceAddress && (desc.flags & deviceAddressMask);
+         bufferInfo.usage |= useDeviceAddress ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0;
+         
+@@ -1094,6 +1099,12 @@ namespace plume {
+         viewInfo.components.b = toVk(desc.componentMapping.b);
+         viewInfo.components.a = toVk(desc.componentMapping.a);
+         viewInfo.subresourceRange.aspectMask = toViewAspectFlags(texture->desc.flags);
++        // gtav: an R8_UINT view of a depth-stencil texture selects its stencil aspect.
++        if ((texture->desc.flags & RenderTextureFlag::DEPTH_TARGET) && desc.format == RenderFormat::R8_UINT &&
++            RenderFormatIsStencil(texture->desc.format)) {
++            viewInfo.format = toVk(texture->desc.format);
++            viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
++        }
+         viewInfo.subresourceRange.baseMipLevel = desc.mipSlice;
+         viewInfo.subresourceRange.levelCount = mipLevels;
+         viewInfo.subresourceRange.baseArrayLayer = desc.arrayIndex;
+@@ -1390,7 +1401,7 @@ namespace plume {
+         pipelineInfo.layout = pipelineLayout->vk;
+         pipelineInfo.stage = stageInfo;
+ 
+-        VkResult res = vkCreateComputePipelines(device->vk, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vk);
++        VkResult res = vkCreateComputePipelines(device->vk, device->pipelineCache, 1, &pipelineInfo, nullptr, &vk);
+         if (res != VK_SUCCESS) {
+             fprintf(stderr, "vkCreateComputePipelines failed with error code 0x%X.\n", res);
+             return;
+@@ -1649,7 +1660,7 @@ namespace plume {
+         pipelineInfo.layout = pipelineLayout->vk;
+         pipelineInfo.renderPass = renderPass;
+ 
+-        VkResult res = vkCreateGraphicsPipelines(device->vk, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vk);
++        VkResult res = vkCreateGraphicsPipelines(device->vk, device->pipelineCache, 1, &pipelineInfo, nullptr, &vk);
+         if (res != VK_SUCCESS) {
+             fprintf(stderr, "vkCreateGraphicsPipelines failed with error code 0x%X.\n", res);
+             return;
+@@ -2548,8 +2559,11 @@ namespace plume {
+             imageViews.emplace_back(colorAttachmentImageView);
+ 
+             if (i == 0) {
+-                width = uint32_t(colorAttachment->desc.width);
+-                height = colorAttachment->desc.height;
++                // A view of a mip level renders at that level's size.
++                uint32_t mip = (desc.colorAttachmentViews && desc.colorAttachmentViews[i])
++                    ? static_cast<const VulkanTextureView *>(desc.colorAttachmentViews[i])->desc.mipSlice : 0;
++                width = std::max(uint32_t(colorAttachment->desc.width) >> mip, 1U);
++                height = std::max(colorAttachment->desc.height >> mip, 1U);
+             }
+ 
+             VkAttachmentReference reference = {};
+@@ -4092,6 +4106,22 @@ namespace plume {
+             }
+         }
+ 
++        {
++            std::vector<uint8_t> seed = std::move(pipelineCacheSeed());
++            VkPipelineCacheCreateInfo cacheInfo = {};
++            cacheInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
++            cacheInfo.initialDataSize = seed.size();
++            cacheInfo.pInitialData = seed.empty() ? nullptr : seed.data();
++            if (vkCreatePipelineCache(vk, &cacheInfo, nullptr, &pipelineCache) != VK_SUCCESS) {
++                // Stale or foreign data: start empty.
++                cacheInfo.initialDataSize = 0;
++                cacheInfo.pInitialData = nullptr;
++                if (vkCreatePipelineCache(vk, &cacheInfo, nullptr, &pipelineCache) != VK_SUCCESS) {
++                    pipelineCache = VK_NULL_HANDLE;
++                }
++            }
++        }
++
+         VmaVulkanFunctions vmaFunctions = {};
+         vmaFunctions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
+         vmaFunctions.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
+@@ -4463,6 +4493,11 @@ namespace plume {
+     void VulkanDevice::release() {
+         nullBuffer = nullptr; // force destruction before destroying allocator
+ 
++        if (pipelineCache != VK_NULL_HANDLE) {
++            vkDestroyPipelineCache(vk, pipelineCache, nullptr);
++            pipelineCache = VK_NULL_HANDLE;
++        }
++
+         if (allocator != VK_NULL_HANDLE) {
+             vmaDestroyAllocator(allocator);
+             allocator = VK_NULL_HANDLE;
+@@ -4666,6 +4701,26 @@ namespace plume {
+         return instance != nullptr;
+     }
+ 
++    void SetVulkanPipelineCacheData(std::vector<uint8_t> data) {
++        pipelineCacheSeed() = std::move(data);
++    }
++
++    std::vector<uint8_t> GetVulkanPipelineCacheData(RenderDevice *device) {
++        auto *vulkanDevice = static_cast<VulkanDevice *>(device);
++        std::vector<uint8_t> data;
++        size_t size = 0;
++        if (vulkanDevice == nullptr || vulkanDevice->pipelineCache == VK_NULL_HANDLE ||
++            vkGetPipelineCacheData(vulkanDevice->vk, vulkanDevice->pipelineCache, &size, nullptr) != VK_SUCCESS) {
++            return data;
++        }
++        data.resize(size);
++        if (vkGetPipelineCacheData(vulkanDevice->vk, vulkanDevice->pipelineCache, &size, data.data()) != VK_SUCCESS) {
++            data.clear();
++        }
++        data.resize(size);
++        return data;
++    }
++
+     // Global creation function.
+ 
+ #if defined(PLUME_SDL2_VULKAN_ENABLED)
+diff --git a/plume_vulkan.h b/plume_vulkan.h
+index 1d36b12..72c0ff1 100644
+--- a/plume_vulkan.h
++++ b/plume_vulkan.h
+@@ -404,6 +404,7 @@ namespace plume {
+ 
+     struct VulkanDevice : RenderDevice {
+         VkDevice vk = VK_NULL_HANDLE;
++        VkPipelineCache pipelineCache = VK_NULL_HANDLE;
+         VulkanInterface *renderInterface = nullptr;
+         VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
+         VkPhysicalDeviceProperties physicalDeviceProperties = {};
+@@ -466,4 +467,9 @@ namespace plume {
+         const std::vector<std::string> &getDeviceNames() const override;
+         bool isValid() const;
+     };
++
++    // Pipeline cache: seed data for devices created afterwards, and the current contents of a
++    // device's cache (to persist between runs). Cache creation failures fall back to no cache.
++    void SetVulkanPipelineCacheData(std::vector<uint8_t> data);
++    std::vector<uint8_t> GetVulkanPipelineCacheData(RenderDevice *device);
+ };

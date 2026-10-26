@@ -1,0 +1,9 @@
+build/
+build-xr/
+thirdparty/
+logs/
+derive/
+gtav/generated/
+gtav/assets/
+gtav/out/
+*.log
