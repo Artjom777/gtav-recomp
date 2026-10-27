@@ -1,5 +1,29 @@
+diff --git a/plume_render_interface.h b/plume_render_interface.h
+index 2048557..a97cb42 100644
+--- a/plume_render_interface.h
++++ b/plume_render_interface.h
+@@ -150,6 +150,10 @@ namespace plume {
+         virtual void discardTexture(const RenderTexture* texture) = 0; // D3D12 only.
+         virtual void resetQueryPool(const RenderQueryPool *queryPool, uint32_t queryFirstIndex, uint32_t queryCount) = 0;
+         virtual void writeTimestamp(const RenderQueryPool *queryPool, uint32_t queryIndex) = 0;
++        // Occlusion queries (Vulkan only; no-ops elsewhere). The begin and end are recorded outside any
++        // render pass, so a query may span several of them.
++        virtual void beginOcclusionQuery(const RenderQueryPool *queryPool, uint32_t queryIndex) { }
++        virtual void endOcclusionQuery(const RenderQueryPool *queryPool, uint32_t queryIndex) { }
+ 
+         // Concrete implementation shortcuts.
+         inline void barriers(RenderBarrierStages stages, const RenderBufferBarrier &barrier) {
+@@ -241,6 +245,8 @@ namespace plume {
+         virtual std::unique_ptr<RenderCommandSemaphore> createCommandSemaphore() = 0;
+         virtual std::unique_ptr<RenderFramebuffer> createFramebuffer(const RenderFramebufferDesc &desc) = 0;
+         virtual std::unique_ptr<RenderQueryPool> createQueryPool(uint32_t queryCount) = 0;
++        // Precise sample-count queries; nullptr when the backend has none (see beginOcclusionQuery).
++        virtual std::unique_ptr<RenderQueryPool> createOcclusionQueryPool(uint32_t queryCount) { return nullptr; }
+         virtual void setBottomLevelASBuildInfo(RenderBottomLevelASBuildInfo &buildInfo, const RenderBottomLevelASMesh *meshes, uint32_t meshCount, bool preferFastBuild = true, bool preferFastTrace = false) = 0;
+         virtual void setTopLevelASBuildInfo(RenderTopLevelASBuildInfo &buildInfo, const RenderTopLevelASInstance *instances, uint32_t instanceCount, bool preferFastBuild = true, bool preferFastTrace = false) = 0;
+         virtual void setShaderBindingTableInfo(RenderShaderBindingTableInfo &tableInfo, const RenderShaderBindingGroups &groups, const RenderPipeline *pipeline, RenderDescriptorSet **descriptorSets, uint32_t descriptorSetCount) = 0;
 diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
-index 4fdc4bf..b9ba4b2 100644
+index 4fdc4bf..a44f20a 100644
 --- a/plume_vulkan.cpp
 +++ b/plume_vulkan.cpp
 @@ -28,6 +28,11 @@
@@ -68,7 +92,85 @@ index 4fdc4bf..b9ba4b2 100644
              }
  
              VkAttachmentReference reference = {};
-@@ -4092,6 +4106,22 @@ namespace plume {
+@@ -2685,15 +2699,16 @@ namespace plume {
+ 
+     // VulkanQueryPool
+ 
+-    VulkanQueryPool::VulkanQueryPool(VulkanDevice *device, uint32_t queryCount) {
++    VulkanQueryPool::VulkanQueryPool(VulkanDevice *device, uint32_t queryCount, bool occlusion) {
+         assert(device != nullptr);
+         assert(queryCount > 0);
+ 
+         this->device = device;
++        this->occlusion = occlusion;
+ 
+         VkQueryPoolCreateInfo createInfo = {};
+         createInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+-        createInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
++        createInfo.queryType = occlusion ? VK_QUERY_TYPE_OCCLUSION : VK_QUERY_TYPE_TIMESTAMP;
+         createInfo.queryCount = queryCount;
+         
+         VkResult res = vkCreateQueryPool(device->vk, &createInfo, nullptr, &vk);
+@@ -2711,11 +2726,17 @@ namespace plume {
+ 
+     void VulkanQueryPool::queryResults() {
+ 	    VkResult res = vkGetQueryPoolResults(device->vk, vk, 0, uint32_t(results.size()), sizeof(uint64_t) * results.size(), results.data(), sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+-        if (res != VK_SUCCESS) {
++        // Occlusion pools are read whole; queries a frame did not use stay unavailable.
++        if (res != VK_SUCCESS && !(occlusion && res == VK_NOT_READY)) {
+             fprintf(stderr, "vkGetQueryPoolResults failed with error code 0x%X.\n", res);
+             return;
+         }
+ 
++        // Sample counts need no conversion.
++        if (occlusion) {
++            return;
++        }
++
+         // Conversion sourced from Godot Engine's Vulkan Rendering Driver.
+         auto mult64to128 = [](uint64_t u, uint64_t v, uint64_t &h, uint64_t &l) {
+             uint64_t u1 = (u & 0xffffffff);
+@@ -3486,6 +3507,8 @@ namespace plume {
+     void VulkanCommandList::resetQueryPool(const RenderQueryPool *queryPool, uint32_t queryFirstIndex, uint32_t queryCount) {
+         assert(queryPool != nullptr);
+ 
++        // Not allowed inside a render pass.
++        endActiveRenderPass();
+         const VulkanQueryPool *interfaceQueryPool = static_cast<const VulkanQueryPool *>(queryPool);
+         vkCmdResetQueryPool(vk, interfaceQueryPool->vk, queryFirstIndex, queryCount);
+     }
+@@ -3497,6 +3520,22 @@ namespace plume {
+         vkCmdWriteTimestamp(vk, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, interfaceQueryPool->vk, queryIndex);
+     }
+ 
++    void VulkanCommandList::beginOcclusionQuery(const RenderQueryPool *queryPool, uint32_t queryIndex) {
++        assert(queryPool != nullptr);
++
++        endActiveRenderPass();
++        const VulkanQueryPool *interfaceQueryPool = static_cast<const VulkanQueryPool *>(queryPool);
++        vkCmdBeginQuery(vk, interfaceQueryPool->vk, queryIndex, interfaceQueryPool->device->occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
++    }
++
++    void VulkanCommandList::endOcclusionQuery(const RenderQueryPool *queryPool, uint32_t queryIndex) {
++        assert(queryPool != nullptr);
++
++        endActiveRenderPass();
++        const VulkanQueryPool *interfaceQueryPool = static_cast<const VulkanQueryPool *>(queryPool);
++        vkCmdEndQuery(vk, interfaceQueryPool->vk, queryIndex);
++    }
++
+     void VulkanCommandList::checkActiveRenderPass() {
+         assert(targetFramebuffer != nullptr);
+         
+@@ -3931,6 +3970,7 @@ namespace plume {
+         deviceFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+         deviceFeatures.pNext = featuresChain;
+         vkGetPhysicalDeviceFeatures2(physicalDevice, &deviceFeatures);
++        occlusionQueryPrecise = deviceFeatures.features.occlusionQueryPrecise;
+ 
+         // Check for properties.
+         if (rayTracingFound) {
+@@ -4092,6 +4132,22 @@ namespace plume {
              }
          }
  
@@ -91,7 +193,18 @@ index 4fdc4bf..b9ba4b2 100644
          VmaVulkanFunctions vmaFunctions = {};
          vmaFunctions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
          vmaFunctions.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
-@@ -4463,6 +4493,11 @@ namespace plume {
+@@ -4255,6 +4311,10 @@ namespace plume {
+         return std::make_unique<VulkanQueryPool>(this, queryCount);
+     }
+ 
++    std::unique_ptr<RenderQueryPool> VulkanDevice::createOcclusionQueryPool(uint32_t queryCount) {
++        return std::make_unique<VulkanQueryPool>(this, queryCount, true);
++    }
++
+     void VulkanDevice::setBottomLevelASBuildInfo(RenderBottomLevelASBuildInfo &buildInfo, const RenderBottomLevelASMesh *meshes, uint32_t meshCount, bool preferFastBuild, bool preferFastTrace) {
+         assert(meshes != nullptr);
+         assert(meshCount > 0);
+@@ -4463,6 +4523,11 @@ namespace plume {
      void VulkanDevice::release() {
          nullBuffer = nullptr; // force destruction before destroying allocator
  
@@ -103,7 +216,7 @@ index 4fdc4bf..b9ba4b2 100644
          if (allocator != VK_NULL_HANDLE) {
              vmaDestroyAllocator(allocator);
              allocator = VK_NULL_HANDLE;
-@@ -4666,6 +4701,26 @@ namespace plume {
+@@ -4666,6 +4731,26 @@ namespace plume {
          return instance != nullptr;
      }
  
@@ -131,10 +244,30 @@ index 4fdc4bf..b9ba4b2 100644
  
  #if defined(PLUME_SDL2_VULKAN_ENABLED)
 diff --git a/plume_vulkan.h b/plume_vulkan.h
-index 1d36b12..72c0ff1 100644
+index 1d36b12..f815ded 100644
 --- a/plume_vulkan.h
 +++ b/plume_vulkan.h
-@@ -404,6 +404,7 @@ namespace plume {
+@@ -285,8 +285,9 @@ namespace plume {
+         VulkanDevice *device = nullptr;
+         std::vector<uint64_t> results;
+         VkQueryPool vk = VK_NULL_HANDLE;
++        bool occlusion = false;
+ 
+-        VulkanQueryPool(VulkanDevice *device, uint32_t queryCount);
++        VulkanQueryPool(VulkanDevice *device, uint32_t queryCount, bool occlusion = false);
+         virtual ~VulkanQueryPool() override;
+         virtual void queryResults() override;
+         virtual const uint64_t *getResults() const override;
+@@ -342,6 +343,8 @@ namespace plume {
+         void discardTexture(const RenderTexture* texture) override;
+         void resetQueryPool(const RenderQueryPool *queryPool, uint32_t queryFirstIndex, uint32_t queryCount) override;
+         void writeTimestamp(const RenderQueryPool *queryPool, uint32_t queryIndex) override;
++        void beginOcclusionQuery(const RenderQueryPool *queryPool, uint32_t queryIndex) override;
++        void endOcclusionQuery(const RenderQueryPool *queryPool, uint32_t queryIndex) override;
+         void checkActiveRenderPass();
+         void endActiveRenderPass();
+         void setDescriptorSet(VkPipelineBindPoint bindPoint, const VulkanPipelineLayout *pipelineLayout, const RenderDescriptorSet *descriptorSet, uint32_t setIndex);
+@@ -404,9 +407,11 @@ namespace plume {
  
      struct VulkanDevice : RenderDevice {
          VkDevice vk = VK_NULL_HANDLE;
@@ -142,7 +275,19 @@ index 1d36b12..72c0ff1 100644
          VulkanInterface *renderInterface = nullptr;
          VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
          VkPhysicalDeviceProperties physicalDeviceProperties = {};
-@@ -466,4 +467,9 @@ namespace plume {
++        bool occlusionQueryPrecise = false;
+         VmaAllocator allocator = VK_NULL_HANDLE;
+         uint32_t queueFamilyIndices[3] = {};
+         std::vector<VulkanQueueFamily> queueFamilies;
+@@ -436,6 +441,7 @@ namespace plume {
+         std::unique_ptr<RenderCommandSemaphore> createCommandSemaphore() override;
+         std::unique_ptr<RenderFramebuffer> createFramebuffer(const RenderFramebufferDesc &desc) override;
+         std::unique_ptr<RenderQueryPool> createQueryPool(uint32_t queryCount) override;
++        std::unique_ptr<RenderQueryPool> createOcclusionQueryPool(uint32_t queryCount) override;
+         void setBottomLevelASBuildInfo(RenderBottomLevelASBuildInfo &buildInfo, const RenderBottomLevelASMesh *meshes, uint32_t meshCount, bool preferFastBuild, bool preferFastTrace) override;
+         void setTopLevelASBuildInfo(RenderTopLevelASBuildInfo &buildInfo, const RenderTopLevelASInstance *instances, uint32_t instanceCount, bool preferFastBuild, bool preferFastTrace) override;
+         void setShaderBindingTableInfo(RenderShaderBindingTableInfo &tableInfo, const RenderShaderBindingGroups &groups, const RenderPipeline *pipeline, RenderDescriptorSet **descriptorSets, uint32_t descriptorSetCount) override;
+@@ -466,4 +472,9 @@ namespace plume {
          const std::vector<std::string> &getDeviceNames() const override;
          bool isValid() const;
      };

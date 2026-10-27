@@ -23,8 +23,10 @@
 
 #include <atomic>
 #include <cstring>
+#include <mutex>
 #include <string>
 
+REXCVAR_DECLARE(std::string, gtav_native);
 REXCVAR_DEFINE_INT32(gtav_native_layout_probe, 0, "GTAV",
                      "Log objects and register shadow for the first draws of this guest frame");
 
@@ -151,6 +153,12 @@ static uint32_t GuestPhysical(uint32_t virtual_address) {
   return physical != UINT32_MAX ? physical : virtual_address & 0x1FFFFFFF;
 }
 
+// Where the device writes its next PM4 packet: the ring, or a D3D command buffer being recorded.
+static uint32_t WritePointer(uint32_t device) {
+  uint32_t write = be32(Guest(device) + d3d::kDevCmdWrite);
+  return write ? GuestPhysical(write) : 0;
+}
+
 static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive, int32_t base_vertex,
                                uint32_t start, uint32_t count) {
   FlushIndexedVertices();
@@ -162,9 +170,14 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
   d.base_vertex = base_vertex;
   d.start = start;
   d.count = count;
-  d.vs_hash = ShaderHash(g_bound.vertex_shader);
-  d.ps_hash = ShaderHash(g_bound.pixel_shader);
-  d.ps_ucode_hash = ShaderUcodeHash(g_bound.pixel_shader);
+  // The shaders the device holds, as the draw reads them: the Set*Shader hooks are not the only
+  // writers. Outdoors 28 scenery draws a frame (5106-index meshes) bound their pixel shader another
+  // way, so the hooked value was a depth pass's null shader and they came out depth-only.
+  uint32_t vertex_shader = be32(dev + d3d::kDevVertexShader), pixel_shader = be32(dev + d3d::kDevPixelShader);
+  if (!vertex_shader) vertex_shader = g_bound.vertex_shader;
+  d.vs_hash = ShaderHash(vertex_shader);
+  d.ps_hash = ShaderHash(pixel_shader);
+  d.ps_ucode_hash = ShaderUcodeHash(pixel_shader);
   d.regs = g_packet.Push(dev + kRegShadowBegin, kRegShadowSize);
   {
     // RB_MODECONTROL in the device shadow lags: D3D derives it while flushing the draw, after this
@@ -188,6 +201,19 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
       for (uint32_t i = 0; i < 256; i++)
         if (g_inline_consts.valid[bank][i]) std::memcpy(dst + 16 * i, g_inline_consts.data[bank][i], 16);
     }
+  }
+  // Consecutive draws mostly repeat the previous draw's constants and fetch constants: share its
+  // block instead (the replay then skips the byte swap and texture lookups by offset).
+  if (!g_packet.draws.empty()) {
+    const DrawCommand& prev = g_packet.draws.back();
+    auto share = [](uint32_t& offset, uint32_t previous, uint32_t size) {
+      if (offset == previous || std::memcmp(g_packet.At(offset), g_packet.At(previous), size) != 0) return;
+      if (offset + size == g_packet.arena.size()) g_packet.arena.Shrink(size);
+      offset = previous;
+    };
+    share(d.ps_consts, prev.ps_consts, kAluSize);  // last pushed first, so the arena can shrink
+    share(d.vs_consts, prev.vs_consts, kAluSize);
+    share(d.fetch, prev.fetch, kFetchSize);
   }
   // The device's own field, as DrawIndexedVertices reads it: SetIndices (83806E70) is not the
   // only writer, so the hooked value can be stale.
@@ -223,7 +249,7 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
   }
   for (int i = 0; i < 4; i++) d.render_targets[i] = be32(dev + d3d::kDevRenderTargets + 4 * i);
   d.depth_stencil = be32(dev + d3d::kDevDepthStencil);
-  g_packet.commands.push_back({CommandKind::kDraw, uint32_t(g_packet.draws.size())});
+  g_packet.commands.push_back({CommandKind::kDraw, uint32_t(g_packet.draws.size()), WritePointer(device)});
   g_packet.draws.push_back(d);
   return &g_packet.draws.back();
 }
@@ -357,7 +383,7 @@ void OnClear(uint32_t device, uint32_t flags, uint32_t color, float z, uint32_t 
     }
   }
   ClearCommand c{flags, color, stencil, z, g_packet.Push(Guest(device) + kRegShadowBegin, kRegShadowSize)};
-  g_packet.commands.push_back({CommandKind::kClear, uint32_t(g_packet.clears.size())});
+  g_packet.commands.push_back({CommandKind::kClear, uint32_t(g_packet.clears.size()), WritePointer(device)});
   g_packet.clears.push_back(c);
 }
 
@@ -400,16 +426,218 @@ void OnResolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t dest_tex
     uint32_t physical = REX_KERNEL_MEMORY()->GetPhysicalAddress(dword1 & 0xFFFFF000);
     if (physical != UINT32_MAX) dword1 = (dword1 & 0xFFF) | (physical & 0xFFFFF000);
   }
-  g_packet.commands.push_back({CommandKind::kResolve, uint32_t(g_packet.resolves.size())});
+  g_packet.commands.push_back({CommandKind::kResolve, uint32_t(g_packet.resolves.size()), WritePointer(device)});
   g_packet.resolves.push_back(r);
+}
+
+// D3D occlusion queries. With --gtav_native=on the command processor only fakes them (every query
+// passes 1000 samples, so lens flares shine through walls); the native renderer counts the samples
+// for real and GetData returns that count instead (OverrideQueryResult).
+namespace {
+
+struct QueryState {
+  uint32_t issued = 0, done = 0;  // serial of the last END, and of the last published result
+  uint32_t samples = 0;
+  uint64_t issue_frame = 0;
+};
+std::mutex g_query_mutex;
+std::unordered_map<uint32_t, QueryState> g_queries;
+struct QueryStats {
+  uint32_t issued = 0, native = 0, stale = 0, pending = 0, fallback = 0;
+} g_query_stats;
+
+}  // namespace
+
+void OnQueryIssue(uint32_t query, uint32_t flags) {
+  FlushIndexedVertices();
+  if (!Active() || !query) return;
+  const uint8_t* q = Guest(query);
+  constexpr uint32_t kOcclusion = 9;  // D3DQUERYTYPE_OCCLUSION
+  if (be32(q + 4) != kOcclusion) return;
+  uint32_t device = be32(q);
+  QueryCommand c{query, 0, (flags & 2) != 0};  // D3DISSUE_BEGIN = 2, D3DISSUE_END = 1
+  if (!c.begin) {
+    if (!(flags & 1)) return;
+    std::lock_guard lock(g_query_mutex);
+    QueryState& st = g_queries[query];
+    c.serial = ++st.issued;
+    st.issue_frame = g_frame.load(std::memory_order_relaxed);
+    g_query_stats.issued++;
+  }
+  g_packet.commands.push_back({CommandKind::kQuery, uint32_t(g_packet.queries.size()), WritePointer(device)});
+  g_packet.queries.push_back(c);
+}
+
+void PublishQueryResult(uint32_t query, uint32_t serial, uint64_t samples) {
+  std::lock_guard lock(g_query_mutex);
+  auto it = g_queries.find(query);
+  if (it == g_queries.end() || serial < it->second.done) return;
+  it->second.done = serial;
+  it->second.samples = uint32_t(std::min<uint64_t>(samples, UINT32_MAX));
+}
+
+QueryOverride OverrideQueryResult(uint32_t query, uint32_t* samples) {
+  std::lock_guard lock(g_query_mutex);
+  auto it = g_queries.find(query);
+  if (it == g_queries.end() || !it->second.issued) return QueryOverride::kOriginal;
+  QueryState& st = it->second;
+  if (st.done == st.issued) {
+    *samples = st.samples;
+    g_query_stats.native++;
+    return QueryOverride::kReady;
+  }
+  // GTA re-issues its corona queries every few frames, sooner than the native renderer (two to
+  // three frames behind, results after the GPU fence) answers them: waiting for the latest left
+  // ~96% of polls "not ready" and flares froze. The newest finished result is a few frames old.
+  if (st.done) {
+    *samples = st.samples;
+    g_query_stats.stale++;
+    return QueryOverride::kReady;
+  }
+  // The native frame holding it may never render (dropped, or the END sat in an unrun command
+  // buffer): after a few frames the command processor's answer stands.
+  constexpr uint64_t kPatienceFrames = 8;
+  if (g_frame.load(std::memory_order_relaxed) - st.issue_frame > kPatienceFrames) {
+    g_query_stats.fallback++;
+    return QueryOverride::kOriginal;
+  }
+  g_query_stats.pending++;
+  return QueryOverride::kNotReady;
+}
+
+// D3D command buffers. GTA records some draws (outdoor scenery) into command buffers and runs
+// them later, possibly every frame: the draw hooks fire while recording (their PM4 goes into the
+// buffer), nothing fires when the GPU executes them. Commands captured with a write pointer inside
+// a buffer that 838087C8 runs are moved out of the frame into that buffer's recording and appended
+// to the frame at every run, like the GPU executes them.
+namespace {
+
+struct RecordedBuffer {
+  uint32_t begin = 0, end = 0;  // guest physical PM4 range
+  FramePacket packet;
+};
+std::vector<RecordedBuffer> g_buffers;
+struct BufferStats {
+  uint32_t runs = 0, replayed = 0, recorded = 0, empty = 0, frames = 0;
+} g_buffer_stats;
+
+void CopyCommand(FramePacket& dst, const FramePacket& src, const Command& c, uint32_t pm4) {
+  auto blob = [&](uint32_t at, uint32_t size) { return size ? dst.Push(src.At(at), size) : 0u; };
+  switch (c.kind) {
+    case CommandKind::kDraw: {
+      DrawCommand d = src.draws[c.index];
+      d.regs = blob(d.regs, kRegShadowSize);
+      d.fetch = blob(d.fetch, kFetchSize);
+      d.vs_consts = blob(d.vs_consts, kAluSize);
+      d.ps_consts = blob(d.ps_consts, kAluSize);
+      if (d.inline_size) d.inline_vertices = blob(d.inline_vertices, d.inline_size);
+      if (d.inline_index_size) d.inline_indices = blob(d.inline_indices, d.inline_index_size);
+      dst.commands.push_back({c.kind, uint32_t(dst.draws.size()), pm4});
+      dst.draws.push_back(d);
+      break;
+    }
+    case CommandKind::kClear: {
+      ClearCommand k = src.clears[c.index];
+      k.regs = blob(k.regs, kRegShadowSize);
+      dst.commands.push_back({c.kind, uint32_t(dst.clears.size()), pm4});
+      dst.clears.push_back(k);
+      break;
+    }
+    case CommandKind::kQuery: {
+      dst.commands.push_back({c.kind, uint32_t(dst.queries.size()), pm4});
+      dst.queries.push_back(src.queries[c.index]);
+      break;
+    }
+    case CommandKind::kResolve: {
+      ResolveCommand k = src.resolves[c.index];
+      k.regs = blob(k.regs, kRegShadowSize);
+      dst.commands.push_back({c.kind, uint32_t(dst.resolves.size()), pm4});
+      dst.resolves.push_back(k);
+      break;
+    }
+  }
+}
+
+// Moves the frame's commands written into [begin, end) into `out` (replacing what it held).
+// Returns how many moved; the per-kind vectors keep the moved entries, only commands is rebuilt.
+uint32_t TakeRecorded(uint32_t begin, uint32_t end, FramePacket& out) {
+  uint32_t moved = 0;
+  for (const auto& c : g_packet.commands)
+    if (c.pm4 >= begin && c.pm4 < end) moved++;
+  if (!moved) return 0;
+  out.Clear();
+  std::vector<Command> keep;
+  keep.reserve(g_packet.commands.size() - moved);
+  for (const auto& c : g_packet.commands) {
+    if (c.pm4 >= begin && c.pm4 < end) CopyCommand(out, g_packet, c, c.pm4);
+    else keep.push_back(c);
+  }
+  g_packet.commands.swap(keep);
+  return moved;
+}
+
+RecordedBuffer& BufferFor(uint32_t begin, uint32_t end) {
+  for (auto& b : g_buffers)
+    if (b.begin == begin) {
+      b.end = std::max(b.end, end);
+      return b;
+    }
+  if (g_buffers.size() < 24)
+    REXLOG_INFO("[native] command buffer {:08X}-{:08X} ({} bytes) runs for the first time", begin, end, end - begin);
+  g_buffers.push_back({begin, end, {}});
+  return g_buffers.back();
+}
+
+}  // namespace
+
+void OnCommandBufferRun(uint32_t device, uint32_t write_before, uint32_t write_after) {
+  FlushIndexedVertices();
+  if (!Active() || !write_before || write_after <= write_before || write_after - write_before > 4096) return;
+  const uint8_t* p = Guest(write_before);
+  for (uint32_t at = 0; at + 12 <= write_after - write_before; at += 4) {
+    if (be32(p + at) != 0xC0013F00) continue;  // PM4 type 3 INDIRECT_BUFFER, 2 dwords
+    uint32_t begin = be32(p + at + 4), dwords = be32(p + at + 8) & 0xFFFFF;
+    uint32_t end = begin + dwords * 4;
+    g_buffer_stats.runs++;
+    RecordedBuffer& b = BufferFor(begin, end);
+    g_buffer_stats.recorded += TakeRecorded(begin, end, b.packet);
+    if (b.packet.commands.empty()) g_buffer_stats.empty++;
+    for (const auto& c : b.packet.commands) CopyCommand(g_packet, b.packet, c, 0);
+    g_buffer_stats.replayed += uint32_t(b.packet.commands.size());
+    at += 8;
+  }
 }
 
 void OnCaptureSwap(uint32_t front_buffer) {
   FlushIndexedVertices();
+  // Commands recorded this frame into known buffers that did not run yet: they run later.
+  for (auto& b : g_buffers) {
+    FramePacket fresh;
+    if (TakeRecorded(b.begin, b.end, fresh)) {
+      g_buffer_stats.recorded += uint32_t(fresh.commands.size());
+      b.packet = std::move(fresh);
+    }
+  }
+  if (g_buffer_stats.frames % 300 == 299 && g_query_stats.issued) {
+    std::lock_guard lock(g_query_mutex);
+    REXLOG_INFO("[native] occlusion queries per 300 frames: {} issued, results {} native, {} a few frames old, "
+                "{} not ready yet, {} fell back to the command processor ({} query objects)",
+                g_query_stats.issued, g_query_stats.native, g_query_stats.stale, g_query_stats.pending,
+                g_query_stats.fallback, g_queries.size());
+    g_query_stats = {};
+  }
+  if (++g_buffer_stats.frames % 300 == 0 && g_buffer_stats.runs) {
+    REXLOG_INFO("[native] command buffers: {} known, per 300 frames {} runs ({} with nothing recorded), "
+                "{} commands replayed, {} recorded",
+                g_buffers.size(), g_buffer_stats.runs, g_buffer_stats.empty, g_buffer_stats.replayed,
+                g_buffer_stats.recorded);
+    g_buffer_stats = {0, 0, 0, 0, g_buffer_stats.frames};
+  }
   uint64_t frame = g_frame.fetch_add(1, std::memory_order_relaxed);
   if (!Active()) return;
   g_packet.index = frame;
   g_packet.front_buffer = front_buffer;
+  if (REXCVAR_GET(gtav_native) == "on") NoteGuestSwap(frame);
   Submit(std::move(g_packet));
   g_packet = TakeSpare();
 }

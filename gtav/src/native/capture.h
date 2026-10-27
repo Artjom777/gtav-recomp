@@ -36,6 +36,18 @@ void OnClear(uint32_t device, uint32_t flags, uint32_t color, float z, uint32_t 
 void OnResolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t dest_texture, uint32_t dest_point,
                uint32_t clear_color, float clear_z, uint32_t level, uint32_t face);
 
+// 838087C8 (runs D3D command buffers): the device's PM4 write pointer before and after the call;
+// the INDIRECT_BUFFER packets it wrote name the recorded buffers that execute now.
+void OnCommandBufferRun(uint32_t device, uint32_t write_before, uint32_t write_after);
+
+// D3DQuery Issue(query, flags): occlusion query BEGIN / END, recorded in the frame.
+void OnQueryIssue(uint32_t query, uint32_t flags);
+// Render thread: the samples a recorded query passed, once its frame's fence passed.
+void PublishQueryResult(uint32_t query, uint32_t serial, uint64_t samples);
+// Guest GetData on `query` (--gtav_native=on): the native count when the last END has one.
+enum class QueryOverride { kOriginal, kReady, kNotReady };
+QueryOverride OverrideQueryResult(uint32_t query, uint32_t* samples);
+
 // Guest frame boundary (before the guest's Swap runs): hands the frame to the renderer.
 void OnCaptureSwap(uint32_t front_buffer);
 uint64_t GuestFrame();

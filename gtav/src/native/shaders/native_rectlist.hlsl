@@ -24,6 +24,13 @@ float Distance2(float4 a, float4 b) {
 
 [maxvertexcount(4)]
 void main(triangle Vertex v[3], inout TriangleStream<Vertex> stream) {
+    // Rejected rects: GTA's tiled lighting collapses the tiles a light variant skips to
+    // (0,0,0,0). On Xenos they cover nothing; emitted here, w = 0 vertices reach the host
+    // rasterizer as screen-centre points and the strip becomes a wedge across the screen.
+    // Like the SDK's rect-list shader (which drops primitives with NaN positions), cull them.
+    [unroll] for (uint k = 0; k < 3; k++)
+        if (!(v[k].position.w > 0.0) || any(isnan(v[k].position)) || any(isinf(v[k].position)))
+            return;
     float d01 = Distance2(v[0].position, v[1].position);
     float d12 = Distance2(v[1].position, v[2].position);
     float d20 = Distance2(v[2].position, v[0].position);

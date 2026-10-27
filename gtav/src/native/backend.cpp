@@ -2,6 +2,7 @@
 
 #include "backend.h"
 
+#include "capture.h"
 #include "frame.h"
 #include "textures.h"
 #include "vertex_layout.h"
@@ -18,6 +19,7 @@
 
 #define XXH_INLINE_ALL
 #include <xxhash.h>
+#include <immintrin.h>
 
 #include <algorithm>
 #include <chrono>
@@ -39,6 +41,10 @@
 #include <vector>
 
 REXCVAR_DECLARE(std::string, gtav_native_spirv_dir);
+REXCVAR_DEFINE_INT32(gtav_native_dump_rt, 0x2D0, "GTAV",
+                     "Frame dumps: EDRAM base of the color target snapshotted after every draw (0x2D0 = scene HDR)");
+REXCVAR_DEFINE_INT32(gtav_native_dump_rt_skip, 0, "GTAV",
+                     "Frame dumps: skip this many draws into --gtav_native_dump_rt before the 150 snapshots start");
 REXCVAR_DEFINE_BOOL(gtav_native_async_pipelines, true, "GTAV",
                     "Create new pipelines on worker threads (the draw is skipped until ready) instead of "
                     "stalling the frame");
@@ -57,6 +63,9 @@ constexpr uint32_t kTextureDescriptors = 32768;
 constexpr uint32_t kSamplerDescriptors = 1024;
 constexpr uint32_t kNull2D = 0, kNull3D = 1, kNullCube = 2, kFirstTextureDescriptor = 3;
 constexpr uint64_t kUploadChunk = 64ull << 20;
+// Tallest render target: GTA V stacks its four 640x640 sun shadow cascades in one 640x2560 depth
+// surface, so 2048 rows lost the far cascade (distant scenery shadowed by garbage wedges).
+constexpr uint32_t kMaxTargetRows = 4096;
 constexpr uint32_t kSharedConstantsSize = 1792;  // see shader_common.h + xenosrecomp-gtav.patch
 // Indirect vertex fetch records (vfetchIndirect): 32 bytes per input location from byte 768.
 constexpr uint32_t kIndirectFetchRecords = 768;
@@ -65,6 +74,146 @@ constexpr uint32_t kDummyStream = 15;  // vertex slot feeding zeros to inputs a 
 uint32_t be32(const uint8_t* p) { return uint32_t(p[0]) << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
 
 uint64_t Hash(const void* data, size_t size, uint64_t seed = 0) { return XXH3_64bits_withSeed(data, size, seed); }
+
+// The SPIR-V folder (~3,600 files) is read into memory by a background thread at start-up: on a
+// busy USB disk each first-use fopen took ~50 ms, frames meeting dozens of new shaders stalled
+// for seconds, and the command processor now waits for the renderer at every swap. Files the
+// background compiler writes later are not in the snapshot and are read from disk as before.
+#ifdef _WIN32
+extern "C" __declspec(dllimport) void* __stdcall GetCurrentThread();
+extern "C" __declspec(dllimport) int __stdcall SetThreadPriority(void* thread, int priority);
+#endif
+
+class SpirvPreload {
+ public:
+  void Start(const std::string& dir, RenderDevice* device) {
+    std::call_once(started_, [&] {
+      std::thread([this, dir, device] {
+        auto start = std::chrono::steady_clock::now();
+        size_t count = 0, bytes = 0;
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+          if (!entry.is_regular_file(ec)) continue;
+          std::vector<uint8_t> data;
+          if (FILE* f = std::fopen(entry.path().string().c_str(), "rb")) {
+            std::fseek(f, 0, SEEK_END);
+            data.resize(size_t(std::ftell(f)));
+            std::fseek(f, 0, SEEK_SET);
+            bool ok = std::fread(data.data(), 1, data.size(), f) == data.size();
+            std::fclose(f);
+            if (!ok) continue;
+          } else {
+            continue;
+          }
+          bytes += data.size();
+          count++;
+          std::lock_guard lock(mutex_);
+          names_.insert(entry.path().filename().string());
+          files_[entry.path().filename().string()] = std::move(data);
+        }
+        done_ = true;
+        REXLOG_INFO("[native] preloaded {} shader files ({:.1f} MB) in {:.1f} s", count, bytes / 1048576.0,
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+        // vkCreateShaderModule takes ~17 ms per GTA shader on this driver: a new area meeting 60-90
+        // new shaders froze for 1-2 s. Low-priority workers create every module ahead of use.
+        {
+          std::lock_guard lock(mutex_);
+          for (const auto& [name, data] : files_)
+            if (name.size() > 4 && name.compare(name.size() - 4, 4, ".spv") == 0) pending_.push_back(name);
+        }
+        auto created = std::make_shared<std::atomic<size_t>>(0);
+        auto workers = std::make_shared<std::atomic<int>>(3);
+        for (int i = 0; i < 3; i++) {
+          std::thread([this, device, created, workers, start] {
+#ifdef _WIN32
+            SetThreadPriority(GetCurrentThread(), -1);  // THREAD_PRIORITY_BELOW_NORMAL
+#endif
+            for (;;) {
+              std::string name;
+              std::vector<uint8_t> data;
+              {
+                std::lock_guard lock(mutex_);
+                while (!pending_.empty() && name.empty()) {
+                  std::string n = std::move(pending_.back());
+                  pending_.pop_back();
+                  auto it = files_.find(n);
+                  if (it == files_.end()) continue;  // the renderer took it first
+                  data = std::move(it->second);
+                  files_.erase(it);
+                  creating_.insert(n);
+                  name = std::move(n);
+                }
+              }
+              if (name.empty()) break;
+              auto shader = device->createShader(data.data(), data.size(), "main", RenderShaderFormat::SPIRV);
+              {
+                std::lock_guard lock(mutex_);
+                creating_.erase(name);
+                modules_[name] = std::move(shader);
+              }
+              cv_.notify_all();
+              (*created)++;
+            }
+            if (--(*workers) == 0)
+              REXLOG_INFO("[native] created {} shader modules ahead of use in {:.1f} s", created->load(),
+                          std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+          }).detach();
+        }
+      }).detach();
+    });
+  }
+
+  // A module created ahead of use (1), or the file's bytes to create it now (2), else 0.
+  int TakeShader(const std::string& name, std::unique_ptr<RenderShader>* shader, std::vector<uint8_t>* data) {
+    std::unique_lock lock(mutex_);
+    cv_.wait(lock, [&] { return creating_.count(name) == 0; });
+    if (auto it = modules_.find(name); it != modules_.end()) {
+      *shader = std::move(it->second);
+      modules_.erase(it);
+      return 1;
+    }
+    auto it = files_.find(name);
+    if (it == files_.end()) return 0;
+    *data = std::move(it->second);
+    files_.erase(it);
+    return 2;
+  }
+
+  // Moves the file out of the snapshot (each shader is created once); false if not preloaded yet.
+  bool Take(const std::string& name, std::vector<uint8_t>* data) {
+    std::lock_guard lock(mutex_);
+    auto it = files_.find(name);
+    if (it == files_.end()) return false;
+    *data = std::move(it->second);
+    files_.erase(it);
+    return true;
+  }
+
+  bool Contains(const std::string& name) {
+    std::lock_guard lock(mutex_);
+    return files_.count(name) != 0;
+  }
+
+  // Once the whole folder was read, a name it did not have is not on disk either (unless the
+  // background compiler wrote it since): no fopen of missing files (~50 ms each on the busy disk).
+  bool KnownMissing(const std::string& name) {
+    if (!done_ || CompileGeneration() != 0) return false;
+    std::lock_guard lock(mutex_);
+    return names_.count(name) == 0;
+  }
+
+ private:
+  std::once_flag started_;
+  std::mutex mutex_;
+  std::unordered_map<std::string, std::vector<uint8_t>> files_;
+  std::unordered_set<std::string> names_;  // every file in the folder, also after Take
+  std::vector<std::string> pending_;         // .spv files the workers have not created yet
+  std::unordered_set<std::string> creating_;
+  std::unordered_map<std::string, std::unique_ptr<RenderShader>> modules_;
+  std::condition_variable cv_;
+  std::atomic<bool> done_{false};
+};
+SpirvPreload g_spirv_preload;
 
 RenderComparisonFunction Compare(uint32_t xenos) { return RenderComparisonFunction(xenos + 1); }
 RenderStencilOp StencilOp(uint32_t xenos) { return RenderStencilOp(xenos + 1); }
@@ -335,6 +484,9 @@ struct CachedTexture {
   uint64_t content = 0;
   uint64_t raw_hash = 0;  // HashGuestTexture of the decoded bytes
   uint64_t checked_frame = 0;
+  uint64_t bytes = 0;  // decoded size: small textures are rechecked every frame
+  uint64_t sampled_hash = 0;  // HashGuestTexture(sampled) at the last full check
+  uint64_t sample_frame = ~0ull;  // frame of the last sampled check
   bool failed = false;
 };
 
@@ -342,7 +494,18 @@ struct CachedBuffer {
   std::unique_ptr<RenderBuffer> buffer;
   uint64_t content = 0, size = 0;
   uint64_t checked_frame = ~0ull;
+  uint64_t sampled = 0;              // SampledHash at the last full check
+  uint64_t full_frame = ~0ull;       // frame of the last full hash
 };
+
+// 16 runs of 256 bytes spread over a buffer: catches rewrites of large guest buffers at ~4 KB per
+// check (a full hash of every vertex buffer every frame cost ~3 ms).
+uint64_t SampledHash(const uint8_t* p, uint64_t size) {
+  if (size <= 16 * 256) return XXH3_64bits(p, size);
+  uint64_t step = (size - 256) / 15, h = size;
+  for (uint64_t i = 0; i < 16; i++) h = XXH3_64bits_withSeed(p + i * step, 256, h);
+  return h;
+}
 
 }  // namespace
 
@@ -380,6 +543,58 @@ struct Backend::Impl {
   // Every variant written per address, newest last (fetches pick by size before recency).
   std::unordered_map<uint32_t, std::vector<uint64_t>> resolved_by_address;
   uint64_t resolve_serial = 0;
+
+  // Guest memory under each resolve destination when it was written. Nothing writes resolve data
+  // into guest memory here (the command processor only fakes the GPU), so a change means the CPU
+  // put something else there (streaming reuses render-target memory for textures): the resolve is
+  // stale and the guest bytes are the texture now, as the emulator's last-writer-wins memory has it.
+  struct ResolveStamp {
+    uint64_t hash = 0;
+    uint32_t size = 0;
+    uint64_t checked_frame = ~0ull;
+    bool written_back = false;  // small resolves copied into guest memory (FrameComplete)
+  };
+  std::unordered_map<uint32_t, ResolveStamp> resolve_stamps;
+  uint32_t stale_resolves_logged = 0;
+  uint32_t alpha_to_mask_logged = 0;
+
+  static uint64_t SampleGuest(uint32_t address, uint32_t size) {
+    const uint8_t* p = REX_KERNEL_MEMORY()->TranslatePhysical(address);
+    if (!p || !size) return 0;
+    if (size <= 16 * 256) return XXH3_64bits(p, size);
+    uint32_t step = (size - 256) / 15 & ~255u;
+    uint64_t h = 0;
+    for (uint32_t i = 0; i < 16; i++) h = XXH3_64bits_withSeed(p + i * step, 256, h);
+    return h;
+  }
+
+  void StampResolve(uint32_t base, uint32_t width, uint32_t height) {
+    auto& st = resolve_stamps[base];
+    st.size = std::max(width * height, 256u);  // one byte per texel: inside any resolve format
+    st.hash = SampleGuest(base, st.size);
+    st.checked_frame = frame;
+  }
+
+  // False when the CPU overwrote the resolve at `base` (then it is forgotten).
+  bool ResolveCurrent(uint32_t base) {
+    auto it = resolve_stamps.find(base);
+    if (it == resolve_stamps.end() || it->second.written_back) return true;
+    auto& st = it->second;
+    if (st.checked_frame == frame) return true;
+    if (SampleGuest(base, st.size) == st.hash) {
+      st.checked_frame = frame;
+      return true;
+    }
+    if (stale_resolves_logged < 40) {
+      stale_resolves_logged++;
+      REXLOG_INFO("[native] resolve at {:08X} overwritten by the CPU: sampling guest memory instead", base);
+    }
+    resolve_stamps.erase(it);
+    resolved_latest.erase(base);
+    resolved_depth.erase(base);
+    resolved_by_address.erase(base);
+    return false;
+  }
 
   ResolvedTexture* LatestResolved(uint32_t address, bool depth_fetch, uint32_t width = 0, uint32_t height = 0) {
     if (depth_fetch) {
@@ -439,7 +654,7 @@ struct Backend::Impl {
   uint32_t blit_sampler = 0;
 
   // Frame dump state.
-  static constexpr uint32_t kDumpW = 640, kDumpH = 360, kDumpSlots = 160;
+  static constexpr uint32_t kDumpW = 640, kDumpH = 360, kDumpSlots = 320;
   std::unique_ptr<RenderTexture> dump_tex;
   std::unique_ptr<RenderFramebuffer> dump_fb;
   std::unique_ptr<RenderBuffer> dump_readback;
@@ -457,6 +672,7 @@ struct Backend::Impl {
   };
   std::vector<DumpInfo> dump_infos;
   std::string dump_log;  // one line per command of the dumped frame
+  std::unordered_set<uint32_t> dump_raw_f36;  // guest textures whose raw bytes the dump saved
   std::string texture_log;  // textures of the draw being logged
   std::vector<uint32_t> dump_draws;  // {prim, count, 2048 constants} per draw, like the SDK's draws.bin
   std::vector<std::array<uint32_t, 6>> dump_textures;  // first DXT1 fetch constants sampled in the frame
@@ -495,7 +711,7 @@ struct Backend::Impl {
     uint32_t slot = uint32_t(dump_infos.size());
     DumpTexture(list, t.descriptor, uint32_t(t.format), t.width, t.height, address, flags, words);
     uint32_t bpt = BytesPerTexel(t.format);
-    if (!bpt || !t.texture || t.width > 2048 || t.height > 2048) return;
+    if (!bpt || !t.texture || t.width > 2048 || t.height > kMaxTargetRows) return;
     uint32_t row = (t.width + 63) & ~63u;
     uint64_t size = uint64_t(row) * t.height * bpt;
     uint64_t offset = (dump_raw_used + 255) & ~255ull;
@@ -512,6 +728,7 @@ struct Backend::Impl {
 
   // Snapshot of a bound render target (flags 0xF00000 + index), for checking a pass before resolves.
   void DumpTarget(RenderCommandList* list, RenderTarget* t, uint32_t index) {
+    InvalidateDrawState();
     if (!t || !t->descriptor) return;
     uint32_t words[6] = {};
     Transition(list, t->texture.get(), RenderTextureLayout::SHADER_READ);
@@ -521,6 +738,7 @@ struct Backend::Impl {
 
   void DumpTexture(RenderCommandList* list, uint32_t descriptor, uint32_t format, uint32_t width, uint32_t height,
                    uint32_t address, uint32_t flags, const uint32_t words[6]) {
+    InvalidateDrawState();
     uint32_t slot = uint32_t(dump_infos.size());
     if (slot >= kDumpSlots) return;
     if (!dump_tex) {
@@ -548,6 +766,7 @@ struct Backend::Impl {
   }
 
   void BlitTo(RenderCommandList* list, uint32_t descriptor, RenderFormat format) {
+    InvalidateDrawState();
     auto& pipeline = blit_pipelines[uint32_t(format)];
     if (!pipeline) {
       RenderGraphicsPipelineDesc desc;
@@ -576,6 +795,7 @@ struct Backend::Impl {
   RenderFormat digits_format = RenderFormat::UNKNOWN;
   void DrawCounter(RenderCommandList* list, uint32_t value, int32_t x, int32_t y, uint32_t scale,
                    RenderFormat format) {
+    InvalidateDrawState();
     if (!digits_ps)
       digits_ps = device->createShader(g_native_digits_ps, sizeof(g_native_digits_ps), "PSDigits",
                                        RenderShaderFormat::SPIRV);
@@ -612,6 +832,60 @@ struct Backend::Impl {
   // Current framebuffer binding.
   const RenderFramebuffer* bound_fb = nullptr;
   RenderTarget* bound_color[4] = {};
+
+  // Predicated tiling: GTA draws its G-buffer in two tiles split at `tile_split` rows, and the
+  // four surfaces overlap in EDRAM (bases 180/300/600/480 at pitch 1280). RT2 (base 600) is only
+  // resolved for the top tile: its bottom-tile data stays in EDRAM, where the next surface drawn
+  // at base 480 sees it from row tile_split on, and the full resolve of that surface carries it
+  // into memory (06AA0000). Targets here are separate textures, so TileAlias copies it over.
+  struct TileResolves {
+    RenderTarget* target = nullptr;
+    uint32_t pitch = 0, format = 0;
+    bool top = false, bottom = false;
+  };
+  uint32_t tile_split = 0;
+  std::unordered_map<uint32_t, TileResolves> tile_resolves;  // color EDRAM base -> this frame's tile resolves
+  std::unordered_set<RenderTarget*> tile_alias_done;
+  uint32_t tile_alias_logged = 0;
+
+  static bool Is64bpp(uint32_t format) { return format == 5 || format == 7 || format == 15; }
+
+  void NoteTileResolve(uint32_t base, uint32_t format, uint32_t pitch, RenderTarget* t, uint32_t x1, uint32_t y1,
+                       uint32_t y2, uint32_t py) {
+    if (x1 != 0) return;
+    if (y1 > 0 && py == y1) {
+      tile_split = y1;
+      auto& tr = tile_resolves[base];
+      tr = {t, pitch, format, tr.target == t && tr.top, true};
+    } else if (y1 == 0 && py == 0 && tile_split && y2 == tile_split) {
+      tile_resolves[base] = {t, pitch, format, true, false};
+    }
+  }
+
+  void TileAlias(uint32_t base, uint32_t format, uint32_t pitch, RenderTarget* t) {
+    if (!tile_split || !grow_list || t->msaa || Is64bpp(format) || tile_alias_done.count(t)) return;
+    auto self = tile_resolves.find(base);
+    if (self == tile_resolves.end() || self->second.target != t || !self->second.bottom) return;
+    // 32-bpp EDRAM tiles are 80x16 samples; tile_split rows further on starts the other surface.
+    uint32_t other = base + tile_split / 16 * ((pitch + 79) / 80);
+    auto o = tile_resolves.find(other);
+    if (o == tile_resolves.end() || !o->second.top || o->second.bottom || o->second.pitch != pitch) return;
+    RenderTarget* src = o->second.target;
+    if (src == t || src->msaa || src->format != t->format || Is64bpp(o->second.format)) return;
+    uint32_t rows = std::min(src->height, t->height);
+    if (rows <= tile_split) return;
+    tile_alias_done.insert(t);
+    if (tile_alias_logged < 8) {
+      tile_alias_logged++;
+      REXLOG_INFO("[native] tile alias: surface {:03X} rows {}-{} take the bottom tile of {:03X} (never resolved)", base,
+                  tile_split, rows, other);
+    }
+    Transition(grow_list, src->texture.get(), RenderTextureLayout::COPY_SOURCE);
+    Transition(grow_list, t->texture.get(), RenderTextureLayout::COPY_DEST);
+    RenderBox box(0, int32_t(tile_split), int32_t(std::min(src->width, t->width)), int32_t(rows));
+    grow_list->copyTextureRegion(RenderTextureCopyLocation::Subresource(t->texture.get()),
+                                 RenderTextureCopyLocation::Subresource(src->texture.get()), 0, tile_split, 0, &box);
+  }
   RenderTarget* bound_depth = nullptr;
 
   uint32_t AllocDescriptor() {
@@ -677,6 +951,8 @@ struct Backend::Impl {
                               null_views[i].get());
     }
     writeback_resolves = REXCVAR_GET(gtav_native) == "on";
+    if (writeback_resolves)
+      for (auto& pool : query_pools) pool = device->createOcclusionQueryPool(kMaxQueries);
     zero_buffer = device->createBuffer(RenderBufferDesc::UploadBuffer(256, RenderBufferFlag::VERTEX));
     std::memset(zero_buffer->map(), 0, 256);
     RenderSamplerDesc linear;
@@ -762,10 +1038,18 @@ struct Backend::Impl {
     std::string dir = REXCVAR_GET(gtav_native_spirv_dir);
     if (dir.empty())
       dir = DefaultSpirvDir();
-    std::string path = fmt::format("{}/{}_{:016X}.spv", dir, pixel ? "ps" : "vs", hash);
+    g_spirv_preload.Start(dir, device);
+    std::string name = fmt::format("{}_{:016X}.spv", pixel ? "ps" : "vs", hash);
+    std::string path = fmt::format("{}/{}", dir, name);
     std::unique_ptr<RenderShader> shader;
-    if (FILE* f = std::fopen(path.c_str(), "rb")) {
-      std::vector<uint8_t> data;
+    std::vector<uint8_t> data;
+    std::unique_ptr<RenderShader> ready;
+    if (int got = g_spirv_preload.TakeShader(name, &ready, &data); got == 1) {
+      shader = std::move(ready);
+    } else if (got == 2) {
+      shader = device->createShader(data.data(), data.size(), "main", RenderShaderFormat::SPIRV);
+    } else if (g_spirv_preload.KnownMissing(name)) {
+    } else if (FILE* f = std::fopen(path.c_str(), "rb")) {
       std::fseek(f, 0, SEEK_END);
       data.resize(size_t(std::ftell(f)));
       std::fseek(f, 0, SEEK_SET);
@@ -776,7 +1060,11 @@ struct Backend::Impl {
     // vs_<hash>.indirect (written by the shader census): the shader fetches vertices by a computed
     // index and needs the raw streams (Draw fills its vfetchIndirect records).
     if (!pixel && shader) {
-      if (FILE* m = std::fopen(fmt::format("{}/vs_{:016X}.indirect", dir, hash).c_str(), "rb")) {
+      std::string marker = fmt::format("vs_{:016X}.indirect", hash);
+      if (g_spirv_preload.Contains(marker)) {
+        indirect_fetch_shaders.insert(hash);
+      } else if (g_spirv_preload.KnownMissing(marker)) {
+      } else if (FILE* m = std::fopen(fmt::format("{}/{}", dir, marker).c_str(), "rb")) {
         indirect_fetch_shaders.insert(hash);
         std::fclose(m);
       }
@@ -821,7 +1109,7 @@ struct Backend::Impl {
     // The guest never states a surface height. GTA V renders its 720p targets with predicated
     // tiling (EDRAM holds only a tile of them), but D3D-level draws arrive once for the whole
     // surface, so targets are full size: at least 720 lines, never limited by EDRAM.
-    height = std::min(std::max({height, t.height, 720u}), 2048u);
+    height = std::min(std::max({height, t.height, 720u}), kMaxTargetRows);
     // Grown targets keep their contents: GTA binds a taller color target with the scene's depth
     // (e.g. the fog pass), and recreating the depth empty let distant fog meshes cover everything.
     std::unique_ptr<RenderTexture> old_texture;
@@ -878,16 +1166,35 @@ struct Backend::Impl {
   }
 
   // Converted (host-endian, repacked) vertex or index data, cached by guest range and content.
+  // Conversions write byte by byte; upload memory is write-combined, so they go through a
+  // cached scratch buffer and land in one sequential copy.
+  std::vector<uint8_t> convert_scratch;
+  template <class F>
+  void ConvertInto(uint8_t* dst, uint64_t size, const F& convert) {
+    if (convert_scratch.size() < size) convert_scratch.resize(size_t(size));
+    convert(convert_scratch.data());
+    std::memcpy(dst, convert_scratch.data(), size_t(size));
+  }
+
   const RenderBuffer* GuestBuffer(uint64_t key, const uint8_t* guest, uint64_t guest_size, uint64_t host_size,
                                   const std::function<void(uint8_t*)>& convert) {
     auto& b = buffers[key];
     if (b.buffer && b.checked_frame == frame) return b.buffer.get();
+    // Large buffers: a sampled hash every frame and a full one every 8 frames.
+    constexpr uint64_t kSmallBuffer = 64 << 10;
+    if (b.buffer && guest_size > kSmallBuffer && b.size == host_size && frame - b.full_frame < 8 &&
+        SampledHash(guest, guest_size) == b.sampled) {
+      b.checked_frame = frame;
+      return b.buffer.get();
+    }
     uint64_t content = Hash(guest, guest_size);
+    b.full_frame = frame;
+    if (guest_size > kSmallBuffer) b.sampled = SampledHash(guest, guest_size);
     if (!b.buffer || b.content != content || b.size != host_size) {
       if (b.buffer) dead_buffers.push_back(std::move(b.buffer));  // an in-flight frame may read it
       b.buffer = device->createBuffer(RenderBufferDesc::UploadBuffer(
           std::max<uint64_t>(host_size, 16), RenderBufferFlag::VERTEX | RenderBufferFlag::INDEX));
-      convert(static_cast<uint8_t*>(b.buffer->map()));
+      ConvertInto(static_cast<uint8_t*>(b.buffer->map()), host_size, convert);
       b.content = content;
       b.size = host_size;
     }
@@ -901,6 +1208,7 @@ struct Backend::Impl {
     if (!base) return kNull2D;
     uint32_t dim = (words[5] >> 9) & 3;  // dword_5.dimension: 0 1D, 1 2D, 2 3D, 3 cube
     *dimension = dim == 2 ? 1 : dim == 3 ? 2 : 0;
+    ResolveCurrent(base & 0x1FFFFFFF);  // forgets a resolve the CPU overwrote since
     if (dim == 3) {  // cube: only resolved (render-to-cube) textures so far
       ResolvedTexture* r = LatestResolved(base & 0x1FFFFFFF, false);
       if (!r || !r->cube_descriptor) return kNullCube;
@@ -916,10 +1224,33 @@ struct Backend::Impl {
     }
     uint64_t key = Hash(words, 24);
     auto& t = textures[key];
+    tprof.lookups++;
     if (t.failed) return dim == 2 ? kNull3D : kNull2D;
-    if (t.texture && frame - t.checked_frame < 30) return t.descriptor;
+    // Guest memory changes under a cached texture, and the emulator's write watches see every
+    // change: the CPU rewrites some textures in place (vehicle damage maps, 128x128 32_FLOAT), and
+    // streaming recycles same-size slots, so another texture arrives at the same address with the
+    // same fetch constant. Every frame: textures up to 64 KB (the 128x128 32_FLOAT damage maps)
+    // get a full hash, larger ones a sampled hash (and a full one every 30 frames).
+    constexpr uint64_t kSmallTexture = 64 << 10;
+    if (t.texture && (t.checked_frame == frame || t.sample_frame == frame)) return t.descriptor;
+    if (t.texture && t.bytes > kSmallTexture && frame - t.checked_frame < 30) {
+      ScopedMs st{tprof.sampled_ms};
+      tprof.sampled++;
+      if (HashGuestTexture(words, true) == t.sampled_hash) {
+        t.sample_frame = frame;
+        return t.descriptor;
+      }
+    }
     // Recheck: hash the raw guest bytes and only decode when they changed.
-    uint64_t raw = HashGuestTexture(words);
+    uint64_t raw;
+    {
+      ScopedMs ft{tprof.full_ms};
+      tprof.full++;
+      tprof.full_bytes += t.bytes;
+      raw = HashGuestTexture(words);
+    }
+    t.sampled_hash = HashGuestTexture(words, true);
+    t.sample_frame = frame;
     if (t.texture && raw && raw == t.raw_hash) {
       t.checked_frame = frame;
       return t.descriptor;
@@ -933,6 +1264,7 @@ struct Backend::Impl {
     uint64_t content = Hash(dec.data.data(), std::min<size_t>(dec.data.size(), 1 << 20));
     t.checked_frame = frame;
     t.raw_hash = raw;
+    t.bytes = dec.data.size();
     if (t.texture && t.content == content) return t.descriptor;
     t.content = content;
     if (!t.texture) {
@@ -977,12 +1309,31 @@ struct Backend::Impl {
     s.addressU = clamp((words[0] >> 10) & 7);
     s.addressV = clamp((words[0] >> 13) & 7);
     s.addressW = clamp((words[0] >> 16) & 7);
-    s.magFilter = ((words[3] >> 19) & 3) == 0 ? RenderFilter::NEAREST : RenderFilter::LINEAR;
-    s.minFilter = ((words[3] >> 21) & 3) == 0 ? RenderFilter::NEAREST : RenderFilter::LINEAR;
-    s.mipmapMode = ((words[3] >> 23) & 3) == 0 ? RenderMipmapMode::NEAREST : RenderMipmapMode::LINEAR;
-    uint32_t aniso = (words[3] >> 25) & 7;
-    s.anisotropyEnabled = aniso >= 2 && aniso <= 5;
+    // Border colour (dword 5 bits 0-1), as the SDK texture cache sets it: white is opaque white,
+    // everything else transparent black. Plume's default (opaque black) gave UI quads clamped to
+    // border an opaque box and cut lights sampled past their map edge off at a hard edge.
+    s.borderColor = (words[5] & 3) == 1 ? RenderBorderColor::OPAQUE_WHITE : RenderBorderColor::TRANSPARENT_BLACK;
+    // Filters and LOD range as the SDK texture cache derives them (GetSamplerParameters /
+    // WriteSampler): any anisotropy (even 1:1) means trilinear, the basemap mip filter (2) samples
+    // only the first level, levels start at mip_min_level, and the fetch constant's LOD bias
+    // (dword 4 bits 12-21, 5 fractional bits; the SDK adds it in the shader) shifts the LOD.
+    uint32_t mip_filter = (words[3] >> 23) & 3;
+    uint32_t aniso = std::min((words[3] >> 25) & 7, 5u);
+    bool base_map = mip_filter == 2;
+    if (aniso) {
+      s.magFilter = s.minFilter = RenderFilter::LINEAR;
+      s.mipmapMode = RenderMipmapMode::LINEAR;
+    } else {
+      s.magFilter = ((words[3] >> 19) & 3) == 1 ? RenderFilter::LINEAR : RenderFilter::NEAREST;
+      s.minFilter = ((words[3] >> 21) & 3) == 1 ? RenderFilter::LINEAR : RenderFilter::NEAREST;
+      s.mipmapMode = mip_filter == 1 ? RenderMipmapMode::LINEAR : RenderMipmapMode::NEAREST;
+    }
+    s.anisotropyEnabled = aniso >= 2;
     s.maxAnisotropy = s.anisotropyEnabled ? 1u << (aniso - 1) : 1;
+    s.minLOD = float((words[4] >> 2) & 15);
+    s.maxLOD = base_map ? s.minLOD + 0.25f : float((words[4] >> 6) & 15);
+    if (s.maxLOD < s.minLOD) s.maxLOD = s.minLOD;
+    s.mipLODBias = float(int32_t(words[4] << 10) >> 22) / 32.0f;
     return Sampler(s);
   }
 
@@ -1039,6 +1390,7 @@ struct Backend::Impl {
       for (uint32_t i = 0; i < count; i++) {
         auto c = regs::Color(r, int(i));
         color[i] = Target(c.base, uint32_t(c.format), false, surface.pitch, surface.msaa, height);
+        TileAlias(c.base, uint32_t(c.format), surface.pitch, color[i]);
       }
     }
     *depth = nullptr;
@@ -1085,7 +1437,7 @@ struct Backend::Impl {
       uint64_t vs, ps;
       uint32_t topology, count, spec, msaa;
       uint32_t formats[5];
-      uint32_t depthcontrol, blend[4], mask, stencil[2], mode;
+      uint32_t depthcontrol, blend[4], mask, stencil[2], mode, alpha_to_mask;
     } k{};
     k.vs = d.vs_hash;
     k.ps = d.ps_hash;
@@ -1102,6 +1454,7 @@ struct Backend::Impl {
     k.stencil[0] = regs::Read(r, regs::RB_STENCILREFMASK);
     k.stencil[1] = regs::Read(r, regs::RB_STENCILREFMASK_BF);
     k.mode = regs::Read(r, regs::PA_SU_SC_MODE_CNTL);
+    k.alpha_to_mask = (regs::Read(r, regs::RB_COLORCONTROL) >> 4) & 1;
     uint64_t h = Hash(&k, sizeof(k));
     for (uint32_t i = 0; i < vl.element_count; i++) {
       const auto& e = vl.elements[i];
@@ -1147,7 +1500,10 @@ struct Backend::Impl {
       desc.stencilWriteMask = (ref >> 16) & 0xFF;
       desc.stencilFrontFace = {StencilOp((dc >> 14) & 7), StencilOp((dc >> 11) & 7), StencilOp((dc >> 17) & 7),
                                Compare((dc >> 8) & 7)};
-      desc.stencilBackFace = (dc & 0x80) ? RenderStencilFaceDesc{StencilOp((dc >> 26) & 7), StencilOp((dc >> 23) & 7),
+      // Like the SDK, rect lists are not polygonal: always front faces, so the back-face stencil
+      // state never applies (GTA's sky G-buffer fill sets back-face ALWAYS; honouring it on the
+      // host's back-facing rect overwrote the whole G-buffer).
+      desc.stencilBackFace = (dc & 0x80) && !rect_list ? RenderStencilFaceDesc{StencilOp((dc >> 26) & 7), StencilOp((dc >> 23) & 7),
                                                                  StencilOp((dc >> 29) & 7), Compare((dc >> 20) & 7)}
                                          : desc.stencilFrontFace;
     }
@@ -1162,6 +1518,17 @@ struct Backend::Impl {
                                             : RenderCullMode::NONE;
     desc.frontFace = (mode & 4) ? RenderFrontFace::CLOCKWISE : RenderFrontFace::COUNTER_CLOCKWISE;
     desc.multisampling = RenderMultisampling(SampleCount(regs::Surface(r).msaa));
+    // RB_COLORCONTROL.alpha_to_mask_enable: coverage from oC0.w (GTA's tree LOD billboards and
+    // foliage use it instead of the alpha test; without it they drew as solid ellipses).
+    // Without MSAA the pixel shader does the Xenos dither instead (g_AlphaToMask): host
+    // alpha-to-coverage at one sample is a hard ~0.5 cut, so fading foliage popped on and off.
+    desc.alphaToCoverageEnabled = count && ((regs::Read(r, regs::RB_COLORCONTROL) >> 4) & 1) &&
+                                  desc.multisampling.sampleCount != RenderSampleCount::COUNT_1;
+    if (desc.alphaToCoverageEnabled && alpha_to_mask_logged < 12) {
+      alpha_to_mask_logged++;
+      REXLOG_INFO("[native] alpha-to-coverage pipeline {:016X}: msaa {}, colorcontrol {:08X}", key,
+                  regs::Surface(r).msaa, regs::Read(r, regs::RB_COLORCONTROL));
+    }
     uint32_t mask = regs::Read(r, regs::RB_COLOR_MASK);
     desc.renderTargetCount = count;
     for (uint32_t i = 0; i < count; i++) {
@@ -1218,11 +1585,98 @@ struct Backend::Impl {
     return (pipelines[key] = std::move(pipeline)).get();
   }
 
+  // Where a frame's recording time goes, logged every 300 frames ("[native] record ms per frame").
+  struct DrawProfile {
+    double setup = 0, consts = 0, fetch = 0, streams = 0, pipe = 0, submit = 0;
+    std::chrono::steady_clock::time_point t;
+    void Start() { t = std::chrono::steady_clock::now(); }
+    void Mark(double& bucket) {
+      auto now = std::chrono::steady_clock::now();
+      bucket += std::chrono::duration<double, std::milli>(now - t).count();
+      t = now;
+    }
+  };
+  DrawProfile prof, prof_sum;
+  struct TextureProfile {
+    uint64_t lookups = 0, cached_blocks = 0, resolved = 0, sampled = 0, full = 0, full_bytes = 0;
+    double full_ms = 0, sampled_ms = 0, descriptor_ms = 0, sampler_ms = 0, current_ms = 0, resolved_ms = 0;
+  } tprof;
+  // Draw state already in the command list: binding the same layout, descriptor sets, pipeline,
+  // viewports and buffers again for each of ~2,700 draws cost ~2 ms a frame. Any other code that
+  // binds state (clears, resolves, dumps, overlays) calls InvalidateDrawState.
+  struct DrawState {
+    bool sets = false;
+    RenderPipeline* pipeline = nullptr;
+    uint32_t viewports = 0;
+    RenderViewport vp{};
+    RenderRect scissor{};
+    RenderVertexBufferView views[16]{};
+    RenderInputSlot slots[16]{};
+    bool slot_bound[16]{};
+    RenderIndexBufferView index{RenderBufferReference(), 0, RenderFormat::UNKNOWN};
+    bool index_bound = false;
+  } draw_state;
+  void InvalidateDrawState() { draw_state = DrawState{}; }
+  void BindIndexBuffer(RenderCommandList* list, const RenderIndexBufferView& view) {
+    auto& ds = draw_state;
+    if (ds.index_bound && ds.index.buffer.ref == view.buffer.ref && ds.index.buffer.offset == view.buffer.offset &&
+        ds.index.size == view.size && ds.index.format == view.format)
+      return;
+    list->setIndexBuffer(&view);
+    ds.index = view;
+    ds.index_bound = true;
+  }
+  struct FetchCache {
+    std::array<uint32_t, 192> sc{};  // shared constants 0-191: descriptors, samplers, exp scales
+    uint32_t offset = 0;
+    bool valid = false;
+  } fetch_cache;
+  // Per-slot memo of TextureDescriptor + SamplerDescriptor, keyed by the six fetch words:
+  // ~20,000 slot lookups a frame repeat a few hundred fetch constants. Results only change at a
+  // resolve or a new frame, which bump the generation.
+  struct SlotMemo {
+    uint32_t words[6];
+    uint32_t dim, descriptor, sampler, generation;
+  };
+  static constexpr uint32_t kSlotMemoSize = 4096;
+  std::vector<SlotMemo> slot_memo = std::vector<SlotMemo>(kSlotMemoSize);
+  uint32_t slot_generation = 1;
+  uint64_t slot_memo_hits = 0;
+  uint32_t prof_frames = 0;
+
+  // The guest's ALU constants are big-endian: byte-swapped 16 bytes at a time into upload memory.
+  // The capture shares a block between consecutive draws with equal constants (same offset).
+  struct LastConstants {
+    uint32_t offset = 0;
+    UploadAllocation gpu{};
+    bool valid = false;
+  };
+  LastConstants last_vs, last_ps;
+
+  __attribute__((target("ssse3"))) UploadAllocation ConstantUpload(const uint8_t* src, uint32_t offset,
+                                                                   LastConstants& last) {
+    if (last.valid && last.offset == offset) return last.gpu;
+    auto a = upload.Allocate(kAluSize);
+    const __m128i swap = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+    for (uint32_t i = 0; i < kAluSize; i += 16) {
+      __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i));
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(a.cpu + i), _mm_shuffle_epi8(v, swap));
+    }
+    last.offset = offset;
+    last.gpu = a;
+    last.valid = true;
+    return a;
+  }
+
   void Draw(RenderCommandList* list, const FramePacket& f, const DrawCommand& d) {
+    prof.Start();
     const uint8_t* r = f.At(d.regs);
-    // GTAV_NATIVE_SKIP_PS=hash,hash: bring-up diagnostic that drops draws using these pixel shaders.
+    // GTAV_NATIVE_SKIP_PS / GTAV_NATIVE_SKIP_VS=hash,hash: bring-up diagnostic that drops draws using
+    // these pixel / vertex shaders (bisecting the lighting pass).
     static const std::string skip_ps = std::getenv("GTAV_NATIVE_SKIP_PS") ? std::getenv("GTAV_NATIVE_SKIP_PS") : "";
+    static const std::string skip_vs = std::getenv("GTAV_NATIVE_SKIP_VS") ? std::getenv("GTAV_NATIVE_SKIP_VS") : "";
     if (!skip_ps.empty() && skip_ps.find(fmt::format("{:016X}", d.ps_hash)) != std::string::npos) return;
+    if (!skip_vs.empty() && skip_vs.find(fmt::format("{:016X}", d.vs_hash)) != std::string::npos) return;
     RenderShader* vs = Shader(d.vs_hash, false);
     RenderShader* ps = Shader(d.ps_hash, true);
     if (!vs || d.count == 0 || d.element_count == 0) {
@@ -1239,7 +1693,7 @@ struct Backend::Impl {
     uint32_t dc = regs::Read(r, regs::RB_DEPTHCONTROL);
     RenderTarget* color[4] = {};
     RenderTarget* depth = nullptr;
-    uint32_t count = ActiveTargets(r, std::min(height, 2048u), color, &depth, (dc & 3) != 0);
+    uint32_t count = ActiveTargets(r, std::min(height, kMaxTargetRows), color, &depth, (dc & 3) != 0);
     if (count == 0 && !depth) {
       stat_skipped++;
       return;
@@ -1252,19 +1706,26 @@ struct Backend::Impl {
 
     // Constants: VS/PS float constants (byte-swapped), shared constants (textures, samplers,
     // booleans, alpha threshold).
-    auto vsc = upload.Allocate(kAluSize), psc = upload.Allocate(kAluSize), shared = upload.Allocate(kSharedConstantsSize);
+    prof.Mark(prof.setup);
+    // Consecutive draws mostly share a constant set: the last upload is reused when the guest
+    // bytes match (memcmp of 4 KB is ~20x cheaper than swapping and writing it again).
     const uint8_t* vsrc = f.At(d.vs_consts);
     const uint8_t* psrc = f.At(d.ps_consts);
-    for (uint32_t i = 0; i < kAluSize; i += 4) {
-      uint32_t v = be32(vsrc + i), p = be32(psrc + i);
-      std::memcpy(vsc.cpu + i, &v, 4);
-      std::memcpy(psc.cpu + i, &p, 4);
-    }
-    std::memset(shared.cpu, 0, kSharedConstantsSize);
-    uint32_t* sc = reinterpret_cast<uint32_t*>(shared.cpu);
+    UploadAllocation vsc = ConstantUpload(vsrc, d.vs_consts, last_vs), psc = ConstantUpload(psrc, d.ps_consts, last_ps);
+    // Shared constants are built here and copied into upload memory once: that memory is
+    // write-combined, and reading it back (or scattering 4-byte writes) cost ~100 ms a frame.
+    alignas(16) uint8_t shared_cpu[kSharedConstantsSize] = {};
+    prof.Mark(prof.consts);
+    uint32_t* sc = reinterpret_cast<uint32_t*>(shared_cpu);
     const uint8_t* fetch = f.At(d.fetch);
     texture_log.clear();
-    for (uint32_t slot = 0; slot < 32; slot++) {
+    // The texture/sampler descriptors of a fetch block only change at a resolve (new resolve
+    // textures, layouts): a draw sharing the previous draw's block reuses its slots.
+    bool fetch_cached = !dumping && fetch_cache.valid && fetch_cache.offset == d.fetch;
+    if (fetch_cached) std::memcpy(sc, fetch_cache.sc.data(), sizeof(fetch_cache.sc));
+    tprof.cached_blocks += fetch_cached;
+    auto slots_start = std::chrono::steady_clock::now();
+    for (uint32_t slot = 0; slot < 32 && !fetch_cached; slot++) {
       uint32_t words[6];
       for (int w = 0; w < 6; w++) words[w] = be32(fetch + slot * 24 + w * 4);
       sc[0 * 32 + slot] = kNull2D;
@@ -1276,7 +1737,17 @@ struct Backend::Impl {
       std::memcpy(&sc[160 + slot], &exp_scale, 4);
       if ((words[0] & 3) != 2) continue;
       uint32_t dim;
-      uint32_t descriptor = TextureDescriptor(list, words, &dim);
+      uint32_t descriptor;
+      uint32_t mix = words[0] * 0x9E3779B1u;
+      for (int w = 1; w < 6; w++) mix = (mix ^ words[w]) * 0x9E3779B1u;
+      SlotMemo& memo = slot_memo[(mix >> 20) & (kSlotMemoSize - 1)];
+      if (!dumping && memo.generation == slot_generation && std::memcmp(memo.words, words, 24) == 0) {
+        slot_memo_hits++;
+        sc[memo.dim * 32 + slot] = memo.descriptor;
+        sc[96 + slot] = memo.sampler;
+        continue;
+      }
+      descriptor = TextureDescriptor(list, words, &dim);
       if (dumping) {
         uint32_t base = FetchBaseAddress(words) & 0x1FFFFFFF;
         char kind = descriptor <= kNullCube ? 'N' : resolved_latest.count(base) ? 'R' : 'T';
@@ -1284,18 +1755,58 @@ struct Backend::Impl {
             std::none_of(dump_textures.begin(), dump_textures.end(),
                          [&](const auto& w) { return (w[1] & ~0xFFFu) == (words[1] & ~0xFFFu); }))
           dump_textures.push_back({words[0], words[1], words[2], words[3], words[4], words[5]});
+        // 32_FLOAT guest textures (vehicle damage maps): raw bytes, once per address.
+        if (kind == 'T' && (words[1] & 0x3F) == 36 && dump_raw_f36.insert(base).second) {
+          uint32_t w = ((words[2] & 0x1FFF) + 32) & ~31u, h = (((words[2] >> 13) & 0x1FFF) + 32) & ~31u;
+          std::string dir = LogPath(fmt::format("native_dump/frame_{}", dump_frame));
+          std::filesystem::create_directories(dir);
+          const uint8_t* src = REX_KERNEL_MEMORY()->TranslatePhysical(base);
+          if (FILE* fp = src ? std::fopen(fmt::format("{}/tex_{:08X}_f36.bin", dir, base).c_str(), "wb") : nullptr) {
+            std::fwrite(words, 4, 6, fp);
+            std::fwrite(src, 1, size_t(w) * h * 4, fp);
+            std::fclose(fp);
+          }
+        }
         int32_t exp_adjust = int32_t(words[3] << 13) >> 26;  // dword_3 bits 13-18
-        texture_log += fmt::format(" s{}:{}{:08X}/f{}d{}sw{:03X}sg{:02X}e{}/{}x{}", slot, kind, base, words[1] & 0x3F,
-                                   dim, (words[3] >> 1) & 0xFFF, (words[0] >> 2) & 0xFF, exp_adjust,
-                                   (words[2] & 0x1FFF) + 1, ((words[2] >> 13) & 0x1FFF) + 1);
+        // c = clamp x/y/z, b = border colour, m = mag/min/mip filter, a = aniso, l = mip levels min-max,
+        // lb = LOD bias (x32).
+        texture_log += fmt::format(
+            " s{}:{}{:08X}/f{}d{}sw{:03X}sg{:02X}e{}c{}{}{}b{}m{}{}{}a{}l{}-{}lb{}/{}x{}", slot, kind, base,
+            words[1] & 0x3F, dim, (words[3] >> 1) & 0xFFF, (words[0] >> 2) & 0xFF, exp_adjust, (words[0] >> 10) & 7,
+            (words[0] >> 13) & 7, (words[0] >> 16) & 7, words[5] & 3, (words[3] >> 19) & 3, (words[3] >> 21) & 3,
+            (words[3] >> 23) & 3, (words[3] >> 25) & 7, (words[4] >> 2) & 15, (words[4] >> 6) & 15,
+            int32_t(words[4] << 10) >> 22, (words[2] & 0x1FFF) + 1, ((words[2] >> 13) & 0x1FFF) + 1);
       }
       sc[dim * 32 + slot] = descriptor;
       sc[96 + slot] = SamplerDescriptor(words);
+      if (!dumping) {
+        std::memcpy(memo.words, words, 24);
+        memo.dim = dim;
+        memo.descriptor = descriptor;
+        memo.sampler = sc[96 + slot];
+        memo.generation = slot_generation;
+      }
     }
+    if (!fetch_cached)
+      tprof.descriptor_ms +=
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - slots_start).count();
+    if (!fetch_cached && !dumping) {
+      std::memcpy(fetch_cache.sc.data(), sc, sizeof(fetch_cache.sc));
+      fetch_cache.offset = d.fetch;
+      fetch_cache.valid = true;
+    }
+    prof.Mark(prof.fetch);
     const uint8_t* bools = r;  // the shadow starts with the 0x4900 bool constants
     sc[128] = (be32(bools) & 0xFFFF) | (be32(bools + 16) & 0xFFFF) << 16;
     float alpha_ref = regs::ReadFloat(r, regs::RB_ALPHA_REF);
     std::memcpy(&sc[132], &alpha_ref, 4);
+    // g_AlphaToMask (533): without MSAA the shader applies the Xenos alpha-to-mask dither itself.
+    {
+      uint32_t colorcontrol = regs::Read(r, regs::RB_COLORCONTROL);
+      sc[133] = count && ((colorcontrol >> 4) & 1) && SampleCount(regs::Surface(r).msaa) == RenderSampleCount::COUNT_1
+                    ? (colorcontrol >> 24) | 0x100u
+                    : 0u;
+    }
     // NDC mapping (g_NdcScale at 536, g_NdcOffset at 544): identity when the viewport transform
     // is on; with it off the shader writes pixel positions, mapped here onto the whole target
     // (the generated SPIR-V negates y afterwards).
@@ -1309,6 +1820,19 @@ struct Backend::Impl {
       vp = RenderViewport(0, 0, float(tw), float(th), vp.minDepth, vp.maxDepth);
     }
     std::memcpy(&sc[134], ndc, sizeof(ndc));
+    // g_HalfPixelOffset at 520: with D3D9 pixel centres (PA_SU_VTX_CNTL.pix_center == 0) the guest
+    // samples attributes at integer window positions, the host at .5; shift geometry by half a
+    // pixel like the SDK. Without it every screen-space pass reads one source texel too far
+    // (the tile depth reductions drift a whole 16 px tile over three levels).
+    if (!(regs::Read(r, regs::PA_SU_VTX_CNTL) & 1)) {
+      float sx = float(tw) * 0.5f, sy = -float(th) * 0.5f;  // window = ndc * s + o
+      if (regs::Read(r, regs::PA_CL_VTE_CNTL) & 1) {
+        sx = regs::ReadFloat(r, regs::PA_CL_VPORT_XSCALE);
+        sy = regs::ReadFloat(r, regs::PA_CL_VPORT_YSCALE);
+      }
+      float half[2] = {sx != 0 ? 0.5f / sx : 0.0f, sy != 0 ? 0.5f / sy : 0.0f};
+      std::memcpy(&sc[130], half, sizeof(half));
+    }
     // g_ColorScale[4] at 560: RB_COLOR_INFO exponent bias, and 1/32 for the 16-bit fixed formats.
     for (uint32_t i = 0; i < 4; i++) {
       static constexpr uint32_t kInfo[4] = {regs::RB_COLOR_INFO, regs::RB_COLOR1_INFO, regs::RB_COLOR2_INFO,
@@ -1392,7 +1916,7 @@ struct Backend::Impl {
       RenderBufferReference ref;
       if (inline_data) {  // CPU-written per draw: per-frame upload memory, never cached
         auto a = upload.Allocate(uint64_t(vertices) * host_stride, 16);
-        convert(a.cpu);
+        ConvertInto(a.cpu, uint64_t(vertices) * host_stride, convert);
         ref = RenderBufferReference(a.buffer, a.offset);
       } else {
         ref = RenderBufferReference(
@@ -1437,7 +1961,7 @@ struct Backend::Impl {
                                     be32(g + at + 8), be32(g + at + 12));
           }
         }
-        uint8_t* record = shared.cpu + kIndirectFetchRecords + location * 32;
+        uint8_t* record = shared_cpu + kIndirectFetchRecords + location * 32;
         uint64_t address = raw[e.stream] | (sb.endian & 3);
         uint32_t fields[3] = {sb.stride / 4, uint32_t(e.offset / 4), e.type};
         std::memcpy(record, &address, 8);
@@ -1446,12 +1970,50 @@ struct Backend::Impl {
     }
     views[slot_count] = RenderVertexBufferView(RenderBufferReference(zero_buffer.get()), 256);
     slots[slot_count++] = RenderInputSlot(kDummyStream, 0);
+    prof.Mark(prof.streams);
 
     uint64_t pkey = PipelineKey(d, vl, color, count, depth, r, topo.topology, spec);
     RenderPipeline* pipeline = Pipeline(pkey, vs, ps, vl, color, count, depth, r, topo.topology, spec, d.primitive == 8);
     if (!pipeline) {
       stat_skipped++;
       return;
+    }
+    prof.Mark(prof.pipe);
+
+    // Dump frame: vertex data of strip/fan draws (light volumes), to diagnose exploding triangles.
+    if (dumping && (d.primitive == 5 || d.primitive == 6) && d.element_count) {
+      const auto& sb = d.streams[d.elements[0].stream];
+      bool inl = d.is_inline && d.elements[0].stream == 0;
+      const uint8_t* g = inl ? f.At(d.inline_vertices) : REX_KERNEL_MEMORY()->TranslatePhysical(sb.address + sb.offset);
+      uint32_t stride = std::max(sb.stride, 1u), avail = inl ? d.inline_size / stride : (sb.size - sb.offset) / stride;
+      uint32_t type = d.elements[0].type, off = d.elements[0].offset;
+      auto pos = [&](uint32_t v) -> std::string {
+        if (v >= avail) return "past-end";
+        const uint8_t* p = g + size_t(v) * stride + off;
+        if (type == 0x1A2360) {  // float16_4, 8in16 swapped
+          float c[4];
+          for (int k = 0; k < 4; k++) {
+            uint16_t h = uint16_t(p[2 * k] << 8 | p[2 * k + 1]);
+            uint32_t e = (h >> 10) & 31, m = h & 1023;
+            float val = e == 0 ? std::ldexp(float(m), -24) : std::ldexp(float(m | 1024), int(e) - 25);
+            c[k] = (h & 0x8000) ? -val : val;
+          }
+          return fmt::format("({:.3g},{:.3g},{:.3g},{:.3g})", c[0], c[1], c[2], c[3]);
+        }
+        if (type == 0x2A23B9) {
+          float c[3];
+          for (int k = 0; k < 3; k++) {
+            uint32_t u = be32(p + 4 * k);
+            std::memcpy(&c[k], &u, 4);
+          }
+          return fmt::format("({:.4g},{:.4g},{:.4g})", c[0], c[1], c[2]);
+        }
+        return fmt::format("type {:06X}", type);
+      };
+      dump_log += fmt::format("  strip/fan: inline={} addr={:08X} size={} offset={} stride={} start={} count={} avail={} "
+                              "v0={} v1={} v2={} v[last-1]={} v[last]={}\n",
+                              inl, sb.address, sb.size, sb.offset, sb.stride, d.start, d.count, avail, pos(d.start),
+                              pos(d.start + 1), pos(d.start + 2), pos(d.start + d.count - 2), pos(d.start + d.count - 1));
     }
 
     // Dump frame: the depth buffer as the first far-plane-pinned draw (sky / distant fog meshes,
@@ -1500,24 +2062,56 @@ struct Backend::Impl {
       std::memcpy(&dump_draws[at], vsc.cpu, kAluSize);
       std::memcpy(&dump_draws[at + 1024], psc.cpu, kAluSize);
     }
+    const RenderFramebuffer* fb_before = bound_fb;
     BindTargets(list, color, count, depth);
-    list->setGraphicsPipelineLayout(layout.get());
-    list->setPipeline(pipeline);
-    list->setGraphicsDescriptorSet(texture_set.get(), 0);
-    list->setGraphicsDescriptorSet(texture_set.get(), 1);
-    list->setGraphicsDescriptorSet(texture_set.get(), 2);
-    list->setGraphicsDescriptorSet(sampler_set.get(), 3);
+    if (bound_fb != fb_before) {  // a new render pass: rebind conservatively
+      draw_state.pipeline = nullptr;
+      draw_state.viewports = 0;
+    }
+    auto& ds = draw_state;
+    if (!ds.sets) {
+      list->setGraphicsPipelineLayout(layout.get());
+      list->setGraphicsDescriptorSet(texture_set.get(), 0);
+      list->setGraphicsDescriptorSet(texture_set.get(), 1);
+      list->setGraphicsDescriptorSet(texture_set.get(), 2);
+      list->setGraphicsDescriptorSet(sampler_set.get(), 3);
+      ds.sets = true;
+    }
+    if (ds.pipeline != pipeline) {
+      list->setPipeline(pipeline);
+      ds.pipeline = pipeline;
+    }
+    auto shared = upload.Allocate(kSharedConstantsSize);
+    std::memcpy(shared.cpu, shared_cpu, kSharedConstantsSize);
     uint64_t push[3] = {vsc.gpu, psc.gpu, shared.gpu};
     list->setGraphicsPushConstants(0, push, 0, sizeof(push));
     // Pipelines with several render targets declare one viewport per target.
     uint32_t w = count ? color[0]->width : depth->width, h = count ? color[0]->height : depth->height;
-    RenderViewport vps[4] = {vp, vp, vp, vp};
-    RenderRect scissors[4];
-    for (auto& sr : scissors) sr = RenderRect(0, 0, int32_t(w), int32_t(h));
-    list->setViewports(vps, std::max(count, 1u));
-    list->setScissors(scissors, std::max(count, 1u));
+    uint32_t nvp = std::max(count, 1u);
+    RenderRect scissor(0, 0, int32_t(w), int32_t(h));
+    if (ds.viewports != nvp || std::memcmp(&ds.vp, &vp, sizeof(vp)) != 0 ||
+        std::memcmp(&ds.scissor, &scissor, sizeof(scissor)) != 0) {
+      RenderViewport vps[4] = {vp, vp, vp, vp};
+      RenderRect scissors[4] = {scissor, scissor, scissor, scissor};
+      list->setViewports(vps, nvp);
+      list->setScissors(scissors, nvp);
+      ds.viewports = nvp;
+      ds.vp = vp;
+      ds.scissor = scissor;
+    }
     // Vertex slots are bound by index; the dummy stream sits at slot 15.
-    for (uint32_t i = 0; i < slot_count; i++) list->setVertexBuffers(slots[i].index, &views[i], 1, &slots[i]);
+    for (uint32_t i = 0; i < slot_count; i++) {
+      uint32_t at = slots[i].index & 15;
+      const auto &a = ds.views[at], &b = views[i];
+      if (ds.slot_bound[at] && a.buffer.ref == b.buffer.ref && a.buffer.offset == b.buffer.offset && a.size == b.size &&
+          ds.slots[at].index == slots[i].index && ds.slots[at].stride == slots[i].stride &&
+          ds.slots[at].classification == slots[i].classification)
+        continue;
+      list->setVertexBuffers(slots[i].index, &views[i], 1, &slots[i]);
+      ds.views[at] = views[i];
+      ds.slots[at] = slots[i];
+      ds.slot_bound[at] = true;
+    }
 
     // Index data: a guest index buffer, or BeginIndexedVertices indices copied into the arena.
     bool inline_indices = d.inline_index_size != 0;
@@ -1544,7 +2138,7 @@ struct Backend::Impl {
       for (uint32_t q = 0; q < quads; q++)
         for (int k = 0; k < 6; k++) out[q * 6 + k] = index(q * 4 + kQuad[k]);
       RenderIndexBufferView view(RenderBufferReference(a.buffer, a.offset), quads * 6 * 4, RenderFormat::R32_UINT);
-      list->setIndexBuffer(&view);
+      BindIndexBuffer(list, view);
       list->drawIndexedInstanced(quads * 6, 1, 0, d.indexed ? d.base_vertex : 0, 0);
     } else if (d.indexed) {
       if (!index_data || !index_bytes) {
@@ -1560,19 +2154,29 @@ struct Backend::Impl {
       RenderBufferReference ib_ref;
       if (inline_indices) {  // CPU-written per draw: per-frame upload memory, never cached
         auto a = upload.Allocate(index_bytes, 16);
-        swap(a.cpu);
+        ConvertInto(a.cpu, index_bytes, swap);
         ib_ref = RenderBufferReference(a.buffer, a.offset);
       } else {
         uint64_t key = Hash(&d.index_address, 4, d.index_size ^ (uint64_t(unit) << 40));
         ib_ref = RenderBufferReference(GuestBuffer(key, guest, d.index_size, d.index_size, swap));
       }
       RenderIndexBufferView view(ib_ref, index_bytes, d.index32 ? RenderFormat::R32_UINT : RenderFormat::R16_UINT);
-      list->setIndexBuffer(&view);
+      BindIndexBuffer(list, view);
       list->drawIndexedInstanced(d.count, 1, d.start, d.base_vertex, 0);
     } else {
       list->drawInstanced(d.count, 1, d.start, 0);
     }
     stat_draws++;
+    prof.Mark(prof.submit);
+    // Dump frame: the scene's HDR target (EDRAM base --gtav_native_dump_rt, default 2D0) after
+    // every draw into it, to find the draw that introduces an artifact (dump index in commands.txt).
+    if (dumping && count && per_draw_budget > 0 &&
+        regs::Color(r, 0).base == uint32_t(REXCVAR_GET(gtav_native_dump_rt)) &&
+        ++rt_draws_seen > uint32_t(std::max(0, REXCVAR_GET(gtav_native_dump_rt_skip)))) {
+      per_draw_budget--;
+      dump_log += fmt::format("  -> snapshot {} after this draw\n", dump_infos.size());
+      DumpTarget(list, color[0], 0x100 + per_draw_budget);
+    }
     // Dump frame: snapshot 16_16 (shadow) targets after their first draws.
     if (dumping && count && color[0]->format == RenderFormat::R16G16_SNORM && snapshot_budget > 0) {
       snapshot_budget--;
@@ -1581,6 +2185,8 @@ struct Backend::Impl {
   }
 
   int snapshot_budget = 3;
+  int per_draw_budget = 0;
+  uint32_t rt_draws_seen = 0;  // draws into the snapshotted target so far (--gtav_native_dump_rt_skip)
   bool far_snapshot_done = false;
 
   struct RenderTopologyInfo {
@@ -1603,10 +2209,12 @@ struct Backend::Impl {
   }
 
   void Clear(RenderCommandList* list, const FramePacket& f, const ClearCommand& c) {
+    InvalidateDrawState();
     const uint8_t* r = f.At(c.regs);
     if (dumping)
-      dump_log += fmt::format("clear flags={:X} color={:08X} z={} stencil={} rt0={:03X} depth={:03X} mode={}\n",
-                              c.flags, c.color, c.z, c.stencil, regs::Color(r, 0).base, regs::Depth(r).base,
+      dump_log += fmt::format("clear flags={:X} color={:08X} z={} stencil={} rt0={:03X}/{} depth={:03X} mode={}\n",
+                              c.flags, c.color, c.z, c.stencil, regs::Color(r, 0).base,
+                              uint32_t(regs::Color(r, 0).format), regs::Depth(r).base,
                               regs::Read(r, regs::RB_MODECONTROL) & 7);
     // XDK D3DCLEAR flags: bits 0-3 = render targets 0-3, 0x10 = Z buffer, 0x20 = stencil.
     bool color = (c.flags & 0xF) != 0, z = (c.flags & 0x10) != 0, stencil = (c.flags & 0x20) != 0;
@@ -1614,7 +2222,7 @@ struct Backend::Impl {
     RenderTarget* depth = nullptr;
     RenderViewport vp = Viewport(r, regs::Surface(r).pitch, 720);
     uint32_t height = uint32_t(vp.y + std::fabs(vp.height)) + 1;
-    uint32_t count = ActiveTargets(r, std::min(height, 2048u), targets, &depth, z || stencil);
+    uint32_t count = ActiveTargets(r, std::min(height, kMaxTargetRows), targets, &depth, z || stencil);
     if (!color) count = 0;
     if (count == 0 && !depth) return;
     BindTargets(list, targets, count, depth);
@@ -1623,6 +2231,23 @@ struct Backend::Impl {
     for (uint32_t i = 0; i < count; i++)
       if (c.flags & (1u << i)) list->clearColor(i, col);
     if (depth) list->clearDepthStencil(z, stencil, c.z, c.stencil & 0xFF);
+    // The same EDRAM under another color format is another host target here, and D3D sets the new
+    // surface's format only at the next draw, so the registers can still name the previous one: the
+    // phone pass clears 2D0 while it reads 7e3 and then draws 8888, which kept the stale 8888
+    // contents (a box around the phone). A clear wipes the memory, so clear every alias of it.
+    auto surface = regs::Surface(r);
+    for (uint32_t i = 0; i < count; i++) {
+      if (!(c.flags & (1u << i))) continue;
+      uint32_t base = regs::Color(r, int(i)).base;
+      for (auto& [key, t] : this->targets) {  // the member map (the local `targets` are this clear's)
+        if (&t == targets[i] || t.depth || !t.texture || (key & 0xFFF) != base || ((key >> 17) & 0x3FFF) != surface.pitch ||
+            (key >> 31) != surface.msaa)
+          continue;
+        RenderTarget* alias = &t;
+        BindTargets(list, &alias, 1, nullptr);
+        list->clearColor(0, col);
+      }
+    }
   }
 
   // The depth resolve as the raw D24S8 word (see PSDepthPack), a second variant at the same
@@ -1720,6 +2345,7 @@ struct Backend::Impl {
   // Writes `r` in its guest layout to the buffer at device address `gpu` (native_memory.hlsl).
   void WriteGuestLayout(RenderCommandList* list, ResolvedTexture& r, const GuestLayout& g, RenderBuffer* buffer,
                         uint64_t gpu) {
+    InvalidateDrawState();
     Transition(list, r.texture.get(), RenderTextureLayout::SHADER_READ);
     list->barriers(RenderBarrierStage::COMPUTE, RenderBufferBarrier(buffer, RenderBufferAccess::WRITE));
     bound_fb = nullptr;
@@ -1770,6 +2396,41 @@ struct Backend::Impl {
   std::vector<Writeback> writebacks;
   bool writeback_resolves = false;  // set from --gtav_native=on in Init
 
+  // Occlusion queries (--gtav_native=on): one pool per frame in flight, read in FrameComplete.
+  static constexpr uint32_t kMaxQueries = 1024;
+  struct QueryRecord {
+    uint32_t query, serial;  // serial 0: the query never ended in this frame
+  };
+  std::unique_ptr<RenderQueryPool> query_pools[Backend::kFramesInFlight];
+  std::vector<QueryRecord> query_records[Backend::kFramesInFlight];
+  uint32_t slot = 0;
+  int32_t active_query = -1;
+
+  void Query(RenderCommandList* list, const QueryCommand& q) {
+    RenderQueryPool* pool = query_pools[slot].get();
+    if (!pool) return;
+    auto& records = query_records[slot];
+    if (dumping)
+      dump_log += fmt::format("query {} {:08X} serial {}\n", q.begin ? "begin" : "end", q.query, q.serial);
+    if (q.begin) {
+      EndActiveQuery(list);
+      if (records.size() >= kMaxQueries) return;
+      if (records.empty()) list->resetQueryPool(pool, 0, kMaxQueries);
+      active_query = int32_t(records.size());
+      records.push_back({q.query, 0});
+      list->beginOcclusionQuery(pool, uint32_t(active_query));
+    } else if (active_query >= 0 && records[active_query].query == q.query) {
+      records[active_query].serial = q.serial;
+      EndActiveQuery(list);
+    }
+  }
+
+  void EndActiveQuery(RenderCommandList* list) {
+    if (active_query < 0) return;
+    list->endOcclusionQuery(query_pools[slot].get(), uint32_t(active_query));
+    active_query = -1;
+  }
+
   // Per-frame state of a frame in flight (see Backend::BeginFrame). The members above are the
   // state of the frame being recorded; EndFrame parks them here until the slot's fence passed.
   struct Parked {
@@ -1813,6 +2474,7 @@ struct Backend::Impl {
     writeback_used = offset + g.size;
     WriteGuestLayout(list, r, g, writeback_buffer.get(), writeback_gpu + offset);
     writebacks.push_back({address, offset, g.size});
+    resolve_stamps[address].written_back = true;
   }
 
   // Single-sampled copy of a multisampled target, for resolves the copy shader must perform
@@ -1855,6 +2517,9 @@ struct Backend::Impl {
 
   void Resolve(RenderCommandList* list, const FramePacket& f, const ResolveCommand& rc) {
     ScopedMs timer{t_resolve};
+    fetch_cache.valid = false;
+    slot_generation++;
+    InvalidateDrawState();
     const uint8_t* r = f.At(rc.regs);
     // Destination: the texture object's fetch constant (header 24 bytes + MipFlush).
     const uint32_t* words = rc.dest_words + 7;
@@ -1904,6 +2569,7 @@ struct Backend::Impl {
     dst.serial = ++resolve_serial;
     std::memcpy(dst.fetch_words, words, sizeof(dst.fetch_words));
     if (depth_resolve) resolved_depth[base] = variant;
+    StampResolve(base, dw, dh);
     if (!dst.texture) {
       if (mips > 1 || layers > 1) {
         dst.texture = device->createTexture(RenderTextureDesc::Texture(
@@ -1946,6 +2612,14 @@ struct Backend::Impl {
     x2 = std::min(x2, x1 + (dw > px ? dw - px : 0));
     y2 = std::min(y2, y1 + (dh > py ? dh - py : 0));
     if (x2 <= x1 || y2 <= y1) return;
+    if (rc.has_rect && rc.has_point) {
+      if (!depth_resolve) {
+        auto c = regs::Color(r, int(source));
+        NoteTileResolve(c.base, uint32_t(c.format), surface.pitch, src, x1, y1, y2, py);
+      } else if (x1 == 0 && y1 > 0 && py == y1) {
+        tile_split = y1;
+      }
+    }
     if (dumping && !depth_resolve) DumpTarget(list, src, 8 + source);  // the source as the copy sees it
     uint32_t src_descriptor = src->descriptor;
     if (shader_copy && !depth_resolve && src->msaa) {
@@ -2066,9 +2740,19 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   s.grow_list = list;
   s.stat_draws = s.stat_skipped = s.stat_pipelines_created = s.stat_textures = 0;
   s.t_shader = s.t_pipeline = s.t_texture = s.t_resolve = 0;
+  s.tile_split = 0;
+  s.tile_resolves.clear();
+  s.tile_alias_done.clear();
+  s.last_vs.valid = s.last_ps.valid = false;  // upload memory is per frame
+  s.fetch_cache.valid = false;
+  s.slot_generation++;
+  s.InvalidateDrawState();
+  s.prof = {};
   int32_t dump_at = REXCVAR_GET(gtav_native_dump_frame);
   bool requested = s.dump_request.exchange(false);
   s.far_snapshot_done = false;
+  s.per_draw_budget = 150;
+  s.rt_draws_seen = 0;
   s.dumping = requested || (dump_at > 0 && f.index >= uint64_t(dump_at) && s.dump_frame == 0);
   if (s.dumping) {
     s.dump_frame = f.index;
@@ -2077,6 +2761,7 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
     s.dump_draws.clear();
     s.dump_textures.clear();
     s.dump_small.clear();
+    s.dump_raw_f36.clear();
     s.snapshot_budget = 3;
   }
   for (const auto& c : f.commands) {
@@ -2084,6 +2769,30 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
       case CommandKind::kDraw: s.Draw(list, f, f.draws[c.index]); break;
       case CommandKind::kClear: s.Clear(list, f, f.clears[c.index]); break;
       case CommandKind::kResolve: s.Resolve(list, f, f.resolves[c.index]); break;
+      case CommandKind::kQuery: s.Query(list, f.queries[c.index]); break;
+    }
+  }
+  s.EndActiveQuery(list);  // a query is ended in the command list it began in
+  {
+    auto& a = s.prof_sum;
+    a.setup += s.prof.setup, a.consts += s.prof.consts, a.fetch += s.prof.fetch;
+    a.streams += s.prof.streams, a.pipe += s.prof.pipe, a.submit += s.prof.submit;
+    if (++s.prof_frames == 300) {
+      double n = s.prof_frames;
+      REXLOG_INFO("[native] record ms per frame: setup {:.2f} consts {:.2f} textures {:.2f} streams {:.2f} "
+                  "pipeline {:.2f} bind+draw {:.2f} (draws only; {} draws this frame)",
+                  a.setup / n, a.consts / n, a.fetch / n, a.streams / n, a.pipe / n, a.submit / n, s.stat_draws);
+      auto& t = s.tprof;
+      REXLOG_INFO("[native]   textures per frame: {:.0f} lookups, {:.0f} draws reused the previous block, {:.0f} sampled "
+                  "({:.2f} ms), {:.0f} full hashes of {:.1f} MB ({:.2f} ms)",
+                  t.lookups / n, t.cached_blocks / n, t.sampled / n, t.sampled_ms / n, t.full / n,
+                  t.full_bytes / n / 1048576.0, t.full_ms / n);
+      REXLOG_INFO("[native]   texture ms per frame: slots {:.2f}, {:.0f} slots from the memo",
+                  t.descriptor_ms / n, s.slot_memo_hits / n);
+      s.slot_memo_hits = 0;
+      t = {};
+      a = {};
+      s.prof_frames = 0;
     }
   }
   if (f.index % 150 == 0)
@@ -2114,7 +2823,10 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
 
 // The slot's parked state becomes the recording state (its upload chunks get reused); the
 // previous recording state, already parked by EndFrame, is an empty placeholder.
-void Backend::BeginFrame(uint32_t slot) { impl_->SwapFrameState(impl_->parked[slot]); }
+void Backend::BeginFrame(uint32_t slot) {
+  impl_->slot = slot;
+  impl_->SwapFrameState(impl_->parked[slot]);
+}
 
 void Backend::EndFrame(uint32_t slot) { impl_->SwapFrameState(impl_->parked[slot]); }
 
@@ -2129,6 +2841,14 @@ Backend::FrameStats Backend::LastStats() const {
 
 void Backend::FrameComplete(uint32_t slot) {
   auto& p = impl_->parked[slot];
+  if (auto& records = impl_->query_records[slot]; !records.empty()) {
+    RenderQueryPool* pool = impl_->query_pools[slot].get();
+    pool->queryResults();
+    const uint64_t* samples = pool->getResults();
+    for (size_t i = 0; i < records.size(); i++)
+      if (records[i].serial) PublishQueryResult(records[i].query, records[i].serial, samples[i]);
+    records.clear();
+  }
   p.upload.Reset();
   auto& pending = p.pending_free_descriptors;
   impl_->free_descriptors.insert(impl_->free_descriptors.end(), pending.begin(), pending.end());

@@ -36,7 +36,7 @@ struct StreamBinding {
   uint32_t endian = 0;   // fetch constant endian mode (xenos::Endian)
 };
 
-enum class CommandKind : uint8_t { kDraw, kClear, kResolve };
+enum class CommandKind : uint8_t { kDraw, kClear, kResolve, kQuery };
 
 struct DrawCommand {
   bool indexed = false;
@@ -77,9 +77,20 @@ struct ResolveCommand {
   uint32_t dest_words[13] = {};  // dest texture object header + fetch constant (layout check)
 };
 
+// D3D occlusion query Issue(BEGIN / END). The native renderer counts the samples the draws between
+// them pass and publishes the count for the guest's GetData (see PublishQueryResult).
+struct QueryCommand {
+  uint32_t query = 0;   // guest D3DQuery object
+  uint32_t serial = 0;  // which END of that query (counts per query object)
+  bool begin = false;
+};
+
 struct Command {
   CommandKind kind;
   uint32_t index;  // into the per-kind vector
+  // Guest physical PM4 write address when captured: inside a D3D command buffer while the game
+  // records one (see OnCommandBufferRun); 0 for commands replayed from a recorded buffer.
+  uint32_t pm4 = 0;
 };
 
 // Append-only bytes without std::vector's zero fill: a frame pushes tens of MB of register
@@ -90,6 +101,7 @@ class ByteArena {
   const uint8_t* data() const { return buf_.get(); }
   size_t size() const { return size_; }
   void clear() { size_ = 0; }
+  void Shrink(size_t n) { size_ -= std::min(n, size_); }
   uint8_t* Grow(size_t n) {
     if (size_ + n > cap_) {
       size_t cap = std::max(size_ + n, cap_ ? cap_ * 2 : size_t(4) << 20);
@@ -114,6 +126,7 @@ struct FramePacket {
   std::vector<DrawCommand> draws;
   std::vector<ClearCommand> clears;
   std::vector<ResolveCommand> resolves;
+  std::vector<QueryCommand> queries;
   ByteArena arena;
   uint32_t front_buffer = 0;  // guest texture object passed to Swap
 
@@ -129,6 +142,7 @@ struct FramePacket {
     draws.clear();
     clears.clear();
     resolves.clear();
+    queries.clear();
     arena.clear();
     front_buffer = 0;
   }

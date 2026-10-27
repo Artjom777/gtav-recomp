@@ -14,7 +14,7 @@ from compare_dump import half, pick_emu_frame, tiled_offset
 
 # Plume RenderFormat values (plume_render_interface_types.h) -> numpy decode
 NATIVE = {10: ('<f2', 4), 11: ('<u2', 4), 20: ('u1', 4), 24: ('u1', 4), 26: ('<f2', 2), 29: ('<i2', 2),
-          34: ('<f4', 1), 2: ('<f4', 4), 16: ('<f4', 2)}
+          34: ('<f4', 1), 2: ('<f4', 4), 16: ('<f4', 2), 43: ('<f2', 1)}
 SCALE = {11: 65535.0, 20: 255.0, 24: 255.0, 29: 32767.0}
 
 
@@ -55,9 +55,9 @@ def texel(buf, words, x, y):
         return [struct.unpack('<f', b)[0]]
     if fmt == 6:  # 0xAARRGGBB little-endian -> B G R A
         return [b[2] / 255, b[1] / 255, b[0] / 255, b[3] / 255]
-    if fmt == 54:  # 2_10_10_10 fixed: X bits 0-9, Y 10-19, Z 20-29, W 30-31
+    if fmt == 54:  # 2_10_10_10 resolved like 8_8_8_8 (A2R10G10B10): B bits 0-9, G 10-19, R 20-29, A 30-31
         v = struct.unpack('<I', b)[0]
-        return [(v & 1023) / 1023, ((v >> 10) & 1023) / 1023, ((v >> 20) & 1023) / 1023, (v >> 30) / 3]
+        return [((v >> 20) & 1023) / 1023, ((v >> 10) & 1023) / 1023, (v & 1023) / 1023, (v >> 30) / 3]
     return None
 
 
@@ -143,7 +143,8 @@ def main():
     for f in sorted(f for f in os.listdir(nd) if f.endswith('.raw')):
         m = re.match(r'(\d+)_([0-9A-F]{8})_f(\d+)_(\d+)x(\d+)_r(\d+)\.raw$', f)
         slot, addr, fmt, w, h, row = int(m.group(1)), m.group(2), *map(int, m.groups()[2:])
-        if slot not in group or last_of_group[(addr, group[slot])] != slot:
+        # .get: the file name can carry another address than the resolve line (1F000000 vs 1F001000)
+        if slot not in group or last_of_group.get((addr, group[slot])) != slot:
             continue
         k = group[slot]
         if fmt not in NATIVE:

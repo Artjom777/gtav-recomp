@@ -6,15 +6,19 @@
 #include "renderer.h"
 #include "stats.h"
 
+#include <rex/cvar.h>
 #include <rex/hook.h>
 
 #include <chrono>
+#include <cstring>
 
 namespace gtav::native {
 void ProbeFrame();
 }
 
 using namespace gtav::native;
+
+REXCVAR_DECLARE(std::string, gtav_native);
 
 #define GTAV_COUNT_HOOK(addr, counter) \
   REX_EXTERN(__imp__sub_##addr);       \
@@ -24,6 +28,33 @@ using namespace gtav::native;
   }
 
 GTAV_COUNT_HOOK(83818300, kStatRs)
+
+// D3DQuery_Issue(query, flags) (the D3D function itself; GTA reaches it through two tail-calling
+// wrappers).
+REX_EXTERN(__imp__sub_83815FB0);
+REX_HOOK_RAW(sub_83815FB0) {
+  OnQueryIssue(ctx.r3.u32, ctx.r4.u32);
+  __imp__sub_83815FB0(ctx, base);
+}
+
+// GTA's query poll 832BA500(query, &samples) -> ready (calls D3DQuery_GetData without flush). With
+// --gtav_native=on the command processor's count is a fake; the native renderer's count replaces
+// it, and the query stays "not ready" until the native frame that drew it completed.
+REX_EXTERN(__imp__sub_832BA500);
+REX_HOOK_RAW(sub_832BA500) {
+  uint32_t query = ctx.r3.u32, out = ctx.r4.u32;
+  __imp__sub_832BA500(ctx, base);
+  static const bool on = REXCVAR_GET(gtav_native) == "on";
+  if (!on || !out) return;
+  uint32_t samples = 0;
+  switch (OverrideQueryResult(query, &samples)) {
+    case QueryOverride::kOriginal: return;
+    case QueryOverride::kReady: ctx.r3.u64 = 1; break;
+    case QueryOverride::kNotReady: ctx.r3.u64 = 0; break;
+  }
+  uint32_t be = __builtin_bswap32(samples);
+  std::memcpy(base + out, &be, 4);
+}
 
 // DrawIndexedVertices(dev, ...) / DrawVertices(dev, ...)
 REX_EXTERN(__imp__sub_83811030);
@@ -43,6 +74,16 @@ REX_HOOK_RAW(sub_83810C18) {
   __imp__sub_83810C18(ctx, base);
 }
 
+// 838087C8(dev, ...): runs recorded D3D command buffers (writes PM4 INDIRECT_BUFFER packets, the
+// only game-called D3D function that does). The draws inside them were captured while recording.
+REX_EXTERN(__imp__sub_838087C8);
+REX_HOOK_RAW(sub_838087C8) {
+  uint32_t device = ctx.r3.u32;
+  auto write = [&] { return __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + device + d3d::kDevCmdWrite)); };
+  uint32_t before = device ? write() : 0;
+  __imp__sub_838087C8(ctx, base);
+  if (device) OnCommandBufferRun(device, before, write());
+}
 // SetPixelShader(dev, shader) / SetVertexShader(dev, shader) / SetIndices(dev, ib).
 // (Skate 3's labels for the first two were swapped; the bound containers' type flags decide.)
 REX_EXTERN(__imp__sub_83812190);

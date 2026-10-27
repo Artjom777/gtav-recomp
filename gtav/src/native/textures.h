@@ -30,7 +30,8 @@ struct DecodedTexture {
 bool DecodeGuestTexture(const uint32_t words[6], DecodedTexture* out);
 
 // Hash of the texture's raw guest bytes (base + mips): cheap change detection without decoding.
-uint64_t HashGuestTexture(const uint32_t words[6]);
+// `sampled` hashes ~5 KB spread over the texture instead (a per-frame check of large textures).
+uint64_t HashGuestTexture(const uint32_t words[6], bool sampled = false);
 
 // The guest physical base address of a texture fetch constant (0 if not a texture).
 uint32_t FetchBaseAddress(const uint32_t words[6]);

@@ -177,7 +177,7 @@ uint32_t FetchBaseAddress(const uint32_t words[6]) {
   return words[1] & 0xFFFFF000;
 }
 
-uint64_t HashGuestTexture(const uint32_t words[6]) {
+uint64_t HashGuestTexture(const uint32_t words[6], bool sampled) {
   xenos::xe_gpu_texture_fetch_t fetch = {};
   fetch.dword_0 = words[0];
   fetch.dword_1 = words[1];
@@ -195,6 +195,18 @@ uint64_t HashGuestTexture(const uint32_t words[6]) {
     if (!addr || !size || size > (64u << 20) || (addr & 0x1FFFFFFF) + uint64_t(size) > 0x20000000) return seed;
     return XXH3_64bits_withSeed(mem->TranslatePhysical(addr), size, seed);
   };
+  if (sampled) {
+    // 16 runs of 256 bytes spread over the base level and 4 over the mips: catches a streaming
+    // slot that now holds another texture, at ~5 KB per check.
+    auto sample = [&](uint32_t addr, uint32_t size, uint32_t runs, uint64_t seed) {
+      if (size <= runs * 256u) return hash_range(addr, size, seed);
+      uint32_t step = (size - 256) / (runs - 1) & ~255u;
+      for (uint32_t i = 0; i < runs; i++) seed = hash_range(addr + i * step, 256, seed);
+      return seed;
+    };
+    uint64_t h = sample(info.memory.base_address, info.memory.base_size, 16, 1);
+    return sample(info.memory.mip_address, info.memory.mip_size, 4, h);
+  }
   uint64_t h = hash_range(info.memory.base_address, info.memory.base_size, 1);
   return hash_range(info.memory.mip_address, info.memory.mip_size, h);
 }

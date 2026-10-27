@@ -14,5 +14,13 @@ $a = @("--game_data_root=E:\gtav-rex\game\disc2_files", "--user_data_root=E:/gta
 if ($Mode -eq "on") { $a += @("--gpu_skip_rendering=true", "--vsync=false", "--gtav_native_vsync=false") }
 if ($Counter) { $a += "--gtav_native_fps" }
 if ($Extra) { $a += $Extra }
+# Read the exe and DLLs once so they are in the file cache: the first launch after a build paged
+# the 134 MB exe in from the busy E: disk during boot (XEX patch 4-8 s instead of 0.3 s), and both
+# of those slow boots hung before VdSetGraphicsInterruptCallback.
+$buf = New-Object byte[] (8MB)
+foreach ($f in @("$build\gtav_fast.exe") + (Get-ChildItem "$build\*.dll").FullName) {
+  $s = [IO.File]::OpenRead($f)
+  try { while ($s.Read($buf, 0, $buf.Length) -gt 0) {} } finally { $s.Close() }
+}
 $p = Start-Process -FilePath "$build\gtav_fast.exe" -ArgumentList $a -WorkingDirectory $build -PassThru
 "launched pid $($p.Id), log $logs\$Log.log"

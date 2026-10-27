@@ -63,6 +63,66 @@ constexpr uint32_t kSwapchainBuffers = 3;  // two frames in flight + one being p
 
 class Renderer {
  public:
+  // The command processor only fakes the GPU (--gtav_native=on): it finishes a frame long before
+  // this renderer replays it, and the fences after its swap tell the game that frame's memory is
+  // free, so the game streams new textures and vertex data over memory a queued frame still has
+  // to read (wrong textures flashing, spiky meshes). The guest's swaps are queued in order; the
+  // command processor's swap N waits until the renderer has recorded guest swap N.
+  void NoteGuestSwap(uint64_t frame_index) {
+    std::lock_guard lock(swap_mutex_);
+    guest_swaps_.push_back(frame_index);
+    last_noted_ = frame_index;
+    if (guest_swaps_.size() > 64) guest_swaps_.pop_front();
+  }
+
+  void WaitForGuestSwap() {
+    uint64_t index;
+    {
+      std::lock_guard lock(swap_mutex_);
+      if (guest_swaps_.empty()) return;
+      index = guest_swaps_.front();
+      guest_swaps_.pop_front();
+    }
+    auto start = std::chrono::steady_clock::now();
+    bool waited = false, timed_out = false;
+    {
+      std::unique_lock lock(recorded_mutex_);
+      if (recorded_through_ <= index) {
+        waited = true;
+        // Bounded: a renderer that stopped must not stall the guest's GPU for good.
+        timed_out = !recorded_cv_.wait_for(lock, std::chrono::milliseconds(1000),
+                                           [&] { return recorded_through_ > index; });
+      }
+    }
+    auto& st = swap_wait_stats_;
+    st.swaps++;
+    if (waited) {
+      st.waits++;
+      double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+      st.ms_sum += ms;
+      st.ms_max = std::max(st.ms_max, ms);
+    }
+    if (timed_out) {
+      st.timeouts++;
+      size_t queued;
+      {
+        std::lock_guard lock(mutex_);
+        queued = queue_.size();
+      }
+      static uint32_t logged = 0;
+      if (logged++ < 20)
+        REXLOG_INFO("[native] swap wait timed out: waiting for guest frame {}, recorded through {}, last noted {}, "
+                    "{} queued, renderer state {} on frame {}",
+                    index, recorded_through_, last_noted_.load(), queued, render_state_.load(), render_frame_.load());
+    }
+    if (st.swaps == 600) {
+      REXLOG_INFO("[native] command processor waited for the renderer at {} of 600 swaps (avg {:.2f} max {:.2f} ms, "
+                  "{} timeouts), guest frame {}",
+                  st.waits, st.waits ? st.ms_sum / st.waits : 0.0, st.ms_max, st.timeouts, index);
+      st = {};
+    }
+  }
+
   void Submit(FramePacket&& packet) {
     if (!started_.exchange(true)) thread_ = std::thread([this] { ThreadMain(); });
     {
@@ -115,8 +175,11 @@ class Renderer {
           GetWindowThreadProcessId(hwnd, &pid);
           if (pid != GetCurrentProcessId() || hwnd == c->self || !IsWindowVisible(hwnd)) return TRUE;
           wchar_t cls[64];
+          // Async: ShowWindow on another thread's window waits for that thread (the SDK's main
+          // thread, busy for seconds during a cold boot), and this thread must keep servicing the
+          // native window while the renderer creates its swap chain.
           if (GetClassNameW(hwnd, cls, 64) && std::wstring(cls).rfind(L"SDL", 0) == 0)
-            ShowWindow(hwnd, SW_HIDE);
+            ShowWindowAsync(hwnd, SW_HIDE);
           return TRUE;
         },
         reinterpret_cast<LPARAM>(&ctx));
@@ -229,17 +292,23 @@ class Renderer {
     }
     REXLOG_INFO("[native] using {}", device_->getDescription().name);
     queue_cmd_ = device_->createCommandQueue(plume::RenderCommandListType::DIRECT);
+    // Init steps are logged: a cold first boot after a rebuild sometimes never got past here.
+    REXLOG_INFO("[native] init: queue created, creating the swap chain");
     swapchain_ = queue_cmd_->createSwapChain(
         plume::RenderSwapChainDesc(window_, plume::RenderFormat::B8G8R8A8_UNORM, kSwapchainBuffers));
     swapchain_->setVsyncEnabled(REXCVAR_GET(gtav_native_vsync));
+    REXLOG_INFO("[native] init: swap chain created, resizing");
     swapchain_->resize();
+    REXLOG_INFO("[native] init: swap chain {}x{}", swapchain_->getWidth(), swapchain_->getHeight());
     for (uint32_t i = 0; i < Backend::kFramesInFlight; i++) {
       lists_[i] = queue_cmd_->createCommandList();
       fences_[i] = device_->createCommandFence();
       acquires_[i] = device_->createCommandSemaphore();
     }
     CreateFramebuffers();
+    REXLOG_INFO("[native] init: framebuffers created, backend init");
     backend_ok_ = backend_.Init(device_.get());
+    REXLOG_INFO("[native] init: done");
     if (!backend_ok_) REXLOG_ERROR("[native] backend init failed; showing clear color only");
     return true;
   }
@@ -280,18 +349,30 @@ class Renderer {
     if (!pipelines_since_save_ || now - last_cache_save_ < std::chrono::seconds(20)) return;
     last_cache_save_ = now;
     pipelines_since_save_ = 0;
+    auto get_start = std::chrono::steady_clock::now();
     std::vector<uint8_t> data = plume::GetVulkanPipelineCacheData(device_.get());
+    double get_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - get_start).count();
     if (data.empty()) return;
-    std::error_code ec;
-    std::filesystem::create_directories(PipelineCachePath().parent_path(), ec);
-    auto tmp = PipelineCachePath();
-    tmp += ".tmp";
-    if (FILE* f = std::fopen(tmp.string().c_str(), "wb")) {
-      bool ok = std::fwrite(data.data(), 1, data.size(), f) == data.size();
-      std::fclose(f);
-      if (ok) std::filesystem::rename(tmp, PipelineCachePath(), ec);
-    }
+    // The file is written by a background thread: ~33 MB on the busy E: disk took ~2 s, a freeze
+    // every 20 s while the renderer (and so the guest, through the swap wait) waited for it.
+    if (cache_writing_.exchange(true)) return;  // the previous save is still being written
+    std::thread([this, data = std::move(data), get_ms] {
+      auto start = std::chrono::steady_clock::now();
+      std::error_code ec;
+      std::filesystem::create_directories(PipelineCachePath().parent_path(), ec);
+      auto tmp = PipelineCachePath();
+      tmp += ".tmp";
+      if (FILE* f = std::fopen(tmp.string().c_str(), "wb")) {
+        bool ok = std::fwrite(data.data(), 1, data.size(), f) == data.size();
+        std::fclose(f);
+        if (ok) std::filesystem::rename(tmp, PipelineCachePath(), ec);
+      }
+      REXLOG_INFO("[native] pipeline cache saved: {} KB (get {:.0f} ms, write {:.0f} ms)", data.size() / 1024, get_ms,
+                  std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+      cache_writing_ = false;
+    }).detach();
   }
+  std::atomic<bool> cache_writing_{false};
 
   // Waits for the slot's previous frame and recycles what it left behind.
   void Retire(uint32_t slot) {
@@ -342,10 +423,11 @@ class Renderer {
         // its twin by draw constants even while the camera moves.
         if (readback_restore_.empty()) readback_restore_ = rex::cvar::GetFlagByName("readback_resolve");
         rex::cvar::SetFlagByName("readback_resolve", "full");
-        rex::cvar::SetFlagByName("emu_draw_dump_window", "16");
+        // 8 frames: twins have matched at window positions 0-3; every dumped frame is slow.
+        rex::cvar::SetFlagByName("emu_draw_dump_window", "8");
         rex::cvar::SetFlagByName("emu_resolve_dump_frame", "-1");
         native_dump_at_ = frame.index + 6;
-        readback_restore_at_ = frame.index + 40;
+        readback_restore_at_ = frame.index + 16;  // the emulated frame count runs a few ahead
       } else {
         native_dump_at_ = frame.index;
       }
@@ -567,14 +649,23 @@ class Renderer {
       {
         std::unique_lock lock(mutex_);
         auto idle_start = std::chrono::steady_clock::now();
+        render_state_ = 0;  // waiting for a frame
         cv_.wait(lock, [this] { return !queue_.empty(); });
         timing_.idle_sum += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - idle_start).count();
         frame = std::move(queue_.front());
         queue_.pop_front();
       }
       space_cv_.notify_one();
+      render_frame_ = frame.index;
+      render_state_ = 1;  // recording + presenting
       Validate(frame);
       Present(frame);
+      render_state_ = 2;
+      {
+        std::lock_guard lock(recorded_mutex_);
+        recorded_through_ = frame.index + 1;  // its guest memory has been read
+      }
+      recorded_cv_.notify_all();
       {
         std::lock_guard lock(mutex_);
         Recycle(std::move(frame));
@@ -603,6 +694,16 @@ class Renderer {
   std::deque<FramePacket> queue_;
   std::vector<FramePacket> spare_;  // presented/dropped packets, emptied, for TakeSpare
   std::atomic<bool> started_{false}, failed_{false};
+  std::atomic<uint64_t> last_noted_{0}, render_frame_{0};
+  std::atomic<int> render_state_{0};
+  std::mutex swap_mutex_, recorded_mutex_;
+  std::condition_variable recorded_cv_;
+  std::deque<uint64_t> guest_swaps_;
+  uint64_t recorded_through_ = 0;  // guest frames below this have been recorded
+  struct SwapWaitStats {
+    uint32_t swaps = 0, waits = 0, timeouts = 0;
+    double ms_sum = 0, ms_max = 0;
+  } swap_wait_stats_;  // command processor thread only
   std::atomic<uint64_t> dropped_{0};
   std::chrono::steady_clock::time_point fps_since_ = std::chrono::steady_clock::now();
   uint32_t fps_frames_ = 0, fps_value_ = 0;
@@ -652,12 +753,19 @@ class Renderer {
 
 Renderer g_renderer;
 
+
 }  // namespace
 
 bool Active() { return REXCVAR_GET(gtav_native) != "off"; }
 
 void Submit(FramePacket&& frame) { g_renderer.Submit(std::move(frame)); }
 
+void NoteGuestSwap(uint64_t frame_index) { g_renderer.NoteGuestSwap(frame_index); }
+
 FramePacket TakeSpare() { return g_renderer.TakeSpare(); }
 
 }  // namespace gtav::native
+
+// Looked up by the SDK's D3D12 command processor (gpu_skip_rendering) and called at every swap it
+// executes; see Renderer::NoteGuestSwap.
+extern "C" __declspec(dllexport) void rex_skip_rendering_swap(uint64_t) { gtav::native::g_renderer.WaitForGuestSwap(); }
