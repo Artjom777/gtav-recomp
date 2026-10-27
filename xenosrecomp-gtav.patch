@@ -11,10 +11,10 @@ index e59682c..c9592ad 100644
  #include <fmt/core.h>
  #include <string>
 diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
-index 1c74034..8992fe0 100644
+index 1c74034..4d3f719 100644
 --- a/XenosRecomp/shader_common.h
 +++ b/XenosRecomp/shader_common.h
-@@ -26,10 +26,14 @@ struct PushConstants
+@@ -26,10 +26,15 @@ struct PushConstants
  
  [[vk::push_constant]] ConstantBuffer<PushConstants> g_PushConstants;
  
@@ -29,11 +29,12 @@ index 1c74034..8992fe0 100644
 +#define g_AlphaToMask              vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 532)
 +#define g_NdcScale                 vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 536)
 +#define g_NdcOffset                vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 544)
++#define g_AlphaFunc                vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 552)
 +#define g_ColorScale(INDEX)        vk::RawBufferLoad<float4>(g_PushConstants.SharedConstants + 560 + (INDEX) * 16)
  
  [[vk::constant_id(0)]] const uint g_SpecConstants = 0;
  
-@@ -38,13 +42,25 @@ struct PushConstants
+@@ -38,13 +43,26 @@ struct PushConstants
  #else
  
  #define DEFINE_SHARED_CONSTANTS() \
@@ -47,6 +48,7 @@ index 1c74034..8992fe0 100644
 +    float g_AlphaThreshold : packoffset(c33.x);     uint g_AlphaToMask : packoffset(c33.y); \
 +    float2 g_NdcScale : packoffset(c33.z); \
 +    float2 g_NdcOffset : packoffset(c34.x); \
++    uint g_AlphaFunc : packoffset(c34.z); \
 +    float4 g_ColorScaleArray[4] : packoffset(c35);
  
  uint g_SpecConstants();
@@ -63,7 +65,7 @@ index 1c74034..8992fe0 100644
  #endif
  
  Texture2D<float4> g_Texture2DDescriptorHeap[] : register(t0, space0);
-@@ -59,10 +75,41 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
+@@ -59,10 +77,41 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
      return dimensions;
  }
  
@@ -106,7 +108,7 @@ index 1c74034..8992fe0 100644
  }
  
  float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
-@@ -135,17 +182,17 @@ float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex
+@@ -135,17 +184,17 @@ float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex
      float h1y = h1(fy);
  
      float4 r =
@@ -129,7 +131,7 @@ index 1c74034..8992fe0 100644
  }
  
  struct CubeMapData
-@@ -156,7 +203,53 @@ struct CubeMapData
+@@ -156,7 +205,53 @@ struct CubeMapData
  
  float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData)
  {
@@ -184,7 +186,7 @@ index 1c74034..8992fe0 100644
  }
  
  float4 tfetchR11G11B10(uint4 value)
-@@ -180,6 +273,116 @@ float4 tfetchTexcoord(uint swappedTexcoords, float4 value, uint semanticIndex)
+@@ -180,6 +275,116 @@ float4 tfetchTexcoord(uint swappedTexcoords, float4 value, uint semanticIndex)
      return (swappedTexcoords & (1ull << semanticIndex)) != 0 ? value.yxwz : value;
  }
  
@@ -302,7 +304,7 @@ index 1c74034..8992fe0 100644
  {
      uint index = cubeMapData.cubeMapIndex;
 diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
-index 698a418..4f8ed1e 100644
+index 698a418..6f5b838 100644
 --- a/XenosRecomp/shader_recompiler.cpp
 +++ b/XenosRecomp/shader_recompiler.cpp
 @@ -17,12 +17,12 @@ static constexpr const char* USAGE_TYPES[] =
@@ -781,7 +783,19 @@ index 698a418..4f8ed1e 100644
      out += "\tfloat ps = 0.0;\n";
      if (isPixelShader)
      {
-@@ -1809,6 +1964,36 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1804,11 +1959,47 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                     out += '{';
+ 
+                     indent();
+-                    out += "\tclip(oC0.w - g_AlphaThreshold);\n";
++                    // GTA V: RB_COLORCONTROL.alpha_func (g_AlphaFunc: 0 never, 1 less, 2 equal, 3 lequal,
++                    // 4 greater, 5 notequal, 6 gequal, 7 always); faded-out LODs use "never".
++                    out += "\tuint alphaFunc = g_AlphaFunc;\n";
++                    indent();
++                    out += "\tbool alphaPass = (alphaFunc & 1) && oC0.w < g_AlphaThreshold || (alphaFunc & 2) && oC0.w == g_AlphaThreshold || (alphaFunc & 4) && oC0.w > g_AlphaThreshold;\n";
++                    indent();
++                    out += "\tclip(alphaPass ? 1.0 : -1.0);\n";
+ 
                      indent();
                      out += "}";
  
@@ -818,7 +832,7 @@ index 698a418..4f8ed1e 100644
                  #ifdef UNLEASHED_RECOMP
                      specConstantsMask |= SPEC_CONSTANT_ALPHA_TO_COVERAGE;
  
-@@ -1832,7 +2017,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1832,7 +2023,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                      if (!hasMtxProjection)
                  #endif
                      {

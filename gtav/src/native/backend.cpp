@@ -44,7 +44,9 @@ REXCVAR_DECLARE(std::string, gtav_native_spirv_dir);
 REXCVAR_DEFINE_INT32(gtav_native_dump_rt, 0x2D0, "GTAV",
                      "Frame dumps: EDRAM base of the color target snapshotted after every draw (0x2D0 = scene HDR)");
 REXCVAR_DEFINE_INT32(gtav_native_dump_rt_skip, 0, "GTAV",
-                     "Frame dumps: skip this many draws into --gtav_native_dump_rt before the 150 snapshots start");
+                     "Frame dumps: skip this many draws into --gtav_native_dump_rt before the snapshots start");
+REXCVAR_DEFINE_INT32(gtav_native_dump_rt_count, 150, "GTAV",
+                     "Frame dumps: number of per-draw snapshots of --gtav_native_dump_rt (~2.7 MB each at 720p)");
 REXCVAR_DEFINE_BOOL(gtav_native_async_pipelines, true, "GTAV",
                     "Create new pipelines on worker threads (the draw is skipped until ready) instead of "
                     "stalling the frame");
@@ -557,6 +559,7 @@ struct Backend::Impl {
   std::unordered_map<uint32_t, ResolveStamp> resolve_stamps;
   uint32_t stale_resolves_logged = 0;
   uint32_t alpha_to_mask_logged = 0;
+  uint32_t alpha_funcs_logged = 0;  // RB_COLORCONTROL alpha functions already logged (bit per function)
 
   static uint64_t SampleGuest(uint32_t address, uint32_t size) {
     const uint8_t* p = REX_KERNEL_MEMORY()->TranslatePhysical(address);
@@ -654,7 +657,9 @@ struct Backend::Impl {
   uint32_t blit_sampler = 0;
 
   // Frame dump state.
-  static constexpr uint32_t kDumpW = 640, kDumpH = 360, kDumpSlots = 320;
+  static constexpr uint32_t kDumpW = 640, kDumpH = 360;
+  // Readback slots of a frame dump: resolves and textures, plus the per-draw snapshots asked for.
+  static uint32_t DumpSlots() { return 170 + uint32_t(std::max(150, REXCVAR_GET(gtav_native_dump_rt_count))); }
   std::unique_ptr<RenderTexture> dump_tex;
   std::unique_ptr<RenderFramebuffer> dump_fb;
   std::unique_ptr<RenderBuffer> dump_readback;
@@ -740,14 +745,14 @@ struct Backend::Impl {
                    uint32_t address, uint32_t flags, const uint32_t words[6]) {
     InvalidateDrawState();
     uint32_t slot = uint32_t(dump_infos.size());
-    if (slot >= kDumpSlots) return;
+    if (slot >= DumpSlots()) return;
     if (!dump_tex) {
       dump_tex = device->createTexture(RenderTextureDesc::ColorTarget(kDumpW, kDumpH, RenderFormat::R8G8B8A8_UNORM));
       const RenderTexture* color = dump_tex.get();
       RenderFramebufferDesc fb(&color, 1);
       dump_fb = device->createFramebuffer(fb);
       dump_readback = device->createBuffer(
-          RenderBufferDesc::ReadbackBuffer(uint64_t(kDumpW) * kDumpH * 4 * kDumpSlots));
+          RenderBufferDesc::ReadbackBuffer(uint64_t(kDumpW) * kDumpH * 4 * DumpSlots()));
     }
     DumpInfo info{address, format, width, height, flags, {}};
     std::memcpy(info.words, words, sizeof(info.words));
@@ -1800,6 +1805,11 @@ struct Backend::Impl {
     sc[128] = (be32(bools) & 0xFFFF) | (be32(bools + 16) & 0xFFFF) << 16;
     float alpha_ref = regs::ReadFloat(r, regs::RB_ALPHA_REF);
     std::memcpy(&sc[132], &alpha_ref, 4);
+    sc[138] = regs::Read(r, regs::RB_COLORCONTROL) & 7;  // g_AlphaFunc (552): the alpha test's compare function
+    if ((regs::Read(r, regs::RB_COLORCONTROL) & 8) && !(alpha_funcs_logged & (1u << sc[138]))) {
+      alpha_funcs_logged |= 1u << sc[138];
+      REXLOG_INFO("[native] alpha test function {} first seen (ref {}, ps {:016X})", sc[138], alpha_ref, d.ps_hash);
+    }
     // g_AlphaToMask (533): without MSAA the shader applies the Xenos alpha-to-mask dither itself.
     {
       uint32_t colorcontrol = regs::Read(r, regs::RB_COLORCONTROL);
@@ -2751,7 +2761,7 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   int32_t dump_at = REXCVAR_GET(gtav_native_dump_frame);
   bool requested = s.dump_request.exchange(false);
   s.far_snapshot_done = false;
-  s.per_draw_budget = 150;
+  s.per_draw_budget = std::max(0, REXCVAR_GET(gtav_native_dump_rt_count));
   s.rt_draws_seen = 0;
   s.dumping = requested || (dump_at > 0 && f.index >= uint64_t(dump_at) && s.dump_frame == 0);
   if (s.dumping) {
