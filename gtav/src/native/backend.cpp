@@ -490,6 +490,7 @@ struct CachedTexture {
   uint64_t sampled_hash = 0;  // HashGuestTexture(sampled) at the last full check
   uint64_t sample_frame = ~0ull;  // frame of the last sampled check
   bool failed = false;
+  bool all_zero = false;  // decoded texels all zero (guest data not streamed in yet?)
 };
 
 struct CachedBuffer {
@@ -559,7 +560,8 @@ struct Backend::Impl {
   std::unordered_map<uint32_t, ResolveStamp> resolve_stamps;
   uint32_t stale_resolves_logged = 0;
   uint32_t alpha_to_mask_logged = 0;
-  uint32_t alpha_funcs_logged = 0;  // RB_COLORCONTROL alpha functions already logged (bit per function)
+  uint32_t alpha_funcs_logged = 0;
+  uint32_t zero_textures_logged = 0;  // RB_COLORCONTROL alpha functions already logged (bit per function)
 
   static uint64_t SampleGuest(uint32_t address, uint32_t size) {
     const uint8_t* p = REX_KERNEL_MEMORY()->TranslatePhysical(address);
@@ -1272,6 +1274,12 @@ struct Backend::Impl {
     t.bytes = dec.data.size();
     if (t.texture && t.content == content) return t.descriptor;
     t.content = content;
+    t.all_zero = std::all_of(dec.data.begin(), dec.data.end(), [](uint8_t b) { return b == 0; });
+    if (t.all_zero && zero_textures_logged < 40) {
+      zero_textures_logged++;
+      REXLOG_INFO("[native] texture {:08X} ({}x{}, format {}) is all zero at frame {}", base & 0x1FFFFFFF,
+                  dec.width, dec.height, words[1] & 0x3F, frame);
+    }
     if (!t.texture) {
       t.texture = device->createTexture(
           dec.volume ? RenderTextureDesc::Texture3D(dec.width, dec.height, dec.depth, 1, dec.format)
@@ -1756,6 +1764,10 @@ struct Backend::Impl {
       if (dumping) {
         uint32_t base = FetchBaseAddress(words) & 0x1FFFFFFF;
         char kind = descriptor <= kNullCube ? 'N' : resolved_latest.count(base) ? 'R' : 'T';
+        if (kind == 'T') {  // Z: a guest texture whose texels are all zero
+          auto zt = textures.find(Hash(words, 24));
+          if (zt != textures.end() && zt->second.all_zero) kind = 'Z';
+        }
         if (kind == 'T' && (words[1] & 0x3F) == 18 && dump_textures.size() < 24 &&
             std::none_of(dump_textures.begin(), dump_textures.end(),
                          [&](const auto& w) { return (w[1] & ~0xFFFu) == (words[1] & ~0xFFFu); }))
@@ -1770,6 +1782,24 @@ struct Backend::Impl {
             std::fwrite(words, 4, 6, fp);
             std::fwrite(src, 1, size_t(w) * h * 4, fp);
             std::fclose(fp);
+          }
+        }
+        // Small 8_8_8_8 guest textures (tint palettes): the decoded texels (RGBA as the host sees
+        // them, swizzle in the name) and the fetch words, once per address.
+        if (kind == 'T' && (words[1] & 0x3F) == 6 && dump_raw_f36.insert(base).second) {
+          DecodedTexture t;
+          if (DecodeGuestTexture(words, &t) && t.width * t.height <= 4096) {
+            std::string dir = LogPath(fmt::format("native_dump/frame_{}", dump_frame));
+            std::filesystem::create_directories(dir);
+            if (FILE* fp = std::fopen(fmt::format("{}/tex_{:08X}_f6_{}x{}_fmt{}_sw{}{}{}{}.bin", dir, base, t.width,
+                                                  t.height, uint32_t(t.format), uint32_t(t.swizzle.r),
+                                                  uint32_t(t.swizzle.g), uint32_t(t.swizzle.b), uint32_t(t.swizzle.a))
+                                          .c_str(),
+                                      "wb")) {
+              std::fwrite(words, 4, 6, fp);
+              std::fwrite(t.data.data(), 1, size_t(t.mips[0].row_texels) * t.height * 4, fp);
+              std::fclose(fp);
+            }
           }
         }
         int32_t exp_adjust = int32_t(words[3] << 13) >> 26;  // dword_3 bits 13-18
@@ -2024,6 +2054,25 @@ struct Backend::Impl {
                               "v0={} v1={} v2={} v[last-1]={} v[last]={}\n",
                               inl, sb.address, sb.size, sb.offset, sb.stride, d.start, d.count, avail, pos(d.start),
                               pos(d.start + 1), pos(d.start + 2), pos(d.start + d.count - 2), pos(d.start + d.count - 1));
+    }
+
+    // Dump frame: raw vertex colours (COLOR0 dwords as stored, before the endian swap) of draws
+    // that sample a tint palette in s18, to check which component carries the palette index.
+    if (dumping && texture_log.find(" s18:T") != std::string::npos) {
+      for (uint32_t i = 0; i < d.element_count; i++) {
+        const VertexElement& e = d.elements[i];
+        if (e.usage != 10 || e.usage_index != 0 || e.stream >= kMaxStreams) continue;
+        const auto& sb = d.streams[e.stream];
+        const uint8_t* base = sb.address ? REX_KERNEL_MEMORY()->TranslatePhysical(sb.address) : nullptr;
+        if (!base || !sb.stride) break;
+        std::string cols;
+        for (uint32_t v = 0; v < 8 && sb.offset + v * sb.stride + e.offset + 4 <= sb.size; v++) {
+          const uint8_t* p = base + sb.offset + v * sb.stride + e.offset;
+          cols += fmt::format(" {:02X}{:02X}{:02X}{:02X}", p[0], p[1], p[2], p[3]);
+        }
+        dump_log += fmt::format("  color0 type={:06X} endian={} raw:{}\n", e.type, sb.endian, cols);
+        break;
+      }
     }
 
     // Dump frame: the depth buffer as the first far-plane-pinned draw (sky / distant fog meshes,
