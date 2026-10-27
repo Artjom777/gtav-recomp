@@ -766,6 +766,11 @@ FramePacket TakeSpare() { return g_renderer.TakeSpare(); }
 
 }  // namespace gtav::native
 
-// Looked up by the SDK's D3D12 command processor (gpu_skip_rendering) and called at every swap it
-// executes; see Renderer::NoteGuestSwap.
-extern "C" __declspec(dllexport) void rex_skip_rendering_swap(uint64_t) { gtav::native::g_renderer.WaitForGuestSwap(); }
+// Looked up by the SDK's D3D12 and Vulkan command processors (gpu_skip_rendering) and called at
+// every swap they execute; see Renderer::NoteGuestSwap.
+#ifdef _WIN32
+#define GTAV_EXPORT __declspec(dllexport)
+#else
+#define GTAV_EXPORT __attribute__((visibility("default")))  // exported by the link options
+#endif
+extern "C" GTAV_EXPORT void rex_skip_rendering_swap(uint64_t) { gtav::native::g_renderer.WaitForGuestSwap(); }

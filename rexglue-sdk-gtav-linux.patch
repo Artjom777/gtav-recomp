@@ -1,3 +1,25 @@
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index 96d362b..0cb73ed 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -366,6 +366,17 @@ class D3D12CommandProcessor : public CommandProcessor {
+   bool UpdateBindings(const D3D12Shader* vertex_shader, const D3D12Shader* pixel_shader,
+                       ID3D12RootSignature* root_signature, bool shared_memory_is_uav);
+   bool IssueCopy_ReadbackResolvePath();
++  // gtav native-renderer comparison dumps (see the cvars in command_processor.cpp).
++  bool EmuDumpActive();
++  void DumpResolveForComparison(uint32_t address, uint32_t length, const uint8_t* data);
++  void DumpDrawConstantsForComparison(uint32_t prim, uint32_t count);
++  uint64_t emu_dump_target_ = 0, emu_dump_frame_ = 0;
++  uint32_t emu_dump_sequence_ = 0;
++  // Draw constants of the frame being dumped, written to its draws.bin once the frame is over
++  // (one file open per draw on a slow disk made every dumped frame take minutes).
++  void FlushDrawConstantsForComparison();
++  std::vector<uint8_t> emu_draw_constants_;
++  uint64_t emu_draw_constants_frame_ = 0;
+   bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
+   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
+ 
 diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
 index 696ff48..00eab3e 100644
 --- a/include/rex/graphics/vulkan/command_processor.h
@@ -13,6 +35,27 @@ index 696ff48..00eab3e 100644
    bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
    bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
  
+diff --git a/include/rex/input/input_system.h b/include/rex/input/input_system.h
+index 1cb3faa..a68b9cc 100644
+--- a/include/rex/input/input_system.h
++++ b/include/rex/input/input_system.h
+@@ -11,6 +11,7 @@
+  */
+ 
+ #include <memory>
++#include <mutex>
+ #include <vector>
+ 
+ #include <rex/input/device_assignment.h>
+@@ -65,6 +66,8 @@ class InputSystem : public system::IInputSystem {
+   // does not renumber pad two.
+   std::vector<DeviceInfo> devices_;
+   std::vector<InputDriver*> device_owners_;
++  // Serializes the public X* entry points (several guest threads poll input at once).
++  std::recursive_mutex mutex_;
+ };
+ 
+ /// Create a default InputSystem with SDL + NOP drivers.
 diff --git a/include/rex/system/xobject.h b/include/rex/system/xobject.h
 index 0a43f07..a9bf21f 100644
 --- a/include/rex/system/xobject.h
@@ -26,6 +69,131 @@ index 0a43f07..a9bf21f 100644
    X_STATUS Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t alertable,
                  uint64_t* opt_timeout);
    static X_STATUS SignalAndWait(XObject* signal_object, XObject* wait_object, uint32_t wait_reason,
+diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
+index 20a2cd8..02d1607 100644
+--- a/src/audio/sdl/sdl_audio_driver.cpp
++++ b/src/audio/sdl/sdl_audio_driver.cpp
+@@ -11,7 +11,13 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <cstdio>
++#include <condition_variable>
+ #include <cstring>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
+ 
+ #include <rex/assert.h>
+ #include <rex/audio/conversion.h>
+@@ -25,6 +31,8 @@
+ #include <SDL3/SDL.h>
+ 
+ REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
++REXCVAR_DEFINE_STRING(audio_dump_raw, "", "Audio",
++                      "Append the device mix (float32, interleaved, device rate/channels) to this file, also when muted");
+ 
+ namespace rex::audio::sdl {
+ 
+@@ -158,6 +166,50 @@ void SDLAudioDriver::Shutdown() {
+   }
+ }
+ 
++namespace {
++// --audio_dump_raw: the callback only appends to memory; a writer thread does the file I/O
++// (fwrite on a busy disk inside the callback stalled the device to ~0.4x real time).
++class RawDump {
++ public:
++  static RawDump* Get() {
++    static RawDump* dump = [] {
++      const std::string path = REXCVAR_GET(audio_dump_raw);
++      return path.empty() ? nullptr : new RawDump(path);
++    }();
++    return dump;
++  }
++  void Append(const void* data, size_t len) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    auto p = static_cast<const uint8_t*>(data);
++    pending_.insert(pending_.end(), p, p + len);
++    cv_.notify_one();
++  }
++
++ private:
++  explicit RawDump(const std::string& path) : file_(std::fopen(path.c_str(), "wb")) {
++    std::thread([this] {
++      std::vector<uint8_t> out;
++      for (;;) {
++        {
++          std::unique_lock<std::mutex> lock(mutex_);
++          cv_.wait(lock, [this] { return pending_.size() >= (64u << 10); });
++          out.swap(pending_);
++        }
++        if (file_) {
++          std::fwrite(out.data(), 1, out.size(), file_);
++          std::fflush(file_);
++        }
++        out.clear();
++      }
++    }).detach();
++  }
++  FILE* file_;
++  std::mutex mutex_;
++  std::condition_variable cv_;
++  std::vector<uint8_t> pending_;
++};
++}  // namespace
++
+ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int additional_amount,
+                                  [[maybe_unused]] int total_amount) {
+   SCOPE_profile_cpu_f("apu");
+@@ -178,15 +230,26 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+   const StereoFold fold = GetStereoFold();
+   const SurroundMix mix = GetSurroundMix();
+   const float gain = GetOutputGain();
++  // gtav: audio health, once per ~10 s of output: silence fills mean the guest delivered late
++  // (dropouts), a deep queue means it delivered in bursts (latency).
++  static uint32_t stat_frames = 0, stat_silence = 0, stat_max_queued = 0;
+   while (additional_amount > 0) {
+     static uint32_t sdl_callback_count = 0;
+     std::unique_lock<std::mutex> guard(driver->frames_mutex_);
++    stat_max_queued = std::max(stat_max_queued, uint32_t(driver->frames_queued_.size()));
++    if (++stat_frames >= 1875) {  // 256-sample frames at 48 kHz
++      REXAPU_INFO("audio: {} of {} frames were silence (guest late), max {} queued", stat_silence, stat_frames,
++                  stat_max_queued);
++      stat_frames = stat_silence = stat_max_queued = 0;
++    }
+     if (driver->frames_queued_.empty()) {
++      stat_silence++;
+       if (sdl_callback_count < 10) {
+         REXAPU_DEBUG("SDLCallback: no frames queued (silence)");
+         sdl_callback_count++;
+       }
+       std::memset(data, 0, len);
++      if (RawDump* dump = RawDump::Get()) dump->Append(data, size_t(len));
+       if (!SDL_PutAudioStreamData(stream, data, len)) {
+         REXAPU_ERROR("SDL_PutAudioStreamData() failed while filling silence: {}", SDL_GetError());
+         break;
+@@ -195,9 +258,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+     } else {
+       auto buffer = driver->frames_queued_.front();
+       driver->frames_queued_.pop();
+-      if (REXCVAR_GET(audio_mute)) {
+-        std::memset(data, 0, len);
+-      } else {
++      {
+         switch (driver->sdl_device_channels_) {
+           case 2:
+             conversion::sequential_6_BE_to_interleaved_2_LE(data, buffer, channel_samples_, fold,
+@@ -211,6 +272,8 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+             assert_unhandled_case(driver->sdl_device_channels_);
+             break;
+         }
++        if (RawDump* dump = RawDump::Get()) dump->Append(data, size_t(len));
++        if (REXCVAR_GET(audio_mute)) std::memset(data, 0, len);
+       }
+       if (!SDL_PutAudioStreamData(stream, data, len)) {
+         REXAPU_ERROR("SDL_PutAudioStreamData() failed: {}", SDL_GetError());
 diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
 index 11b83be..e5c1c26 100644
 --- a/src/audio/xma_context.cpp
@@ -82,8 +250,176 @@ index 11b83be..e5c1c26 100644
      data.output_buffer_valid = 0;
    }
  
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 19874a5..1c2dada 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -12,6 +12,7 @@
+ #include <algorithm>
+ #include <cstdarg>
+ #include <cstring>
++#include <filesystem>
+ #include <sstream>
+ #include <utility>
+ 
+@@ -32,6 +33,19 @@
+ #include <rex/ui/d3d12/d3d12_presenter.h>
+ #include <rex/ui/d3d12/d3d12_util.h>
+ 
++// A title-side renderer draws the frames: the command processor still executes the PM4 stream
++// (registers, fences, interrupts, swaps) but issues no host draws, resolves or presents, and
++// occlusion queries take the base class's fake-sample path. (Same flag as the Vulkan backend;
++// the two backends are never compiled into one plugin here.)
++// gtav native-renderer bring-up (same as the Vulkan backend): every resolve of the chosen frame is
++// written to logs/emu_dump/frame_N/<seq>_<address>.bin (needs d3d12_readback_resolve=full) plus the
++// draw constants of emu_draw_dump_window frames. -1 = the next frame (set by the game on F9).
++REXCVAR_DEFINE_INT32(emu_resolve_dump_frame, 0, "GPU",
++                     "Dump every resolve of this frame to logs/emu_dump (-1 = next frame)");
++REXCVAR_DEFINE_INT32(emu_draw_dump_window, 1, "GPU",
++                     "Number of frames (from emu_resolve_dump_frame) whose draw constants are dumped");
++REXCVAR_DEFINE_BOOL(gpu_skip_rendering, false, "GPU",
++                    "Execute PM4 without rendering (a title-side renderer draws the frames)");
+ REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
+@@ -47,6 +61,18 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
+                     "Submit command list when PM4 primary buffer ends")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++// gtav native renderer: with gpu_skip_rendering the title's renderer replays frames some time
++// after this command processor executed them, yet fences written after a swap tell the game the
++// GPU is done with that frame's memory (it then streams new textures and vertex data into it).
++// When the title executable exports rex_skip_rendering_swap, this plugin calls it on the command
++// processor thread at every swap (0-based, in PM4 order); it blocks until the title's renderer
++// has read the frame's guest memory.
++using SkipRenderingSwapHook = void (*)(uint64_t swap_index);
++static SkipRenderingSwapHook ResolveSkipRenderingSwapHook() {
++  return reinterpret_cast<SkipRenderingSwapHook>(
++      GetProcAddress(GetModuleHandleW(nullptr), "rex_skip_rendering_swap"));
++}
++
+ namespace rex::graphics::d3d12 {
+ 
+ // Generated with `xb buildshaders`.
+@@ -152,7 +178,8 @@ void D3D12CommandProcessor::InitializeShaderStorage(const std::filesystem::path&
+ 
+ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader,
+                                                                uint32_t packet, uint32_t count) {
+-  if (!REXCVAR_GET(occlusion_query_enable) || !occlusion_query_resources_available_) {
++  if (!REXCVAR_GET(occlusion_query_enable) || !occlusion_query_resources_available_ ||
++      REXCVAR_GET(gpu_skip_rendering)) {
+     return CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
+   }
+ 
+@@ -1897,7 +1924,13 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+   vertex_buffers_in_sync_[0] = 0;
+   vertex_buffers_in_sync_[1] = 0;
+ 
+-  if (!graphics_system_)
++  if (REXCVAR_GET(gpu_skip_rendering)) {
++    static uint64_t skip_swaps = 0;
++    static const SkipRenderingSwapHook hook = ResolveSkipRenderingSwapHook();
++    if (hook) hook(skip_swaps);
++    skip_swaps++;
++  }
++  if (!graphics_system_ || REXCVAR_GET(gpu_skip_rendering))
+     return;
+   ui::Presenter* presenter = graphics_system_->presenter();
+   if (!presenter) {
+@@ -2275,6 +2308,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+ 
++  if (REXCVAR_GET(gpu_skip_rendering)) {
++    return true;
++  }
++  DumpDrawConstantsForComparison(uint32_t(primitive_type), index_count);
+   ID3D12Device* device = GetD3D12Provider().GetDevice();
+   const RegisterFile& regs = *register_file_;
+ 
+@@ -2870,10 +2907,72 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
+   return true;
+ }
+ 
++bool D3D12CommandProcessor::EmuDumpActive() {
++  int32_t frame = REXCVAR_GET(emu_resolve_dump_frame);
++  if (frame < 0) {
++    REXCVAR_SET(emu_resolve_dump_frame, 0);
++    emu_dump_target_ = frame_current_ + 1;
++  } else if (frame > 0) {
++    emu_dump_target_ = uint64_t(frame);
++  }
++  uint64_t window = uint64_t(std::max(1, REXCVAR_GET(emu_draw_dump_window)));
++  return emu_dump_target_ && frame_current_ >= emu_dump_target_ && frame_current_ < emu_dump_target_ + window;
++}
++
++void D3D12CommandProcessor::DumpResolveForComparison(uint32_t address, uint32_t length,
++                                                     const uint8_t* data) {
++  if (!EmuDumpActive()) return;
++  if (emu_dump_frame_ != frame_current_) {
++    emu_dump_frame_ = frame_current_;
++    emu_dump_sequence_ = 0;
++  }
++  std::filesystem::path dir = std::filesystem::path("logs/emu_dump") / fmt::format("frame_{}", frame_current_);
++  std::error_code ec;
++  std::filesystem::create_directories(dir, ec);
++  auto path = dir / fmt::format("{:03}_{:08X}.bin", emu_dump_sequence_++, address);
++  if (FILE* f = std::fopen(path.string().c_str(), "wb")) {
++    std::fwrite(data, 1, length, f);
++    std::fclose(f);
++  }
++}
++
++void D3D12CommandProcessor::FlushDrawConstantsForComparison() {
++  if (emu_draw_constants_.empty()) return;
++  std::filesystem::path dir =
++      std::filesystem::path("logs/emu_dump") / fmt::format("frame_{}", emu_draw_constants_frame_);
++  std::error_code ec;
++  std::filesystem::create_directories(dir, ec);
++  if (FILE* f = std::fopen((dir / "draws.bin").string().c_str(), "ab")) {
++    std::fwrite(emu_draw_constants_.data(), 1, emu_draw_constants_.size(), f);
++    std::fclose(f);
++  }
++  emu_draw_constants_.clear();
++}
++
++void D3D12CommandProcessor::DumpDrawConstantsForComparison(uint32_t prim, uint32_t count) {
++  bool active = EmuDumpActive();
++  if (!emu_draw_constants_.empty() && (!active || emu_draw_constants_frame_ != frame_current_))
++    FlushDrawConstantsForComparison();
++  if (!active) return;
++  emu_draw_constants_frame_ = frame_current_;
++  auto* ps = active_pixel_shader();
++  uint64_t hash = ps ? ps->ucode_data_hash() : 0;
++  uint32_t header[4] = {prim, count, uint32_t(hash), uint32_t(hash >> 32)};
++  auto append = [&](const void* p, size_t n) {
++    auto* b = static_cast<const uint8_t*>(p);
++    emu_draw_constants_.insert(emu_draw_constants_.end(), b, b + n);
++  };
++  append(header, sizeof(header));
++  append(&register_file_->values[XE_GPU_REG_SHADER_CONSTANT_000_X], 4 * 2048);
++}
++
+ bool D3D12CommandProcessor::IssueCopy() {
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
++  if (REXCVAR_GET(gpu_skip_rendering)) {
++    return true;
++  }
+   if (!BeginSubmission(true)) {
+     return false;
+   }
+@@ -3095,6 +3194,7 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
+     uint8_t* destination = memory_->TranslatePhysical(written_address);
+     if (destination) {
+       std::memcpy(destination, static_cast<uint8_t*>(rb.mapped_data[read_index]), written_length);
++      DumpResolveForComparison(written_address, written_length, destination);
+     }
+   }
+ 
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 001f36b..7346e68 100644
+index 001f36b..1245e09 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -10,6 +10,7 @@
@@ -94,7 +430,18 @@ index 001f36b..7346e68 100644
  #include <array>
  #include <cstdint>
  #include <cstring>
-@@ -47,6 +48,14 @@
+@@ -21,6 +22,10 @@
+ #include <utility>
+ #include <vector>
+ 
++#ifndef _WIN32
++#include <dlfcn.h>
++#endif
++
+ #include <SPIRV/GlslangToSpv.h>
+ #include <glslang/Public/ShaderLang.h>
+ #include <rex/assert.h>
+@@ -47,6 +52,30 @@
  #include <rex/ui/vulkan/util.h>
  
  // Legacy backend compatibility aliases for shared readback controls.
@@ -106,19 +453,41 @@ index 001f36b..7346e68 100644
 +// (registers, fences, interrupts, swaps) but issues no host draws, resolves or presents.
 +REXCVAR_DEFINE_BOOL(gpu_skip_rendering, false, "GPU/Vulkan",
 +                    "Execute PM4 without rendering (a title-side renderer draws the frames)");
++// gtav native renderer: with gpu_skip_rendering the title's renderer replays frames some time
++// after this command processor executed them, yet fences written after a swap tell the game the
++// GPU is done with that frame's memory (it then streams new textures and vertex data into it).
++// When the title executable exports rex_skip_rendering_swap, this plugin calls it on the command
++// processor thread at every swap (0-based, in PM4 order); it blocks until the title's renderer
++// has read the frame's guest memory. (Same hook as the D3D12 backend.)
++using SkipRenderingSwapHook = void (*)(uint64_t swap_index);
++static SkipRenderingSwapHook ResolveSkipRenderingSwapHook() {
++#ifdef _WIN32
++  return reinterpret_cast<SkipRenderingSwapHook>(
++      GetProcAddress(GetModuleHandleW(nullptr), "rex_skip_rendering_swap"));
++#else
++  return reinterpret_cast<SkipRenderingSwapHook>(dlsym(RTLD_DEFAULT, "rex_skip_rendering_swap"));
++#endif
++}
++
  REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
                      "Read render-to-texture results on the CPU")
      .lifecycle(rex::cvar::Lifecycle::kHotReload);
-@@ -2275,7 +2284,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+@@ -2275,7 +2304,13 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
    vertex_buffers_in_sync_[0] = 0;
    vertex_buffers_in_sync_[1] = 0;
  
 -  if (!graphics_system_)
++  if (REXCVAR_GET(gpu_skip_rendering)) {
++    static uint64_t skip_swaps = 0;
++    static const SkipRenderingSwapHook hook = ResolveSkipRenderingSwapHook();
++    if (hook) hook(skip_swaps);
++    skip_swaps++;
++  }
 +  if (!graphics_system_ || REXCVAR_GET(gpu_skip_rendering))
      return;
    ui::Presenter* presenter = graphics_system_->presenter();
    if (!presenter) {
-@@ -3594,8 +3603,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3594,8 +3629,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    SCOPE_profile_cpu_f("gpu");
  #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
  
@@ -131,7 +500,7 @@ index 001f36b..7346e68 100644
    auto draw_fail = [&](const char* stage) {
      auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
      REXGPU_ERROR(
-@@ -4385,6 +4398,9 @@ bool VulkanCommandProcessor::IssueCopy() {
+@@ -4385,6 +4424,9 @@ bool VulkanCommandProcessor::IssueCopy() {
  #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
    SCOPE_profile_cpu_f("gpu");
  #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -141,7 +510,7 @@ index 001f36b..7346e68 100644
  
    if (!BeginSubmission(true)) {
      return false;
-@@ -4400,6 +4416,56 @@ bool VulkanCommandProcessor::IssueCopy() {
+@@ -4400,6 +4442,56 @@ bool VulkanCommandProcessor::IssueCopy() {
    return IssueCopy_ReadbackResolvePath();
  }
  
@@ -198,7 +567,7 @@ index 001f36b..7346e68 100644
  bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
    const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
-@@ -4682,6 +4748,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
+@@ -4682,6 +4774,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
      uint8_t* destination = memory_->TranslatePhysical(written_address);
      if (destination) {
        std::memcpy(destination, readback.mapped_data[read_index], written_length);
@@ -225,6 +594,50 @@ index 0298f06..b3355e9 100644
      switch (mode.output) {
        case TransferOutput::kColor: {
          // Unless a special path was taken, unpack the raw 32bpp value into the
+diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
+index 813bb1c..c366ef7 100644
+--- a/src/input/input_system.cpp
++++ b/src/input/input_system.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <mutex>
+ #include <cmath>
+ 
+ #include <rex/dbg.h>
+@@ -187,6 +188,7 @@ const DeviceInfo* InputSystem::DeviceInfoFor(DeviceId id) const {
+ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+                                       X_INPUT_CAPABILITIES* out_caps) {
+   SCOPE_profile_cpu_f("hid");
++  std::lock_guard lock(mutex_);  // guest threads poll input concurrently; RefreshDevices rebuilds devices_
+   if (!out_caps || !assignment_) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+@@ -214,6 +216,7 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+ 
+ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+   SCOPE_profile_cpu_f("hid");
++  std::lock_guard lock(mutex_);  // guest threads poll input concurrently; RefreshDevices rebuilds devices_
+   if (!assignment_) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+@@ -253,6 +256,7 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+ 
+ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
+   SCOPE_profile_cpu_f("hid");
++  std::lock_guard lock(mutex_);  // guest threads poll input concurrently; RefreshDevices rebuilds devices_
+   if (!assignment_) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+@@ -295,6 +299,7 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
+ X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
+                                    X_INPUT_KEYSTROKE* out_keystroke) {
+   SCOPE_profile_cpu_f("hid");
++  std::lock_guard lock(mutex_);  // guest threads poll input concurrently; RefreshDevices rebuilds devices_
+   if (!assignment_) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
 diff --git a/src/kernel/xam/xam_info.cpp b/src/kernel/xam/xam_info.cpp
 index 1fda053..fe2e5e3 100644
 --- a/src/kernel/xam/xam_info.cpp
