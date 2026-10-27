@@ -27,6 +27,9 @@
 #include <string>
 
 REXCVAR_DECLARE(std::string, gtav_native);
+REXCVAR_DEFINE_BOOL(gtav_native_snapshot_draws, false, "GTAV",
+                    "Copy every draw's vertex and index data at the D3D call instead of reading guest "
+                    "memory when the frame is recorded");
 REXCVAR_DEFINE_INT32(gtav_native_layout_probe, 0, "GTAV",
                      "Log objects and register shadow for the first draws of this guest frame");
 
@@ -249,6 +252,39 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
   }
   for (int i = 0; i < 4; i++) d.render_targets[i] = be32(dev + d3d::kDevRenderTargets + 4 * i);
   d.depth_stencil = be32(dev + d3d::kDevDepthStencil);
+  d.data_hash = DrawDataHash(d, [](uint32_t a) { return REX_KERNEL_MEMORY()->TranslatePhysical(a); });
+  if (REXCVAR_GET(gtav_native_snapshot_draws) && !d.is_inline) {
+    auto* mem = REX_KERNEL_MEMORY();
+    uint32_t first = d.start, last = d.start + d.count;  // vertices [first, last)
+    if (d.indexed) {
+      uint32_t isz = d.index32 ? 4 : 2;
+      const uint8_t* ip = d.index_address ? mem->TranslatePhysical(d.index_address) : nullptr;
+      first = ~0u, last = 0;
+      if (ip && uint64_t(d.start + d.count) * isz <= d.index_size) {
+        ip += size_t(d.start) * isz;
+        d.snap_index = g_packet.Push(ip, d.count * isz);
+        d.snap_index_size = d.count * isz;
+        for (uint32_t i = 0; i < d.count; i++) {
+          uint32_t v = isz == 4 ? be32(ip + 4 * i) : uint32_t(ip[2 * i] << 8 | ip[2 * i + 1]);
+          if (isz == 4 || v != 0xFFFF) first = std::min(first, v), last = std::max(last, v + 1);
+        }
+        if (first < last) first += uint32_t(d.base_vertex), last += uint32_t(d.base_vertex);
+      }
+    }
+    if (first < last && last - first <= (1u << 20)) {
+      d.snap_first = first;
+      d.snap_vertices = last - first;
+      for (uint32_t s = 0; s < kMaxStreams; s++) {
+        const auto& sb = d.streams[s];
+        if (!sb.address || !sb.stride || sb.size <= sb.offset) continue;
+        uint64_t lo = uint64_t(first) * sb.stride, hi = std::min<uint64_t>(uint64_t(last) * sb.stride, sb.size - sb.offset);
+        if (lo >= hi) { d.snap_vertices = 0; break; }
+        d.snap_stream[s] = g_packet.Push(mem->TranslatePhysical(sb.address + sb.offset) + lo, uint32_t(hi - lo));
+        d.snap_vertices = std::min<uint32_t>(d.snap_vertices, uint32_t((hi - lo) / sb.stride));
+      }
+    }
+    if (!d.snap_vertices) d.snap_index_size = 0;  // all or nothing
+  }
   g_packet.commands.push_back({CommandKind::kDraw, uint32_t(g_packet.draws.size()), WritePointer(device)});
   g_packet.draws.push_back(d);
   return &g_packet.draws.back();

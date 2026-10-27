@@ -57,7 +57,53 @@ struct DrawCommand {
   VertexElement elements[kMaxVertexElements];
   StreamBinding streams[kMaxStreams];
   uint32_t render_targets[4] = {}, depth_stencil = 0;  // guest surface objects
+  uint64_t data_hash = 0;  // sampled hash of the vertex/index data at capture (DrawDataHash)
+  // --gtav_native_snapshot_draws: the vertices the draw reaches and its index slice, copied into the
+  // arena at the D3D call (snap_index holds indices [start, start + count)).
+  uint32_t snap_first = 0, snap_vertices = 0;  // vertices [snap_first, snap_first + snap_vertices)
+  uint32_t snap_stream[kMaxStreams] = {};
+  uint32_t snap_index = 0, snap_index_size = 0;
 };
+
+// Hash of the exact guest bytes a draw reads (its index slice and the vertex range those indices
+// reach, sampled to 32 places per range), to see whether the game rewrote that memory between the
+// D3D call and the renderer reading it.
+template <typename Translate>
+uint64_t DrawDataHash(const DrawCommand& d, Translate&& physical) {
+  uint64_t h = 1469598103934665603ull;
+  auto mix = [&](const uint8_t* p, uint32_t size) {
+    if (!p || !size) return;
+    for (uint32_t k = 0; k < 32; k++) {
+      uint32_t at = uint32_t(uint64_t(size) * k / 32);
+      for (uint32_t b = 0; b < 16 && at + b < size; b++) h = (h ^ p[at + b]) * 1099511628211ull;
+    }
+  };
+  if (d.is_inline) return h;
+  uint32_t first = d.start, last = d.start + d.count;  // vertex range [first, last)
+  if (d.indexed && !d.inline_index_size) {
+    uint32_t isz = d.index32 ? 4 : 2;
+    if (uint64_t(d.start + d.count) * isz > d.index_size) return h;
+    const uint8_t* ip = physical(d.index_address);
+    if (!ip) return h;
+    ip += size_t(d.start) * isz;
+    mix(ip, d.count * isz);
+    first = ~0u, last = 0;
+    for (uint32_t i = 0; i < d.count; i++) {
+      uint32_t v = isz == 4 ? (uint32_t(ip[4 * i]) << 24 | uint32_t(ip[4 * i + 1]) << 16 | uint32_t(ip[4 * i + 2]) << 8 | ip[4 * i + 3])
+                            : (uint32_t(ip[2 * i]) << 8 | ip[2 * i + 1]);
+      if (d.index32 || v != 0xFFFF) first = std::min(first, v), last = std::max(last, v + 1);
+    }
+    if (first >= last) return h;
+    first += uint32_t(d.base_vertex), last += uint32_t(d.base_vertex);
+  }
+  for (const auto& s : d.streams) {
+    if (!s.address || !s.stride) continue;
+    uint64_t lo = s.offset + uint64_t(first) * s.stride, hi = s.offset + uint64_t(last) * s.stride;
+    if (hi > s.size || lo >= hi) continue;
+    mix(physical(s.address) + lo, uint32_t(hi - lo));
+  }
+  return h;
+}
 
 struct ClearCommand {
   uint32_t flags = 0, color = 0, stencil = 0;

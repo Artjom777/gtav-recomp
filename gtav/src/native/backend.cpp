@@ -38,6 +38,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <bit>
+#include <set>
 #include <vector>
 
 REXCVAR_DECLARE(std::string, gtav_native_spirv_dir);
@@ -45,6 +46,9 @@ REXCVAR_DEFINE_INT32(gtav_native_dump_rt, 0x2D0, "GTAV",
                      "Frame dumps: EDRAM base of the color target snapshotted after every draw (0x2D0 = scene HDR)");
 REXCVAR_DEFINE_INT32(gtav_native_dump_rt_skip, 0, "GTAV",
                      "Frame dumps: skip this many draws into --gtav_native_dump_rt before the snapshots start");
+REXCVAR_DEFINE_BOOL(gtav_native_exact_cache, false, "GTAV",
+                    "Check cached vertex/index buffers and textures with a full content hash every frame "
+                    "(no sampled-hash shortcut for large ones)");
 REXCVAR_DEFINE_INT32(gtav_native_dump_rt_count, 150, "GTAV",
                      "Frame dumps: number of per-draw snapshots of --gtav_native_dump_rt (~2.7 MB each at 720p)");
 REXCVAR_DEFINE_BOOL(gtav_native_async_pipelines, true, "GTAV",
@@ -561,7 +565,9 @@ struct Backend::Impl {
   uint32_t stale_resolves_logged = 0;
   uint32_t alpha_to_mask_logged = 0;
   uint32_t alpha_funcs_logged = 0;
-  uint32_t zero_textures_logged = 0;  // RB_COLORCONTROL alpha functions already logged (bit per function)
+  uint32_t zero_textures_logged = 0;
+  uint64_t data_changed_draws = 0, data_checked_draws = 0;  // DrawDataHash mismatches at record time
+  std::set<uint64_t> data_changed_examples;  // RB_COLORCONTROL alpha functions already logged (bit per function)
 
   static uint64_t SampleGuest(uint32_t address, uint32_t size) {
     const uint8_t* p = REX_KERNEL_MEMORY()->TranslatePhysical(address);
@@ -1190,6 +1196,7 @@ struct Backend::Impl {
     // Large buffers: a sampled hash every frame and a full one every 8 frames.
     constexpr uint64_t kSmallBuffer = 64 << 10;
     if (b.buffer && guest_size > kSmallBuffer && b.size == host_size && frame - b.full_frame < 8 &&
+        !REXCVAR_GET(gtav_native_exact_cache) &&
         SampledHash(guest, guest_size) == b.sampled) {
       b.checked_frame = frame;
       return b.buffer.get();
@@ -1240,7 +1247,7 @@ struct Backend::Impl {
     // get a full hash, larger ones a sampled hash (and a full one every 30 frames).
     constexpr uint64_t kSmallTexture = 64 << 10;
     if (t.texture && (t.checked_frame == frame || t.sample_frame == frame)) return t.descriptor;
-    if (t.texture && t.bytes > kSmallTexture && frame - t.checked_frame < 30) {
+    if (t.texture && t.bytes > kSmallTexture && frame - t.checked_frame < 30 && !REXCVAR_GET(gtav_native_exact_cache)) {
       ScopedMs st{tprof.sampled_ms};
       tprof.sampled++;
       if (HashGuestTexture(words, true) == t.sampled_hash) {
@@ -1684,6 +1691,13 @@ struct Backend::Impl {
   void Draw(RenderCommandList* list, const FramePacket& f, const DrawCommand& d) {
     prof.Start();
     const uint8_t* r = f.At(d.regs);
+    // Did the game rewrite this draw's vertex/index memory since the D3D call? (logged with the
+    // record-time profile every 300 frames)
+    if (DrawDataHash(d, [](uint32_t a) { return REX_KERNEL_MEMORY()->TranslatePhysical(a); }) != d.data_hash) {
+      data_changed_draws++;
+      if (data_changed_examples.size() < 6) data_changed_examples.insert(d.ps_hash);
+    }
+    data_checked_draws++;
     // GTAV_NATIVE_SKIP_PS / GTAV_NATIVE_SKIP_VS=hash,hash: bring-up diagnostic that drops draws using
     // these pixel / vertex shaders (bisecting the lighting pass).
     static const std::string skip_ps = std::getenv("GTAV_NATIVE_SKIP_PS") ? std::getenv("GTAV_NATIVE_SKIP_PS") : "";
@@ -1905,7 +1919,11 @@ struct Backend::Impl {
       uint32_t stride = std::max(sb.stride, 1u);
       uint32_t vertices = (sb.size - sb.offset) / stride;
       uint32_t host_stride = vl.host_stride[s];
-      const uint8_t* guest = inline_data ? f.At(d.inline_vertices) : mem->TranslatePhysical(sb.address + sb.offset);
+      const bool snapped = d.snap_vertices && !inline_data && !indirect_fetch_shaders.count(d.vs_hash);
+      if (snapped) vertices = d.snap_vertices;  // the snapshot starts at vertex snap_first
+      const uint8_t* guest = inline_data ? f.At(d.inline_vertices)
+                             : snapped   ? f.At(d.snap_stream[s])
+                                         : mem->TranslatePhysical(sb.address + sb.offset);
       uint64_t key = Hash(&sb, sizeof(sb), Hash(vl.elements, sizeof(RenderInputElement) * vl.element_count, s));
       auto convert = [&](uint8_t* out) {
         for (uint32_t n = 0; n < vl.element_count; n++) {
@@ -1954,7 +1972,7 @@ struct Backend::Impl {
         }
       };
       RenderBufferReference ref;
-      if (inline_data) {  // CPU-written per draw: per-frame upload memory, never cached
+      if (inline_data || snapped) {  // per-draw data: per-frame upload memory, never cached
         auto a = upload.Allocate(uint64_t(vertices) * host_stride, 16);
         ConvertInto(a.cpu, uint64_t(vertices) * host_stride, convert);
         ref = RenderBufferReference(a.buffer, a.offset);
@@ -2070,7 +2088,17 @@ struct Backend::Impl {
           const uint8_t* p = base + sb.offset + v * sb.stride + e.offset;
           cols += fmt::format(" {:02X}{:02X}{:02X}{:02X}", p[0], p[1], p[2], p[3]);
         }
-        dump_log += fmt::format("  color0 type={:06X} endian={} raw:{}\n", e.type, sb.endian, cols);
+        // Per byte position: how many vertices have 0x00 / 0xFF / something else there.
+        uint32_t zero[4] = {}, full[4] = {}, total = 0;
+        for (uint32_t off = sb.offset + e.offset; off + 4 <= sb.size; off += sb.stride, total++)
+          for (int k = 0; k < 4; k++) {
+            zero[k] += base[off + k] == 0;
+            full[k] += base[off + k] == 0xFF;
+          }
+        dump_log += fmt::format("  color0 type={:06X} endian={} addr={:08X} stride={} raw:{} | {} vertices, byte0..3 "
+                                "zero {}/{}/{}/{} full {}/{}/{}/{}\n",
+                                e.type, sb.endian, sb.address, sb.stride, cols, total, zero[0], zero[1], zero[2],
+                                zero[3], full[0], full[1], full[2], full[3]);
         break;
       }
     }
@@ -2095,7 +2123,7 @@ struct Backend::Impl {
           "draw prim={} n={} idx={} rt={} [{:03X}/{} {:03X}/{} {:03X}/{} {:03X}/{}] pitch={} msaa={} depth={}@{:03X} "
           "dc={:08X} sref={:06X} mode={:X} clip={:08X} cull={:08X} vte={:03X} vp=({:.0f},{:.0f} {:.0f}x{:.0f} z{:.6g}-{:.6g}) mask={:04X} vs={:016X} "
           "ps={:016X} rts={} {} {} {} sizes={}x{}/{}x{} decl[{}] ps_c39=({:.3g},{:.3g},{:.3g},{:.3g}) info={:08X},{:08X},{:08X},{:08X} "
-          "blend={:08X},{:08X},{:08X},{:08X} tex{}\n",
+          "blend={:08X},{:08X},{:08X},{:08X} cc={:08X} aref={:.3g} tex{}\n",
           d.primitive, d.count, d.indexed, count, regs::Color(r, 0).base, uint32_t(regs::Color(r, 0).format),
           regs::Color(r, 1).base, uint32_t(regs::Color(r, 1).format), regs::Color(r, 2).base,
           uint32_t(regs::Color(r, 2).format), regs::Color(r, 3).base, uint32_t(regs::Color(r, 3).format),
@@ -2110,7 +2138,8 @@ struct Backend::Impl {
           Const(psc.cpu, 39, 2), Const(psc.cpu, 39, 3), regs::Read(r, regs::RB_COLOR_INFO),
           regs::Read(r, regs::RB_COLOR1_INFO), regs::Read(r, regs::RB_COLOR2_INFO), regs::Read(r, regs::RB_COLOR3_INFO),
           regs::Read(r, regs::RB_BLENDCONTROL0), regs::Read(r, regs::RB_BLENDCONTROL1),
-          regs::Read(r, regs::RB_BLENDCONTROL1 + 1), regs::Read(r, regs::RB_BLENDCONTROL1 + 2), texture_log);
+          regs::Read(r, regs::RB_BLENDCONTROL1 + 1), regs::Read(r, regs::RB_BLENDCONTROL1 + 2), regs::Read(r, regs::RB_COLORCONTROL),
+          regs::ReadFloat(r, regs::RB_ALPHA_REF), texture_log);
     if (dumping) {
       dump_draws.push_back(d.primitive);
       dump_draws.push_back(d.count);
@@ -2172,11 +2201,17 @@ struct Backend::Impl {
       ds.slot_bound[at] = true;
     }
 
+    // Snapshot draws (--gtav_native_snapshot_draws): vertex data starts at vertex snap_first and the
+    // index data is the draw's own slice, so both are rebased.
+    // (Vertex shaders that fetch by a computed index read the guest streams directly: not rebased.)
+    const uint32_t snap_first = d.snap_vertices && !indirect_fetch_shaders.count(d.vs_hash) ? d.snap_first : 0;
+    const uint32_t first_index = d.snap_index_size ? 0 : d.start;
     // Index data: a guest index buffer, or BeginIndexedVertices indices copied into the arena.
-    bool inline_indices = d.inline_index_size != 0;
-    const uint8_t* index_data = inline_indices ? f.At(d.inline_indices)
-                                : d.index_address ? mem->TranslatePhysical(d.index_address) : nullptr;
-    uint32_t index_bytes = inline_indices ? d.inline_index_size : d.index_size;
+    bool inline_indices = d.inline_index_size != 0 || d.snap_index_size != 0;
+    const uint8_t* index_data = d.inline_index_size ? f.At(d.inline_indices)
+                                : d.snap_index_size ? f.At(d.snap_index)
+                                : d.index_address   ? mem->TranslatePhysical(d.index_address) : nullptr;
+    uint32_t index_bytes = d.inline_index_size ? d.inline_index_size : d.snap_index_size ? d.snap_index_size : d.index_size;
     if (d.primitive == 13) {  // quad list -> triangle list (0 1 2, 0 2 3 per quad)
       uint32_t quads = d.count / 4;
       if (!quads || (d.indexed && (!index_data || !index_bytes))) {
@@ -2188,8 +2223,8 @@ struct Backend::Impl {
       const uint8_t* guest = d.indexed ? index_data : nullptr;
       uint32_t unit = d.index32 ? 4 : 2;
       auto index = [&](uint32_t i) -> uint32_t {
-        if (!d.indexed) return d.start + i;
-        uint32_t at = (d.start + i) * unit;
+        if (!d.indexed) return d.start + i - snap_first;
+        uint32_t at = (first_index + i) * unit;
         if (at + unit > index_bytes) return 0;
         return unit == 4 ? be32(guest + at) : uint32_t(guest[at] << 8 | guest[at + 1]);
       };
@@ -2198,7 +2233,7 @@ struct Backend::Impl {
         for (int k = 0; k < 6; k++) out[q * 6 + k] = index(q * 4 + kQuad[k]);
       RenderIndexBufferView view(RenderBufferReference(a.buffer, a.offset), quads * 6 * 4, RenderFormat::R32_UINT);
       BindIndexBuffer(list, view);
-      list->drawIndexedInstanced(quads * 6, 1, 0, d.indexed ? d.base_vertex : 0, 0);
+      list->drawIndexedInstanced(quads * 6, 1, 0, d.indexed ? d.base_vertex - int32_t(snap_first) : 0, 0);
     } else if (d.indexed) {
       if (!index_data || !index_bytes) {
         stat_skipped++;
@@ -2221,9 +2256,9 @@ struct Backend::Impl {
       }
       RenderIndexBufferView view(ib_ref, index_bytes, d.index32 ? RenderFormat::R32_UINT : RenderFormat::R16_UINT);
       BindIndexBuffer(list, view);
-      list->drawIndexedInstanced(d.count, 1, d.start, d.base_vertex, 0);
+      list->drawIndexedInstanced(d.count, 1, first_index, d.base_vertex - int32_t(snap_first), 0);
     } else {
-      list->drawInstanced(d.count, 1, d.start, 0);
+      list->drawInstanced(d.count, 1, d.start - snap_first, 0);
     }
     stat_draws++;
     prof.Mark(prof.submit);
@@ -2838,6 +2873,12 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
     a.streams += s.prof.streams, a.pipe += s.prof.pipe, a.submit += s.prof.submit;
     if (++s.prof_frames == 300) {
       double n = s.prof_frames;
+      std::string ex;
+      for (uint64_t h : s.data_changed_examples) ex += fmt::format(" {:016X}", h);
+      REXLOG_INFO("[native] draw data rewritten after capture: {} of {} draws (ps{})", s.data_changed_draws,
+                  s.data_checked_draws, ex);
+      s.data_changed_draws = s.data_checked_draws = 0;
+      s.data_changed_examples.clear();
       REXLOG_INFO("[native] record ms per frame: setup {:.2f} consts {:.2f} textures {:.2f} streams {:.2f} "
                   "pipeline {:.2f} bind+draw {:.2f} (draws only; {} draws this frame)",
                   a.setup / n, a.consts / n, a.fetch / n, a.streams / n, a.pipe / n, a.submit / n, s.stat_draws);
