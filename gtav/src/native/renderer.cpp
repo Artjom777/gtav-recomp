@@ -265,7 +265,19 @@ class Renderer {
             }
           }
           r->window_ = SDL_CreateWindow(on ? "GTA V" : "GTA V - native renderer (shadow)", 1280, 720,
-                                        SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+                                        SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE |
+                                            (REXCVAR_GET(gtav_native_hidden) ? SDL_WINDOW_HIDDEN : 0));
+          // F9 (dump the next frame) and F10 (screenshot; marks audio captures) from any of the
+          // process's windows, like the Win32 timer poll. The watch runs where the SDK pumps events.
+          SDL_AddEventWatch(
+              [](void*, SDL_Event* e) {
+                if (e->type == SDL_EVENT_KEY_DOWN && !e->key.repeat) {
+                  if (e->key.scancode == SDL_SCANCODE_F9) key_dump_ = true;
+                  if (e->key.scancode == SDL_SCANCODE_F10) key_shot_ = true;
+                }
+                return true;
+              },
+              nullptr);
         },
         this, true);
     if (!window_) {

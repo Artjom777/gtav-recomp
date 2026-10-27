@@ -195,10 +195,48 @@ index 20a2cd8..02d1607 100644
        if (!SDL_PutAudioStreamData(stream, data, len)) {
          REXAPU_ERROR("SDL_PutAudioStreamData() failed: {}", SDL_GetError());
 diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
-index 11b83be..e5c1c26 100644
+index 11b83be..af45d1d 100644
 --- a/src/audio/xma_context.cpp
 +++ b/src/audio/xma_context.cpp
-@@ -117,6 +117,9 @@ bool XmaContext::Work() {
+@@ -15,6 +15,7 @@
+ #include <rex/audio/xma/context.h>
+ #include <rex/audio/xma/decoder.h>
+ #include <rex/audio/xma/helpers.h>
++#include <rex/cvar.h>
+ #include <rex/dbg.h>
+ #include <rex/logging.h>
+ #include <rex/memory/ring_buffer.h>
+@@ -36,10 +37,29 @@ extern "C" {
+ // Credits for most of this code goes to:
+ // https://github.com/koolkdev/libertyv/blob/master/libav_wrapper/xma2dec.c
+ 
++// Loud audio burst hunt (gtav): xma_trace logs each context's decoded frames that are near full
++// scale or jump 20 dB over that context's previous frame, plus every "starved on input" reset;
++// xma_starved_reset=false turns that reset off for an A/B run.
++REXCVAR_DEFINE_BOOL(xma_trace, false, "Audio", "Log loud decoded XMA frames and starved-input resets");
++REXCVAR_DEFINE_BOOL(xma_starved_reset, true, "Audio",
++                    "Reset output write_offset to read_offset when a context runs out of input");
++
+ namespace rex::audio {
+ 
+ using stream::BitStream;
+ 
++namespace {
++// Peak |sample| of a converted frame (big-endian int16).
++uint32_t FramePeak(const uint8_t* frame, size_t bytes) {
++  uint32_t peak = 0;
++  for (size_t i = 0; i + 1 < bytes; i += 2) {
++    int32_t v = int16_t(uint16_t(frame[i]) << 8 | frame[i + 1]);
++    peak = std::max<uint32_t>(peak, uint32_t(v < 0 ? -v : v));
++  }
++  return peak;
++}
++}  // namespace
++
+ const uint32_t XmaContext::kBitsPerPacketHeader;
+ const uint32_t XmaContext::kOutputMaxSizeBytes;
+ 
+@@ -117,6 +137,9 @@ bool XmaContext::Work() {
      }
      Consume(&output_rb, &data);
      data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
@@ -208,7 +246,7 @@ index 11b83be..e5c1c26 100644
      StoreContextMerged(data, initial_data, context_ptr);
      return true;
    }
-@@ -133,17 +136,38 @@ bool XmaContext::Work() {
+@@ -133,17 +156,42 @@ bool XmaContext::Work() {
    }
  
    while (remaining_subframe_blocks_in_output_buffer_ >= minimum_subframe_decode_count) {
@@ -238,8 +276,12 @@ index 11b83be..e5c1c26 100644
 -  data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
 +  if (initial_data.IsAnyInputBufferValid()) {
 +    data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
-+  } else if (data.output_buffer_write_offset != data.output_buffer_read_offset) {
++  } else if (REXCVAR_GET(xma_starved_reset) &&
++             data.output_buffer_write_offset != data.output_buffer_read_offset) {
 +    // Starved on input: games use write_offset == read_offset as a stall detector.
++    if (REXCVAR_GET(xma_trace))
++      REXLOG_INFO("xma: ctx {} starved on input, write offset {} -> read offset {}", id_,
++                  uint32_t(data.output_buffer_write_offset), uint32_t(data.output_buffer_read_offset));
 +    data.output_buffer_write_offset = data.output_buffer_read_offset;
 +    data.output_buffer_valid = 0;
 +  }
@@ -250,6 +292,23 @@ index 11b83be..e5c1c26 100644
      data.output_buffer_valid = 0;
    }
  
+@@ -670,6 +718,16 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+   if (decoded) {
+     ConvertFrame(reinterpret_cast<const uint8_t**>(&av_frame_->data), bool(data->is_stereo),
+                  decoded_frame_.data());
++    if (REXCVAR_GET(xma_trace)) {
++      static uint32_t last_peak[512];
++      uint32_t& last = last_peak[id_ & 511];
++      const uint32_t peak = FramePeak(decoded_frame_.data(), kBytesPerFrameChannel << data->is_stereo);
++      if (peak >= 29000 || (peak >= 3000 && peak > last * 10))
++        REXLOG_INFO("xma: ctx {} loud frame peak {} (previous {}), stereo {}, input offset {}, out w/r {}/{}",
++                    id_, peak, last, uint32_t(data->is_stereo), uint32_t(data->input_buffer_read_offset),
++                    uint32_t(data->output_buffer_write_offset), uint32_t(data->output_buffer_read_offset));
++      last = peak;
++    }
+ 
+     // Realign the decoder's output onto the bitstream's sample numbering: the
+     // samples of the frame just decoded run from kDecoderStartPadding into this
 diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
 index 19874a5..1c2dada 100644
 --- a/src/graphics/d3d12/command_processor.cpp

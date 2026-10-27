@@ -302,7 +302,7 @@ index 1c74034..8992fe0 100644
  {
      uint index = cubeMapData.cubeMapIndex;
 diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
-index 698a418..75fb9da 100644
+index 698a418..4f8ed1e 100644
 --- a/XenosRecomp/shader_recompiler.cpp
 +++ b/XenosRecomp/shader_recompiler.cpp
 @@ -17,12 +17,12 @@ static constexpr const char* USAGE_TYPES[] =
@@ -787,7 +787,7 @@ index 698a418..75fb9da 100644
  
 +                    // GTA V: RB_COLORCONTROL alpha-to-mask without MSAA (g_AlphaToMask = offsets
 +                    // | 0x100): the Xenos 2x2 dither, a pixel survives when alpha >= 1 - offset/4
-+                    // with its quad position's 2-bit offset (Xenia's 1-sample path).
++                    // with its quad position's 2-bit offset, index = y low bit | x high bit (Xenia's 1-sample path).
 +                    if (pixelOutputs & PIXEL_SHADER_OUTPUT_COLOR0)
 +                    {
 +                        indent();
@@ -797,7 +797,7 @@ index 698a418..75fb9da 100644
 +                        indent();
 +                        out += "\tuint2 a2mPos = uint2(iPos.xy) & 1;\n";
 +                        indent();
-+                        out += "\tuint a2mOffset = (g_AlphaToMask >> ((a2mPos.x | (a2mPos.y << 1)) * 2)) & 3;\n";
++                        out += "\tuint a2mOffset = (g_AlphaToMask >> ((a2mPos.y | (a2mPos.x << 1)) * 2)) & 3;\n";
 +                        indent();
 +                        out += "\tclip(oC0.w - (1.0 - float(a2mOffset) * 0.25));\n";
 +                        indent();

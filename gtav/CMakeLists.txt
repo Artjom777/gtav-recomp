@@ -132,3 +132,23 @@ add_custom_command(
 add_custom_target(gtav_native_shaders DEPENDS ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h)
 add_dependencies(gtav gtav_native_shaders)
 target_include_directories(gtav PRIVATE ${GTAV_NATIVE_SHADER_DIR})
+
+# Background shader compiler tools (shader_compiler.cpp; build.cmd copies them on Windows):
+# <exe>/tools/XenosRecomp, dxc (a wrapper that sets the library path) and shader_common.h.
+if(NOT WIN32)
+    set(GTAV_XR_BIN ${CMAKE_CURRENT_SOURCE_DIR}/../build/xenosrecomp/XenosRecomp/XenosRecomp CACHE FILEPATH
+        "XenosRecomp binary for the background shader compiler")
+    set(GTAV_TOOLS_DIR $<TARGET_FILE_DIR:gtav>/tools)
+    file(WRITE ${CMAKE_BINARY_DIR}/dxc_wrapper.sh
+         "#!/bin/sh\nd=$(dirname \"$0\")\nLD_LIBRARY_PATH=\"$d/lib\" exec \"$d/dxc-linux\" \"$@\"\n")
+    add_custom_command(TARGET gtav POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${GTAV_TOOLS_DIR}/lib
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${GTAV_XR_BIN} ${GTAV_TOOLS_DIR}/XenosRecomp
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${GTAV_DXC_DIR}/bin/x64/dxc-linux ${GTAV_TOOLS_DIR}/dxc-linux
+        COMMAND ${CMAKE_COMMAND} -E copy_directory ${GTAV_DXC_DIR}/lib/x64 ${GTAV_TOOLS_DIR}/lib
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_BINARY_DIR}/dxc_wrapper.sh ${GTAV_TOOLS_DIR}/dxc
+        COMMAND chmod +x ${GTAV_TOOLS_DIR}/dxc
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/XenosRecomp/XenosRecomp/shader_common.h ${GTAV_TOOLS_DIR}/shader_common.h
+        VERBATIM)
+endif()
