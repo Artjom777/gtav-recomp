@@ -483,6 +483,8 @@ struct RenderTarget {
   uint32_t width, height, msaa;
   bool depth;
   uint32_t descriptor = 0;  // sampled view (single-sample color targets only)
+  uint64_t written = 0;     // order of the last draw/clear into it (MsaaAlias)
+  std::unique_ptr<RenderFramebuffer> alias_fb;  // MsaaAlias copies into it; retired with the texture
   std::unique_ptr<RenderTextureView> view;
   uint32_t stencil_descriptor = 0;  // depth targets: R8_UINT view of the stencil aspect
   std::unique_ptr<RenderTextureView> stencil_view;
@@ -909,6 +911,76 @@ struct Backend::Impl {
     }
   }
 
+  // EDRAM aliasing between sample counts: a 4x MSAA surface of pitch P holds 2x2 samples per
+  // pixel, the same EDRAM as a 1x surface of pitch 2P at that base. GTA V's water pre-pass fills
+  // 658 as 320x180 4x MSAA (black), then draws the water into it as 640x360 1x; natively the 1x
+  // target kept an old scene copy (clear, "underwater" looking water with grey/teal layers). When
+  // the 1x target is bound after the MSAA one was written, the MSAA samples (averaged per pixel,
+  // exact for fills) are carried over at 2x2 per pixel.
+  uint64_t target_serial = 0;
+  uint32_t msaa_alias_logged = 0;
+  // Once a pair is seen, draws into the 4x MSAA surface go straight to the 1x alias at twice the
+  // resolution (color and depth), so the 1x pass sees them exactly: GTA V's water pre-pass writes
+  // a downsampled scene depth into 710 as 4x MSAA and depth-tests the water against it at 1x.
+  // Key: base | MSAA pitch << 12 | depth << 31.
+  std::unordered_set<uint64_t> msaa_redirect;
+  bool redirect2x = false;  // ActiveTargets redirected this draw/clear (viewport x2)
+  static uint64_t RedirectKey(uint32_t base, uint32_t msaa_pitch, bool depth) {
+    return uint64_t(base) | uint64_t(msaa_pitch) << 12 | uint64_t(depth) << 31;
+  }
+  void LearnRedirect(uint32_t base, uint32_t msaa_pitch, bool depth) {
+    if (msaa_redirect.insert(RedirectKey(base, msaa_pitch, depth)).second)
+      REXLOG_INFO("[native] msaa redirect: {} {:03X} pitch {} 4x MSAA draws render into its 1x pitch {} alias",
+                  depth ? "depth" : "color", base, msaa_pitch, msaa_pitch * 2);
+  }
+
+  void MsaaAlias(RenderCommandList* list, uint32_t base, uint32_t format, uint32_t pitch, RenderTarget* t) {
+    if (t->msaa || t->depth || pitch < 2 || (pitch & 1)) return;
+    uint64_t key = uint64_t(base) | uint64_t(StorageFormat(format)) << 12 | uint64_t(pitch / 2) << 17 | uint64_t(2) << 31;
+    auto it = targets.find(key);
+    if (it == targets.end() || !it->second.texture || it->second.written <= t->written) return;
+    RenderTarget* src = &it->second;
+    if (src->format != t->format) return;
+    LearnRedirect(base, pitch / 2, false);
+    if (msaa_alias_logged < 8) {
+      msaa_alias_logged++;
+      REXLOG_INFO("[native] msaa alias: surface {:03X} pitch {} (1x) takes the 4x MSAA pitch {} samples", base, pitch,
+                  pitch / 2);
+    }
+    RenderTarget& scratch = MsaaScratch(src);
+    uint32_t w = std::min(t->width, 2 * src->width), h = std::min(t->height, 2 * src->height);
+    Transition(list, src->texture.get(), RenderTextureLayout::RESOLVE_SOURCE);
+    Transition(list, scratch.texture.get(), RenderTextureLayout::RESOLVE_DEST);
+    RenderRect rect{0, 0, int32_t((w + 1) / 2), int32_t((h + 1) / 2)};
+    list->resolveTextureRegion(scratch.texture.get(), 0, 0, src->texture.get(), &rect);
+    Transition(list, scratch.texture.get(), RenderTextureLayout::SHADER_READ);
+    auto& fb = t->alias_fb;  // lives with the texture: Target() retires it when the target grows
+    if (!fb) {
+      const RenderTexture* color = t->texture.get();
+      fb = device->createFramebuffer(RenderFramebufferDesc(&color, 1));
+    }
+    InvalidateDrawState();
+    Transition(list, t->texture.get(), RenderTextureLayout::COLOR_WRITE);
+    list->setFramebuffer(fb.get());
+    bound_fb = nullptr;
+    for (auto*& c : bound_color) c = nullptr;
+    bound_depth = nullptr;
+    list->setViewports(RenderViewport(0, 0, float(w), float(h)));
+    list->setScissors(RenderRect(0, 0, int32_t(w), int32_t(h)));
+    list->setGraphicsPipelineLayout(layout.get());
+    list->setPipeline(ResolvePipeline(t->format));
+    list->setGraphicsDescriptorSet(texture_set.get(), 0);
+    list->setGraphicsDescriptorSet(texture_set.get(), 1);
+    list->setGraphicsDescriptorSet(texture_set.get(), 2);
+    list->setGraphicsDescriptorSet(sampler_set.get(), 3);
+    float scale = 1.0f;
+    int32_t push[6] = {int32_t(scratch.descriptor), 0, 0, 0, 0, 3};
+    std::memcpy(&push[4], &scale, 4);
+    list->setGraphicsPushConstants(0, push, 0, sizeof(push));
+    list->drawInstanced(3, 1, 0, 0);
+    t->written = ++target_serial;
+  }
+
   void TileAlias(uint32_t base, uint32_t format, uint32_t pitch, RenderTarget* t) {
     if (!tile_split || !grow_list || t->msaa || Is64bpp(format) || tile_alias_done.count(t)) return;
     auto self = tile_resolves.find(base);
@@ -1217,6 +1289,7 @@ struct Backend::Impl {
       if (t.stencil_descriptor) pending_free_descriptors.push_back(t.stencil_descriptor);
       dead_views.push_back(std::move(t.view));
       dead_views.push_back(std::move(t.stencil_view));
+      if (t.alias_fb) dead_framebuffers.push_back(std::move(t.alias_fb));
     }
     t = RenderTarget{};
     t.format = depth ? kDepthFormat : ColorFormat(regs::ColorFormat(format));
@@ -1483,19 +1556,45 @@ struct Backend::Impl {
     uint32_t mode = regs::Read(r, regs::RB_MODECONTROL) & 7;
     uint32_t mask = regs::Read(r, regs::RB_COLOR_MASK);
     uint32_t count = 0;
-    if (mode == 4) {
+    if (mode == 4)
       for (int i = 0; i < 4; i++)
         if ((mask >> (4 * i)) & 0xF) count = uint32_t(i) + 1;
+    // 4x MSAA draws whose every attachment has a learned 1x alias render into the aliases.
+    redirect2x = false;
+    if (surface.msaa == 2 && (count || want_depth)) {
+      bool all = true;
+      for (uint32_t i = 0; i < count; i++)
+        all = all && msaa_redirect.count(RedirectKey(regs::Color(r, int(i)).base, surface.pitch, false));
+      if (want_depth) all = all && msaa_redirect.count(RedirectKey(regs::Depth(r).base, surface.pitch, true));
+      if (all) {
+        redirect2x = true;
+        surface.pitch *= 2;
+        surface.msaa = 0;
+        height = std::min(height * 2, kMaxTargetRows);
+      }
+    }
+    if (mode == 4) {
       for (uint32_t i = 0; i < count; i++) {
         auto c = regs::Color(r, int(i));
         color[i] = Target(c.base, uint32_t(c.format), false, surface.pitch, surface.msaa, height);
         TileAlias(c.base, uint32_t(c.format), surface.pitch, color[i]);
+        if (grow_list) MsaaAlias(grow_list, c.base, uint32_t(c.format), surface.pitch, color[i]);
+        color[i]->written = ++target_serial;
       }
     }
     *depth = nullptr;
     if (want_depth) {
       auto d = regs::Depth(r);
       *depth = Target(d.base, d.float24, true, surface.pitch, surface.msaa, height);
+      // Only alongside a learned color pair of this draw: base 000 is reused at many pitches and
+      // sample counts, and redirecting those unrelated MSAA passes crashed the GPU.
+      bool color_pair = false;
+      for (uint32_t i = 0; i < count; i++)
+        color_pair = color_pair || msaa_redirect.count(RedirectKey(regs::Color(r, int(i)).base, surface.pitch / 2, false));
+      if (surface.msaa == 0 && !redirect2x && !(surface.pitch & 1) && color_pair) {
+        uint64_t msaa_key = uint64_t(d.base) | uint64_t(1) << 16 | uint64_t(surface.pitch / 2) << 17 | uint64_t(2) << 31;
+        if (targets.count(msaa_key)) LearnRedirect(d.base, surface.pitch / 2, true);
+      }
     }
     // Every attachment of one framebuffer must be at least the framebuffer's size: grow the set
     // to its tallest member.
@@ -1529,6 +1628,13 @@ struct Backend::Impl {
     return vp;
   }
 
+  // Sample count of the attachments actually bound (redirected MSAA draws render at 1x).
+  static uint32_t AttachmentMsaa(RenderTarget* const color[4], uint32_t count, RenderTarget* depth, const uint8_t* r) {
+    if (count && color[0]) return color[0]->msaa;
+    if (depth) return depth->msaa;
+    return regs::Surface(r).msaa;
+  }
+
   uint64_t PipelineKey(const DrawCommand& d, const vertex_layout::HostLayout& vl, RenderTarget* const color[4],
                        uint32_t count, RenderTarget* depth, const uint8_t* r, RenderPrimitiveTopology topology,
                        uint32_t spec, uint32_t diag) {
@@ -1544,7 +1650,7 @@ struct Backend::Impl {
     k.count = count;
     k.spec = spec;
     k.diag = diag;
-    k.msaa = regs::Surface(r).msaa;
+    k.msaa = AttachmentMsaa(color, count, depth, r);
     for (uint32_t i = 0; i < count; i++) k.formats[i] = uint32_t(color[i]->format);
     k.formats[4] = depth ? uint32_t(depth->format) : 0;
     k.depthcontrol = regs::Read(r, regs::RB_DEPTHCONTROL);
@@ -1619,7 +1725,7 @@ struct Backend::Impl {
                                             : RenderCullMode::NONE;
     if (diag == kDiagNoCull) desc.cullMode = RenderCullMode::NONE;
     desc.frontFace = (mode & 4) ? RenderFrontFace::CLOCKWISE : RenderFrontFace::COUNTER_CLOCKWISE;
-    desc.multisampling = RenderMultisampling(SampleCount(regs::Surface(r).msaa));
+    desc.multisampling = RenderMultisampling(SampleCount(AttachmentMsaa(color, count, depth, r)));
     // RB_COLORCONTROL.alpha_to_mask_enable: coverage from oC0.w (GTA's tree LOD billboards and
     // foliage use it instead of the alpha test; without it they drew as solid ellipses).
     // Without MSAA the pixel shader does the Xenos dither instead (g_AlphaToMask): host
@@ -1822,6 +1928,7 @@ struct Backend::Impl {
       stat_skipped++;
       return;
     }
+    if (redirect2x) vp = RenderViewport(vp.x * 2, vp.y * 2, vp.width * 2, vp.height * 2, vp.minDepth, vp.maxDepth);
     for (uint32_t i = 0; i < count; i++) {
       auto f = regs::Color(r, int(i)).format;
       if (StorageFormat(uint32_t(f)) == uint32_t(regs::ColorFormat::k2_10_10_10Float))
@@ -1959,7 +2066,8 @@ struct Backend::Impl {
     // g_AlphaToMask (533): without MSAA the shader applies the Xenos alpha-to-mask dither itself.
     {
       uint32_t colorcontrol = regs::Read(r, regs::RB_COLORCONTROL);
-      sc[133] = count && ((colorcontrol >> 4) & 1) && SampleCount(regs::Surface(r).msaa) == RenderSampleCount::COUNT_1
+      sc[133] = count && ((colorcontrol >> 4) & 1) &&
+                        SampleCount(AttachmentMsaa(color, count, depth, r)) == RenderSampleCount::COUNT_1
                     ? (colorcontrol >> 24) | 0x100u
                     : 0u;
     }
@@ -1969,8 +2077,9 @@ struct Backend::Impl {
     float ndc[4] = {1, 1, 0, 0};
     uint32_t tw = count ? color[0]->width : depth->width, th = count ? color[0]->height : depth->height;
     if (!(regs::Read(r, regs::PA_CL_VTE_CNTL) & 1)) {
-      ndc[0] = 2.0f / float(tw);
-      ndc[1] = -2.0f / float(th);
+      float guest = redirect2x ? 0.5f : 1.0f;  // pixel positions are in the 4x MSAA surface's units
+      ndc[0] = 2.0f / (float(tw) * guest);
+      ndc[1] = -2.0f / (float(th) * guest);
       ndc[2] = -1.0f;
       ndc[3] = 1.0f;
       vp = RenderViewport(0, 0, float(tw), float(th), vp.minDepth, vp.maxDepth);

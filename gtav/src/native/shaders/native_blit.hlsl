@@ -6,7 +6,8 @@ struct PushConstants {
     uint SamplerIndex;
     int2 SourceMinusDest;  // resolves: source texel = destination pixel + this
     float Scale;           // color resolves: value conversion between source and destination
-    uint Mode;             // color resolves: 1 = re-encode float channels as 7e3 bit patterns
+    uint Mode;             // color resolves: 1 = re-encode float channels as 7e3 bit patterns,
+                           // 3 = 2x nearest upscale (4x MSAA EDRAM read as a 1x surface)
 };
 
 [[vk::push_constant]] ConstantBuffer<PushConstants> g_Push;
@@ -55,7 +56,7 @@ uint Float32To7e3(float f) {
 }
 
 float4 PSResolve(float4 position : SV_Position) : SV_Target {
-    int2 source = int2(position.xy) + g_Push.SourceMinusDest;
+    int2 source = (g_Push.Mode == 3 ? int2(position.xy) / 2 : int2(position.xy)) + g_Push.SourceMinusDest;
     float4 v = g_Textures[g_Push.TextureIndex].Load(int3(source, 0)) * g_Push.Scale;
     if (g_Push.Mode == 1) {
         // EDRAM holds 2_10_10_10_FLOAT and the guest resolves it as fixed 2_10_10_10: the raw
