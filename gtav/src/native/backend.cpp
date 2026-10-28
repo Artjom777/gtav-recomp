@@ -1726,6 +1726,7 @@ struct Backend::Impl {
     if (diag == kDiagNoCull) desc.cullMode = RenderCullMode::NONE;
     desc.frontFace = (mode & 4) ? RenderFrontFace::CLOCKWISE : RenderFrontFace::COUNTER_CLOCKWISE;
     desc.multisampling = RenderMultisampling(SampleCount(AttachmentMsaa(color, count, depth, r)));
+    desc.dynamicDepthBiasEnabled = depth != nullptr;  // PolygonOffset, set per draw
     // RB_COLORCONTROL.alpha_to_mask_enable: coverage from oC0.w (GTA's tree LOD billboards and
     // foliage use it instead of the alpha test; without it they drew as solid ellipses).
     // Without MSAA the pixel shader does the Xenos dither instead (g_AlphaToMask): host
@@ -1836,8 +1837,37 @@ struct Backend::Impl {
     bool slot_bound[16]{};
     RenderIndexBufferView index{RenderBufferReference(), 0, RenderFormat::UNKNOWN};
     bool index_bound = false;
+    bool bias_set = false;
+    float bias[2] = {};  // constant, slope
   } draw_state;
+  uint32_t bias_logged = 0;
+  std::unordered_set<uint64_t> bias_seen;
   void InvalidateDrawState() { draw_state = DrawState{}; }
+
+  // Guest polygon offset as host depth bias (the SDK's GetPreferredFacePolygonOffset and its
+  // Vulkan scaling). GTA V's ocean: a depth-only grid with halved crests, then the colour water
+  // depth-tested GREATER against it; without the offset the troughs z-fought and most of the near
+  // water was missing (a grey plane at swimming height, the water "above your head").
+  static void PolygonOffset(const uint8_t* r, uint32_t primitive, float out[2]) {
+    uint32_t mode = regs::Read(r, regs::PA_SU_SC_MODE_CNTL);
+    bool polygonal = primitive != 1 && primitive != 2 && primitive != 3;  // not points / lines
+    float scale = 0.0f, offset = 0.0f;
+    if (polygonal) {
+      if (((mode >> 11) & 1) && !(mode & 1)) {
+        scale = regs::ReadFloat(r, regs::PA_SU_POLY_OFFSET_FRONT_SCALE);
+        offset = regs::ReadFloat(r, regs::PA_SU_POLY_OFFSET_FRONT_OFFSET);
+      }
+      if (((mode >> 12) & 1) && !((mode >> 1) & 1) && !scale && !offset) {
+        scale = regs::ReadFloat(r, regs::PA_SU_POLY_OFFSET_BACK_SCALE);
+        offset = regs::ReadFloat(r, regs::PA_SU_POLY_OFFSET_BACK_OFFSET);
+      }
+    } else if ((mode >> 13) & 1) {
+      scale = regs::ReadFloat(r, regs::PA_SU_POLY_OFFSET_FRONT_SCALE);
+      offset = regs::ReadFloat(r, regs::PA_SU_POLY_OFFSET_FRONT_OFFSET);
+    }
+    out[0] = offset * (regs::Depth(r).float24 ? float(1u << 24) : float((1u << 24) - 1));
+    out[1] = scale * (1.0f / 16.0f);
+  }
   void BindIndexBuffer(RenderCommandList* list, const RenderIndexBufferView& view) {
     auto& ds = draw_state;
     if (ds.index_bound && ds.index.buffer.ref == view.buffer.ref && ds.index.buffer.offset == view.buffer.offset &&
@@ -2383,6 +2413,21 @@ struct Backend::Impl {
     if (ds.pipeline != pipeline) {
       list->setPipeline(pipeline);
       ds.pipeline = pipeline;
+      ds.bias_set = false;  // pipelines without dynamic depth bias overwrite it
+    }
+    if (depth) {
+      float bias[2];
+      PolygonOffset(r, d.primitive, bias);
+      if ((bias[0] != 0.0f || bias[1] != 0.0f) && bias_logged < 12 && bias_seen.insert(d.ps_hash ^ d.vs_hash).second) {
+        bias_logged++;
+        REXLOG_INFO("[native] polygon offset {:.6g} slope {:.6g}: vs {:016X} ps {:016X}", bias[0], bias[1], d.vs_hash,
+                    d.ps_hash);
+      }
+      if (!ds.bias_set || std::memcmp(ds.bias, bias, sizeof(bias)) != 0) {
+        list->setDepthBias(bias[0], 0.0f, bias[1]);
+        std::memcpy(ds.bias, bias, sizeof(bias));
+        ds.bias_set = true;
+      }
     }
     auto shared = upload.Allocate(kSharedConstantsSize);
     std::memcpy(shared.cpu, shared_cpu, kSharedConstantsSize);
