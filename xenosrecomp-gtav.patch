@@ -11,7 +11,7 @@ index e59682c..c9592ad 100644
  #include <fmt/core.h>
  #include <string>
 diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
-index 1c74034..4d3f719 100644
+index 1c74034..5e2a7f3 100644
 --- a/XenosRecomp/shader_common.h
 +++ b/XenosRecomp/shader_common.h
 @@ -26,10 +26,15 @@ struct PushConstants
@@ -65,21 +65,28 @@ index 1c74034..4d3f719 100644
  #endif
  
  Texture2D<float4> g_Texture2DDescriptorHeap[] : register(t0, space0);
-@@ -59,10 +77,41 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
+@@ -59,16 +77,54 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
      return dimensions;
  }
  
++// GTA V: like the SDK's shader translator (kRoundingOffset), every fetch gets 1.5/1024 texel added
++// to its offset. With D3D9 pixel centres, screen-space passes put coordinates exactly on texel
++// edges, and point sampling then picks texel i or i-1 depending on interpolation rounding (the
++// ocean wave simulation became a blend of neighbours and drifted).
++#define XENOS_FETCH_ROUNDING (1.5 / 1024.0)
++
 +// 1D textures are bound as 2D textures of height 1.
 +float4 tfetch1D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float texCoord)
 +{
 +    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
-+    return XENOS_SAMPLE(texture, g_SamplerDescriptorHeap[samplerDescriptorIndex], float2(texCoord, 0.5));
++    return XENOS_SAMPLE(texture, g_SamplerDescriptorHeap[samplerDescriptorIndex],
++                        float2(texCoord + XENOS_FETCH_ROUNDING / getTexture2DDimensions(texture).x, 0.5));
 +}
 +
 +float getWeights1D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float texCoord)
 +{
 +    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
-+    return select(isnan(texCoord), 0.0, frac(texCoord * getTexture2DDimensions(texture).x - 0.5));
++    return select(isnan(texCoord), 0.0, frac(texCoord * getTexture2DDimensions(texture).x + XENOS_FETCH_ROUNDING - 0.5));
 +}
 +
 +// GTA V: fetches with unnormalized coordinates (texCoordDenorm) address texels of the base level.
@@ -104,11 +111,18 @@ index 1c74034..4d3f719 100644
  {
      Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
 -    return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture));
-+    return XENOS_SAMPLE(texture, g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture));
++    return XENOS_SAMPLE(texture, g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + (offset + XENOS_FETCH_ROUNDING) / getTexture2DDimensions(texture));
  }
  
  float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
-@@ -135,17 +184,17 @@ float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex
+ {
+     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
+-    return select(isnan(texCoord), 0.0, frac(texCoord * getTexture2DDimensions(texture) + offset - 0.5));
++    return select(isnan(texCoord), 0.0, frac(texCoord * getTexture2DDimensions(texture) + offset + XENOS_FETCH_ROUNDING - 0.5));
+ }
+ 
+ float w0(float a)
+@@ -135,17 +191,24 @@ float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex
      float h1y = h1(fy);
  
      float4 r =
@@ -124,14 +138,21 @@ index 1c74034..4d3f719 100644
      return r;
  }
  
++float3 roundingOffset3D(uint resourceDescriptorIndex)
++{
++    uint w, h, d;
++    g_Texture3DDescriptorHeap[resourceDescriptorIndex].GetDimensions(w, h, d);
++    return XENOS_FETCH_ROUNDING / float3(w, h, d);
++}
++
  float4 tfetch3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord)
  {
 -    return g_Texture3DDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord);
-+    return XENOS_SAMPLE(g_Texture3DDescriptorHeap[resourceDescriptorIndex], g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord);
++    return XENOS_SAMPLE(g_Texture3DDescriptorHeap[resourceDescriptorIndex], g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + roundingOffset3D(resourceDescriptorIndex));
  }
  
  struct CubeMapData
-@@ -156,7 +205,53 @@ struct CubeMapData
+@@ -156,7 +219,54 @@ struct CubeMapData
  
  float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData)
  {
@@ -143,13 +164,14 @@ index 1c74034..4d3f719 100644
 +float4 tfetch1DLod(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float texCoord, float lod)
 +{
 +    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
-+    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], float2(texCoord, 0.5), lod);
++    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex],
++                               float2(texCoord + XENOS_FETCH_ROUNDING / getTexture2DDimensions(texture).x, 0.5), lod);
 +}
 +
 +float4 tfetch2DLod(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset, float lod)
 +{
 +    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
-+    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture), lod);
++    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + (offset + XENOS_FETCH_ROUNDING) / getTexture2DDimensions(texture), lod);
 +}
 +
 +// GTA V: fetches whose instruction overrides the filter to point (mag and min) read one texel, as
@@ -159,7 +181,7 @@ index 1c74034..4d3f719 100644
 +{
 +    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
 +    int2 dims = int2(getTexture2DDimensions(texture));
-+    int2 p = clamp(int2(floor(texCoord * float2(dims) + offset)), int2(0, 0), dims - 1);
++    int2 p = clamp(int2(floor(texCoord * float2(dims) + offset + XENOS_FETCH_ROUNDING)), int2(0, 0), dims - 1);
 +    return texture.Load(int3(p, 0));
 +}
 +
@@ -171,13 +193,13 @@ index 1c74034..4d3f719 100644
 +    uint mip = uint(clamp(round(lod), 0.0, float(levels - 1)));
 +    texture.GetDimensions(mip, w, h, levels);
 +    int2 dims = int2(w, h);
-+    int2 p = clamp(int2(floor(texCoord * float2(dims) + offset)), int2(0, 0), dims - 1);
++    int2 p = clamp(int2(floor(texCoord * float2(dims) + offset + XENOS_FETCH_ROUNDING)), int2(0, 0), dims - 1);
 +    return texture.Load(int3(p, mip));
 +}
 +
 +float4 tfetch3DLod(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float lod)
 +{
-+    return g_Texture3DDescriptorHeap[resourceDescriptorIndex].SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord, lod);
++    return g_Texture3DDescriptorHeap[resourceDescriptorIndex].SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + roundingOffset3D(resourceDescriptorIndex), lod);
 +}
 +
 +float4 tfetchCubeLod(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData, float lod)
@@ -186,7 +208,7 @@ index 1c74034..4d3f719 100644
  }
  
  float4 tfetchR11G11B10(uint4 value)
-@@ -180,6 +275,116 @@ float4 tfetchTexcoord(uint swappedTexcoords, float4 value, uint semanticIndex)
+@@ -180,6 +290,116 @@ float4 tfetchTexcoord(uint swappedTexcoords, float4 value, uint semanticIndex)
      return (swappedTexcoords & (1ull << semanticIndex)) != 0 ? value.yxwz : value;
  }
  

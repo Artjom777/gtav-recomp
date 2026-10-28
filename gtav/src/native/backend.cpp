@@ -57,6 +57,8 @@ REXCVAR_DEFINE_BOOL(gtav_native_async_pipelines, true, "GTAV",
 REXCVAR_DECLARE(std::string, gtav_native);
 REXCVAR_DEFINE_INT32(gtav_native_dump_frame, 0, "GTAV",
                      "Dump every resolve of this guest frame to logs/native_dump/ as PNG");
+REXCVAR_DEFINE_INT32(gtav_native_dump_frames, 1, "GTAV",
+                     "Frame dumps: one request (F9) dumps this many consecutive frames (~350 MB each)");
 
 namespace gtav::native {
 
@@ -716,6 +718,7 @@ struct Backend::Impl {
   bool dumping = false;
   uint64_t dump_frame = 0;
   std::atomic<bool> dump_request{false};
+  int32_t dump_frames_left = 0;  // further consecutive frames to dump (--gtav_native_dump_frames)
 
   // Raw texels of dumped resolves in their host format (the PPMs are clamped 8-bit views):
   // <slot>_<address>_f<format>_<w>x<h>_r<row texels>.raw, for numeric comparisons with the emulator.
@@ -1306,6 +1309,8 @@ struct Backend::Impl {
     uint32_t fetch_format = words[1] & 0x3F;
     if (ResolvedTexture* r = dim == 2 ? nullptr : LatestResolved(base & 0x1FFFFFFF, fetch_format == 22 || fetch_format == 23,
                                             (words[2] & 0x1FFF) + 1, ((words[2] >> 13) & 0x1FFF) + 1)) {
+      if (dim == 1 && !(words[0] >> 31) && (r->fetch_words[0] >> 31))
+        if (uint32_t untiled = LinearViewOfTiled(list, base & 0x1FFFFFFF, *r, words)) return untiled;
       Transition(list, r->texture.get(), RenderTextureLayout::SHADER_READ);
       return r->descriptor;
     }
@@ -1878,15 +1883,20 @@ struct Backend::Impl {
             std::none_of(dump_textures.begin(), dump_textures.end(),
                          [&](const auto& w) { return (w[1] & ~0xFFFu) == (words[1] & ~0xFFFu); }))
           dump_textures.push_back({words[0], words[1], words[2], words[3], words[4], words[5]});
-        // 32_FLOAT guest textures (vehicle damage maps): raw bytes, once per address.
-        if (kind == 'T' && (words[1] & 0x3F) == 36 && dump_raw_f36.insert(base).second) {
+        // 32_FLOAT guest textures (vehicle damage maps) and 8-bit ones up to 128x128 (the ocean
+        // simulation's noise): raw bytes, once per address.
+        uint32_t raw_format = words[1] & 0x3F;
+        bool small = (words[2] & 0x1FFF) < 128 && ((words[2] >> 13) & 0x1FFF) < 128;
+        if (kind == 'T' && (raw_format == 36 || (raw_format == 2 && small)) &&
+            dump_raw_f36.insert(base).second) {
           uint32_t w = ((words[2] & 0x1FFF) + 32) & ~31u, h = (((words[2] >> 13) & 0x1FFF) + 32) & ~31u;
           std::string dir = LogPath(fmt::format("native_dump/frame_{}", dump_frame));
           std::filesystem::create_directories(dir);
           const uint8_t* src = REX_KERNEL_MEMORY()->TranslatePhysical(base);
-          if (FILE* fp = src ? std::fopen(fmt::format("{}/tex_{:08X}_f36.bin", dir, base).c_str(), "wb") : nullptr) {
+          if (FILE* fp = src ? std::fopen(fmt::format("{}/tex_{:08X}_f{}.bin", dir, base, raw_format).c_str(), "wb")
+                             : nullptr) {
             std::fwrite(words, 4, 6, fp);
-            std::fwrite(src, 1, size_t(w) * h * 4, fp);
+            std::fwrite(src, 1, size_t(w) * h * (raw_format == 36 ? 4 : 1), fp);
             std::fclose(fp);
           }
         }
@@ -2526,6 +2536,67 @@ struct Backend::Impl {
     uint64_t gpu = 0, size = 0, serial = 0;
   };
   std::unordered_map<uint32_t, MemoryImage> memory_images;
+
+  // Resolves written tiled and fetched through a linear fetch constant (GTA V's ocean simulation
+  // resolves its height field tiled, then reads that memory linearly and computes the tiled
+  // address itself to untile it). The texture is the resolve's memory read as linear rows:
+  // written out in the guest layout (host byte order), then copied in row by row.
+  struct UntiledView {
+    std::unique_ptr<RenderBuffer> buffer;
+    uint64_t gpu = 0, size = 0, serial = 0;
+    std::unique_ptr<RenderTexture> texture;
+    std::unique_ptr<RenderTextureView> view;
+    uint32_t descriptor = 0, width = 0, height = 0, pitch = 0;
+    RenderFormat format = RenderFormat::UNKNOWN;
+  };
+  std::unordered_map<uint32_t, UntiledView> untiled_views;
+  uint32_t untiled_logged = 0;
+
+  // Descriptor of `r` (tiled) read as the linear texture `words` describes, or 0 when unsupported.
+  uint32_t LinearViewOfTiled(RenderCommandList* list, uint32_t address, ResolvedTexture& r, const uint32_t words[6]) {
+    GuestLayout g;
+    if (!memory_pipeline || r.mips != 1 || r.layers != 1 || r.depth_copy || !GuestLayoutOf(r, &g) || g.linear)
+      return 0;
+    g.endian = 0;  // host byte order: the copy reads the words back as texels
+    uint32_t w = (words[2] & 0x1FFF) + 1, h = ((words[2] >> 13) & 0x1FFF) + 1;
+    uint32_t pitch = ((words[0] >> 22) & 0x1FF) << 5;
+    if (!pitch) pitch = (w + 31) & ~31u;
+    if ((uint64_t(pitch) * h << g.bpp_log2) > g.size || pitch < w) return 0;  // reads past the resolve
+    auto& u = untiled_views[address];
+    if (u.texture && u.serial == r.serial && u.width == w && u.height == h && u.pitch == pitch && u.format == r.format)
+      return u.descriptor;
+    if (untiled_logged < 20) {
+      untiled_logged++;
+      REXLOG_INFO("[native] resolve {:08X} ({}x{}, tiled) fetched linear as {}x{} pitch {}: untiled view", address,
+                  r.width, r.height, w, h, pitch);
+    }
+    if (!u.buffer || u.size < g.size) {
+      if (u.buffer) dead_buffers.push_back(std::move(u.buffer));
+      u.buffer = device->createBuffer(RenderBufferDesc::DefaultBuffer(
+          g.size, RenderBufferFlag::STORAGE | RenderBufferFlag::UNORDERED_ACCESS | RenderBufferFlag::DEVICE_ADDRESSABLE));
+      u.gpu = u.buffer->getDeviceAddress();
+      u.size = g.size;
+    }
+    if (!u.texture || u.width != w || u.height != h || u.format != r.format) {
+      if (u.texture) dead_textures.push_back(std::move(u.texture));
+      if (u.view) dead_views.push_back(std::move(u.view));
+      if (u.descriptor) pending_free_descriptors.push_back(u.descriptor);
+      u.texture = device->createTexture(RenderTextureDesc::Texture2D(w, h, 1, r.format));
+      u.view = u.texture->createTextureView(RenderTextureViewDesc::Texture2D(r.format));
+      u.descriptor = AllocDescriptor();
+      texture_set->setTexture(u.descriptor, u.texture.get(), RenderTextureLayout::SHADER_READ, u.view.get());
+      u.width = w, u.height = h, u.format = r.format;
+    }
+    u.pitch = pitch;
+    u.serial = r.serial;
+    WriteGuestLayout(list, r, g, u.buffer.get(), u.gpu);
+    list->barriers(RenderBarrierStage::COPY, RenderBufferBarrier(u.buffer.get(), RenderBufferAccess::READ));
+    Transition(list, u.texture.get(), RenderTextureLayout::COPY_DEST);
+    list->copyTextureRegion(RenderTextureCopyLocation::Subresource(u.texture.get(), 0),
+                            RenderTextureCopyLocation::PlacedFootprint(u.buffer.get(), r.format, w, h, 1, pitch, 0));
+    Transition(list, u.texture.get(), RenderTextureLayout::SHADER_READ);
+    return u.descriptor;
+  }
   std::unique_ptr<RenderPipelineLayout> memory_layout;
   std::unique_ptr<RenderShader> memory_cs;
   std::unique_ptr<RenderPipeline> memory_pipeline;
@@ -2967,6 +3038,11 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   s.prof = {};
   int32_t dump_at = REXCVAR_GET(gtav_native_dump_frame);
   bool requested = s.dump_request.exchange(false);
+  if (requested) s.dump_frames_left = std::max(1, REXCVAR_GET(gtav_native_dump_frames));
+  if (s.dump_frames_left > 0) {
+    requested = true;
+    s.dump_frames_left--;
+  }
   s.far_snapshot_done = false;
   s.per_draw_budget = std::max(0, REXCVAR_GET(gtav_native_dump_rt_count));
   s.rt_draws_seen = 0;
