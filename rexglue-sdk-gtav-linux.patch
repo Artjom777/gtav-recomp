@@ -197,10 +197,17 @@ index 20a2cd8..02d1607 100644
        if (!SDL_PutAudioStreamData(stream, data, len)) {
          REXAPU_ERROR("SDL_PutAudioStreamData() failed: {}", SDL_GetError());
 diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
-index 11b83be..af45d1d 100644
+index 11b83be..745254f 100644
 --- a/src/audio/xma_context.cpp
 +++ b/src/audio/xma_context.cpp
-@@ -15,6 +15,7 @@
+@@ -9,12 +9,14 @@
+ * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+ */
+ 
++#include <mutex>
+ #include <algorithm>
+ #include <cstring>
+ 
  #include <rex/audio/xma/context.h>
  #include <rex/audio/xma/decoder.h>
  #include <rex/audio/xma/helpers.h>
@@ -208,7 +215,7 @@ index 11b83be..af45d1d 100644
  #include <rex/dbg.h>
  #include <rex/logging.h>
  #include <rex/memory/ring_buffer.h>
-@@ -36,10 +37,29 @@ extern "C" {
+@@ -36,10 +38,30 @@ extern "C" {
  // Credits for most of this code goes to:
  // https://github.com/koolkdev/libertyv/blob/master/libav_wrapper/xma2dec.c
  
@@ -216,6 +223,7 @@ index 11b83be..af45d1d 100644
 +// scale or jump 20 dB over that context's previous frame, plus every "starved on input" reset;
 +// xma_starved_reset=false turns that reset off for an A/B run.
 +REXCVAR_DEFINE_BOOL(xma_trace, false, "Audio", "Log loud decoded XMA frames and starved-input resets");
++REXCVAR_DEFINE_STRING(xma_dump_raw, "", "Audio", "Write every decoded XMA frame (with context and rate) to this file");
 +REXCVAR_DEFINE_BOOL(xma_starved_reset, true, "Audio",
 +                    "Reset output write_offset to read_offset when a context runs out of input");
 +
@@ -238,7 +246,7 @@ index 11b83be..af45d1d 100644
  const uint32_t XmaContext::kBitsPerPacketHeader;
  const uint32_t XmaContext::kOutputMaxSizeBytes;
  
-@@ -117,6 +137,9 @@ bool XmaContext::Work() {
+@@ -117,6 +139,9 @@ bool XmaContext::Work() {
      }
      Consume(&output_rb, &data);
      data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
@@ -248,7 +256,7 @@ index 11b83be..af45d1d 100644
      StoreContextMerged(data, initial_data, context_ptr);
      return true;
    }
-@@ -133,17 +156,42 @@ bool XmaContext::Work() {
+@@ -133,17 +158,42 @@ bool XmaContext::Work() {
    }
  
    while (remaining_subframe_blocks_in_output_buffer_ >= minimum_subframe_decode_count) {
@@ -294,10 +302,25 @@ index 11b83be..af45d1d 100644
      data.output_buffer_valid = 0;
    }
  
-@@ -670,6 +718,16 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+@@ -670,6 +720,31 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
    if (decoded) {
      ConvertFrame(reinterpret_cast<const uint8_t**>(&av_frame_->data), bool(data->is_stereo),
                   decoded_frame_.data());
++    // --xma_dump_raw=PATH: every decoded frame as {u32 context, u32 sample rate, u32 channels,
++    // u32 samples per channel} + the big-endian int16 PCM the guest reads, to tell decoder
++    // artifacts from the game mixer's.
++    if (const std::string& path = REXCVAR_GET(xma_dump_raw); !path.empty()) {
++      static std::mutex dump_mutex;
++      static FILE* dump = nullptr;
++      std::lock_guard lock(dump_mutex);
++      if (!dump) dump = std::fopen(path.c_str(), "wb");
++      if (dump) {
++        uint32_t header[4] = {id_, uint32_t(av_context_->sample_rate), 1u + uint32_t(data->is_stereo),
++                              uint32_t(kSamplesPerFrame)};
++        std::fwrite(header, sizeof(header), 1, dump);
++        std::fwrite(decoded_frame_.data(), 1, kBytesPerFrameChannel << data->is_stereo, dump);
++      }
++    }
 +    if (REXCVAR_GET(xma_trace)) {
 +      static uint32_t last_peak[512];
 +      uint32_t& last = last_peak[id_ & 511];
@@ -311,6 +334,42 @@ index 11b83be..af45d1d 100644
  
      // Realign the decoder's output onto the bitstream's sample numbering: the
      // samples of the frame just decoded run from kDecoderStartPadding into this
+diff --git a/src/codegen/builders/vector.cpp b/src/codegen/builders/vector.cpp
+index cbdd7f7..e06fd99 100644
+--- a/src/codegen/builders/vector.cpp
++++ b/src/codegen/builders/vector.cpp
+@@ -113,15 +113,29 @@ bool build_vnmsubfp(BuilderContext& ctx) {
+   return true;
+ }
+ 
++// AltiVec vmaxfp/vminfp return a QNaN when either operand is a NaN; SSE maxps/minps return the
++// second operand instead, so a clamp like max(min(x, 1), 0) turned NaN into 1.0 (GTA V: audio
++// gains/filters that are NaN on the console played at full level). Select a NaN (a + b) there.
++static void emit_vec_fp_minmax_nan(BuilderContext& ctx, const char* simd_op) {
++  auto vD = ctx.v(ctx.insn.operands[0]);
++  auto vA = ctx.v(ctx.insn.operands[1]);
++  auto vB = ctx.v(ctx.insn.operands[2]);
++  ctx.println("\t{{ simde__m128 a_ = simde_mm_load_ps({}.f32), b_ = simde_mm_load_ps({}.f32);", vA, vB);
++  ctx.println("\t  simde__m128 n_ = simde_mm_cmpunord_ps(a_, b_);");
++  ctx.println("\t  simde_mm_store_ps({}.f32, simde_mm_or_ps(simde_mm_andnot_ps(n_, simde_mm_{}_ps(a_, b_)), "
++              "simde_mm_and_ps(n_, simde_mm_add_ps(a_, b_)))); }}",
++              vD, simd_op);
++}
++
+ bool build_vmaxfp(BuilderContext& ctx) {
+   ctx.emit_set_flush_mode(true);
+-  ctx.emit_vec_fp_binary("max");
++  emit_vec_fp_minmax_nan(ctx, "max");
+   return true;
+ }
+ 
+ bool build_vminfp(BuilderContext& ctx) {
+   ctx.emit_set_flush_mode(true);
+-  ctx.emit_vec_fp_binary("min");
++  emit_vec_fp_minmax_nan(ctx, "min");
+   return true;
+ }
+ 
 diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
 index 19874a5..1c2dada 100644
 --- a/src/graphics/d3d12/command_processor.cpp

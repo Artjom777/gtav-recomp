@@ -39,6 +39,17 @@ def extent(words):
     return pitch, h, bpp, fmt, endian, tiled, size
 
 
+def float20e4(f24):
+    """Xenos 20e4 depth (4-bit exponent, 20-bit mantissa) to float, as Xenia's Float20e4To32."""
+    if not f24:
+        return 0.0
+    mantissa, exponent = f24 & 0xFFFFF, f24 >> 20
+    if not exponent:  # denormal
+        shift = 21 - mantissa.bit_length()
+        exponent, mantissa = 1 - shift, (mantissa << shift) & 0xFFFFF
+    return struct.unpack('<f', struct.pack('<I', ((exponent + 112) << 23) | (mantissa << 3)))[0]
+
+
 def texel(buf, words, x, y):
     pitch, _, bpp, fmt, endian, tiled, _ = extent(words)
     off = tiled_offset(x, y, pitch, bpp.bit_length() - 1) if tiled else (y * pitch + x) * bpp
@@ -53,6 +64,9 @@ def texel(buf, words, x, y):
         return [half(v) for v in struct.unpack('<%dH' % (bpp // 2), b)]
     if fmt == 36:
         return [struct.unpack('<f', b)[0]]
+    if fmt in (22, 23):  # depth resolves: depth in bits 8-31 (24-bit unorm / 20e4 float), stencil 0-7
+        d = struct.unpack('<I', b)[0] >> 8
+        return [d / 16777215.0 if fmt == 22 else float20e4(d)]
     if fmt == 6:  # 0xAARRGGBB little-endian -> B G R A
         return [b[2] / 255, b[1] / 255, b[0] / 255, b[3] / 255]
     if fmt == 54:  # 2_10_10_10 resolved like 8_8_8_8 (A2R10G10B10): B bits 0-9, G 10-19, R 20-29, A 30-31

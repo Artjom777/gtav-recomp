@@ -27,7 +27,16 @@ float4 PSMain(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target 
 // target; the resolve rectangle is the viewport, SourceMinusDest maps it back to the source.
 float PSDepth(float4 position : SV_Position) : SV_Target {
     int2 source = int2(position.xy) + g_Push.SourceMinusDest;
-    return g_Textures[g_Push.TextureIndex].Load(int3(source, 0)).r;
+    float d = g_Textures[g_Push.TextureIndex].Load(int3(source, 0)).r;
+    if (g_Push.Mode == 2) {
+        // D24FS8 source: the Xbox stores depth as 20e4 (20-bit mantissa, truncated, as Xenia's
+        // default), and GTA's shadow bias is tuned to it; the host keeps 32-bit floats.
+        if (d >= 6.103515625e-5)  // 2^-14, smallest normal 20e4
+            d = asfloat(asuint(min(d, 1.99999988)) & ~7u);
+        else
+            d = floor(d * 17179869184.0) / 17179869184.0;  // denormal step 2^-34
+    }
+    return d;
 }
 
 // Color resolve with format conversion: the destination target has the host format of the guest
@@ -108,4 +117,18 @@ float4 PSDigits(float4 position : SV_Position) : SV_Target {
               ((s & 0x10) && Segment(c, float4(0, 12, 3, 22))) || ((s & 0x20) && Segment(c, float4(0, 2, 3, 12))) ||
               ((s & 0x40) && Segment(c, float4(2, 10.5, 12, 13.5)));
     return on ? float4(0.2, 1.0, 0.3, 1.0) : float4(0.0, 0.0, 0.0, 0.6);
+}
+
+// Tree-orb diagnostic (F11 "flat" modes): replaces a guest pixel shader with magenta in RT0, no
+// textures or kill, so the picture shows where the draw rasterizes and passes depth. The shade
+// varies per triangle so that per-draw snapshots still show a draw that covers an earlier one.
+float4 PSDiagFlat(float4 position : SV_Position, uint primitive : SV_PrimitiveID) : SV_Target0 {
+    float shade = 0.55 + 0.45 * float((primitive * 2654435761u) >> 24) / 255.0;
+    return float4(shade, 0.0, shade, 1.0);
+}
+
+// Frame dumps (GTAV_NATIVE_DUMP_ALPHA=1): per-draw snapshots show the target's alpha as grey.
+float4 PSAlpha(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+    float a = g_Textures[g_Push.TextureIndex].SampleLevel(g_Samplers[g_Push.SamplerIndex], uv, 0).a;
+    return float4(a, a, a, 1.0);
 }

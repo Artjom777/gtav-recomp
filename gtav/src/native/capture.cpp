@@ -9,6 +9,7 @@
 
 #include "d3d_map.h"
 #include "frame.h"
+#include "paths.h"
 #include "renderer.h"
 #include "shaders.h"
 #include "xenos_regs.h"
@@ -21,8 +22,17 @@
 #include <rex/logging.h>
 #include <rex/system.h>
 
+#define XXH_INLINE_ALL
+#include <xxhash.h>
+
+#ifndef _WIN32
+#include <sys/uio.h>
+#include <unistd.h>
+#endif
+
 #include <atomic>
 #include <cstring>
+#include <fstream>
 #include <mutex>
 #include <string>
 
@@ -30,6 +40,10 @@ REXCVAR_DECLARE(std::string, gtav_native);
 REXCVAR_DEFINE_BOOL(gtav_native_snapshot_draws, false, "GTAV",
                     "Copy every draw's vertex and index data at the D3D call instead of reading guest "
                     "memory when the frame is recorded");
+REXCVAR_DEFINE_BOOL(gtav_native_dump_on_collapse, false, "GTAV",
+                    "Diagnostic: dump the first frame with a collapsed tree leaf draw (tree orbs)");
+REXCVAR_DEFINE_BOOL(gtav_native_pm4_scan, false, "GTAV",
+                    "Diagnostic: log ALU constant writes found in the PM4 stream between draws (tree orbs)");
 REXCVAR_DEFINE_INT32(gtav_native_layout_probe, 0, "GTAV",
                      "Log objects and register shadow for the first draws of this guest frame");
 
@@ -70,6 +84,10 @@ void FlushInlineConstants() {
 }
 FramePacket g_packet;
 std::atomic<uint64_t> g_frame{0};
+struct Collapse {
+  bool frame_bad = false, frame_good = false, requested = false;
+  uint32_t streak = 0;  // consecutive frames with only collapsed leaf draws
+} g_collapse;
 int g_probe_logged = 0;
 
 uint32_t be32(const uint8_t* p) { return uint32_t(p[0]) << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
@@ -162,10 +180,183 @@ static uint32_t WritePointer(uint32_t device) {
   return write ? GuestPhysical(write) : 0;
 }
 
+// Diagnostic (tree orbs): parses the PM4 the device wrote since the previous draw and counts ALU
+// constant writes by packet kind, following INDIRECT_BUFFERs one level. GTA's wind-animated tree
+// leaves (VS AF15EF63) read _globalEntityScale from c232; in some frames the D3D shadow holds a
+// stale value there for all of them, so the per-tree value must reach the GPU some other way.
+namespace pm4scan {
+constexpr uint64_t kLeafVs = 0xAF15EF63BB4B093Full;
+constexpr uint32_t kWatchReg = 0x4000 + 232 * 4;  // VS c232.x
+uint32_t g_pos = 0;
+uint32_t g_watch[4] = {};
+const char* g_watch_src = "none";
+uint32_t g_watch_addr = 0;
+struct Stats {
+  uint32_t draws = 0, set_alu = 0, load_alu = 0, type0_alu = 0, set2 = 0, set_shader = 0, ibs = 0, resets = 0;
+  uint32_t watch_set = 0, watch_load = 0, watch_type0 = 0, watch_other = 0;
+  uint32_t checked = 0, vs_mismatch = 0, ps_mismatch = 0;
+} g_stats;
+// Shader identity check: the microcode the GPU loads (IM_LOAD / IM_LOAD_IMMEDIATE, hashed like the
+// emulator keys it) against the shaders the capture used. A draw's own IM_LOADs and draw packet are
+// written after the capture hook, so the first draw packet of the next scan belongs to it.
+uint64_t g_loaded[2] = {};  // vertex, pixel microcode hash
+
+// Guest physical memory read through process_vm_readv: unallocated guest pages may be protected,
+// and a fault here (on the game's D3D thread) hangs the game. False if any of it is unreadable.
+bool SafeCopy(uint32_t phys, uint32_t size, std::vector<uint8_t>& out) {
+  out.resize(size);
+  if (!size) return true;
+  if (phys >= 0x20000000 || size > 0x20000000 - phys) return false;
+#ifdef _WIN32
+  std::memcpy(out.data(), REX_KERNEL_MEMORY()->TranslatePhysical(phys), size);
+  return true;
+#else
+  iovec local{out.data(), size};
+  iovec remote{const_cast<uint8_t*>(REX_KERNEL_MEMORY()->TranslatePhysical(phys)), size};
+  return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == ssize_t(size);
+#endif
+}
+struct Expected {
+  bool valid = false;
+  uint64_t ucode[2] = {}, container[2] = {};
+} g_expected;
+
+void CheckDraw() {
+  if (!g_expected.valid) return;
+  g_expected.valid = false;
+  g_stats.checked++;
+  static uint32_t logged = 0;
+  for (int t = 0; t < 2; t++) {
+    if (!g_expected.ucode[t] || !g_loaded[t] || g_expected.ucode[t] == g_loaded[t]) continue;
+    (t ? g_stats.ps_mismatch : g_stats.vs_mismatch)++;
+    if (logged < 80) {
+      logged++;
+      REXLOG_INFO("[native-pm4] {} mismatch: captured {:016X} (ucode {:016X}), GPU loads ucode {:016X} = {:016X}",
+                  t ? "ps" : "vs", g_expected.container[t], g_expected.ucode[t], g_loaded[t],
+                  ContainerForUcode(g_loaded[t]));
+    }
+  }
+}
+
+void Note(uint32_t reg, uint32_t n, const uint8_t* data, const char* src, uint32_t addr, uint32_t& counter) {
+  if (reg + n <= kWatchReg || reg > kWatchReg + 3) return;
+  counter++;
+  for (uint32_t i = 0; i < 4; i++)
+    if (kWatchReg + i >= reg && kWatchReg + i < reg + n) g_watch[i] = data ? be32(data + 4 * (kWatchReg + i - reg)) : 0;
+  g_watch_src = src;
+  g_watch_addr = addr;
+}
+
+void Parse(uint32_t begin, uint32_t end, int depth) {
+  std::vector<uint8_t> segment, extra;
+  if (!SafeCopy(begin, end - begin, segment)) {
+    g_stats.resets++;
+    return;
+  }
+  const uint8_t* p = segment.data();
+  uint32_t size = end - begin;
+  for (uint32_t at = 0; at + 4 <= size;) {
+    uint32_t h = be32(p + at);
+    uint32_t type = h >> 30;
+    if (type == 2) {
+      at += 4;
+      continue;
+    }
+    if (type == 1) {
+      at += 12;
+      continue;
+    }
+    uint32_t count = ((h >> 16) & 0x3FFF) + 1;
+    const uint8_t* body = p + at + 4;
+    if (at + 4 + 4 * count > size) break;
+    if (type == 0) {
+      uint32_t reg = h & 0x7FFF;
+      if (reg >= 0x4000 && reg < 0x4800) {
+        g_stats.type0_alu++;
+        Note(reg, (h & 0x8000) ? 1 : count, body, "type0", 0, g_stats.watch_type0);
+      }
+    } else {
+      uint32_t op = (h >> 8) & 0x7F;
+      if (op == 0x2D && count >= 1) {  // SET_CONSTANT
+        uint32_t ot = be32(body);
+        if (((ot >> 16) & 0xFF) == 0) {
+          g_stats.set_alu++;
+          Note(0x4000 + (ot & 0x7FF), count - 1, body + 4, "SET_CONSTANT", 0, g_stats.watch_set);
+        }
+      } else if (op == 0x2F && count >= 3) {  // LOAD_ALU_CONSTANT
+        uint32_t addr = be32(body) & 0x1FFFFFFC, ot = be32(body + 4), n = be32(body + 8) & 0xFFF;
+        if (((ot >> 16) & 0xFF) == 0 && SafeCopy(addr, 4 * n, extra)) {
+          g_stats.load_alu++;
+          Note(0x4000 + (ot & 0x7FF), n, extra.data(), "LOAD_ALU_CONSTANT", addr, g_stats.watch_load);
+        }
+      } else if (op == 0x55 || op == 0x56) {  // SET_CONSTANT2 / SET_SHADER_CONSTANTS (register index)
+        (op == 0x55 ? g_stats.set2 : g_stats.set_shader)++;
+        Note(be32(body) & 0xFFFF, count - 1, body + 4, op == 0x55 ? "SET_CONSTANT2" : "SET_SHADER_CONSTANTS", 0,
+             g_stats.watch_other);
+      } else if (op == 0x27 && count >= 2) {  // IM_LOAD: type | address, start << 16 | dwords
+        uint32_t at_type = be32(body), dwords = be32(body + 4) & 0xFFFF, addr = at_type & 0x1FFFFFFC;
+        if ((at_type & 3) < 2 && dwords && SafeCopy(addr, dwords * 4, extra))
+          g_loaded[at_type & 3] = XXH3_64bits(extra.data(), dwords * 4);
+      } else if (op == 0x2B && count >= 2) {  // IM_LOAD_IMMEDIATE: type, start << 16 | dwords, code
+        uint32_t t = be32(body), dwords = be32(body + 4) & 0xFFFF;
+        if (t < 2 && dwords && dwords <= count - 2) g_loaded[t] = XXH3_64bits(body + 8, dwords * 4);
+      } else if (op == 0x22 || op == 0x36) {  // DRAW_INDX / DRAW_INDX_2
+        CheckDraw();
+      } else if (op == 0x3F && count == 2 && depth == 0) {  // INDIRECT_BUFFER
+        g_stats.ibs++;
+        uint32_t ib = be32(body) & 0x1FFFFFFC, dwords = be32(body + 4) & 0xFFFFF;
+        if (dwords && dwords < 0x10000) Parse(ib, ib + dwords * 4, 1);
+      }
+    }
+    at += 4 + 4 * count;
+  }
+}
+
+void OnDraw(uint32_t write, uint64_t vs_hash, const uint8_t* captured_vs) {
+  if (write > g_pos && write - g_pos < (1u << 20) && g_pos && write <= 0x20000000) Parse(g_pos, write, 0);
+  else g_stats.resets++, g_expected.valid = false;
+  g_pos = write;
+  g_stats.draws++;
+  g_expected.valid = true;
+  g_expected.container[0] = ShaderHash(g_bound.vertex_shader);
+  g_expected.container[1] = ShaderHash(g_bound.pixel_shader);
+  g_expected.ucode[0] = ShaderUcodeHash(g_bound.vertex_shader);
+  g_expected.ucode[1] = ShaderUcodeHash(g_bound.pixel_shader);
+  static uint32_t logged = 0;
+  if (vs_hash == kLeafVs && logged < 60) {
+    logged++;
+    uint32_t c[4];
+    for (int i = 0; i < 4; i++) c[i] = be32(captured_vs + 232 * 16 + 4 * i);
+    auto f = [](uint32_t v) { float x; std::memcpy(&x, &v, 4); return x; };
+    REXLOG_INFO("[native-pm4] leaf draw: captured c232 ({:.3f},{:.3f},{:.3f},{:.3f}), last ring write "
+                "({:.3f},{:.3f},{:.3f},{:.3f}) by {} {:08X}",
+                f(c[0]), f(c[1]), f(c[2]), f(c[3]), f(g_watch[0]), f(g_watch[1]), f(g_watch[2]), f(g_watch[3]),
+                g_watch_src, g_watch_addr);
+  }
+  if (g_stats.draws % 50000 == 0) {
+    auto& s = g_stats;
+    REXLOG_INFO("[native-pm4] per 50000 draws: ALU writes SET_CONSTANT {} LOAD_ALU_CONSTANT {} type0 {} "
+                "SET_CONSTANT2 {} SET_SHADER_CONSTANTS {}, indirect buffers {}, scan resets {}; c232 written by "
+                "SET_CONSTANT {} LOAD {} type0 {} other {}; shader check {} draws, vs mismatches {}, ps {}",
+                s.set_alu, s.load_alu, s.type0_alu, s.set2, s.set_shader, s.ibs, s.resets, s.watch_set,
+                s.watch_load, s.watch_type0, s.watch_other, s.checked, s.vs_mismatch, s.ps_mismatch);
+    s = {};
+  }
+}
+}  // namespace pm4scan
+
 static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive, int32_t base_vertex,
                                uint32_t start, uint32_t count) {
   FlushIndexedVertices();
   if (!Active()) return nullptr;
+  if (REXCVAR_GET(gtav_native_pm4_scan)) {
+    FlushInlineConstants();
+    uint8_t vs[256 * 16];
+    std::memcpy(vs, Guest(device) + d3d::kDevVsConstants, sizeof(vs));
+    for (uint32_t i = 0; i < 256; i++)
+      if (g_inline_consts.valid[0][i]) std::memcpy(vs + 16 * i, g_inline_consts.data[0][i], 16);
+    pm4scan::OnDraw(WritePointer(device), ShaderHash(g_bound.vertex_shader), vs);
+  }
   const uint8_t* dev = Guest(device);
   DrawCommand d;
   d.indexed = indexed;
@@ -205,6 +396,11 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
         if (g_inline_consts.valid[bank][i]) std::memcpy(dst + 16 * i, g_inline_consts.data[bank][i], 16);
     }
   }
+  // --gtav_native_dump_on_collapse: wind-animated tree leaf draws (VS AF15EF63) whose
+  // _globalEntityScale (c232) has z = 0 collapse to a point (black tree "orbs"). OnCaptureSwap
+  // requests a frame dump once that lasts (to compare with the emulator in shadow mode).
+  if (REXCVAR_GET(gtav_native_dump_on_collapse) && d.vs_hash == 0xAF15EF63BB4B093Full)
+    (be32(g_packet.At(d.vs_consts) + 232 * 16 + 8) == 0 ? g_collapse.frame_bad : g_collapse.frame_good) = true;
   // Consecutive draws mostly repeat the previous draw's constants and fetch constants: share its
   // block instead (the replay then skips the byte swap and texture lookups by offset).
   if (!g_packet.draws.empty()) {
@@ -670,6 +866,16 @@ void OnCaptureSwap(uint32_t front_buffer) {
     g_buffer_stats = {0, 0, 0, 0, g_buffer_stats.frames};
   }
   uint64_t frame = g_frame.fetch_add(1, std::memory_order_relaxed);
+  if (g_collapse.frame_bad || g_collapse.frame_good) {
+    g_collapse.streak = g_collapse.frame_bad && !g_collapse.frame_good ? g_collapse.streak + 1 : 0;
+    if (g_collapse.streak == 120 && !g_collapse.requested) {
+      g_collapse.requested = true;
+      REXLOG_INFO("[native] tree leaf draws collapsed (c232.z = 0) for 120 frames at guest frame {}: requesting a "
+                  "frame dump", frame);
+      std::ofstream(LogPath("dump_request")) << "collapse\n";
+    }
+    g_collapse.frame_bad = g_collapse.frame_good = false;
+  }
   if (!Active()) return;
   g_packet.index = frame;
   g_packet.front_buffer = front_buffer;

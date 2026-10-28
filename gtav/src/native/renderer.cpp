@@ -28,6 +28,7 @@
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <set>
 #include <unordered_map>
 #include <memory>
@@ -38,6 +39,9 @@
 
 REXCVAR_DEFINE_STRING(gtav_native, "off", "GTAV", "Native renderer: off | shadow | on");
 REXCVAR_DEFINE_BOOL(gtav_native_vsync, true, "GTAV", "Native renderer: wait for vertical sync when presenting");
+REXCVAR_DEFINE_BOOL(gtav_native_flicker_catch, false, "GTAV",
+                    "Native renderer: detect one-frame glitches (a frame unlike both neighbours), save them to "
+                    "logs/flicker and log them");
 REXCVAR_DEFINE_BOOL(gtav_native_fps, false, "GTAV", "Native renderer: on-screen frames-per-second counter");
 REXCVAR_DEFINE_BOOL(gtav_native_hidden, false, "GTAV",
                     "Native renderer: keep every game window hidden (unattended test runs)");
@@ -219,7 +223,7 @@ class Renderer {
       SetTimer(hwnd, 1, 500, nullptr);  // hide the SDK window again if it reappears ("on")
       SetTimer(hwnd, 2, 50, nullptr);   // F9/F10 while either game window has focus
       MSG msg;
-      bool f9_down = false, f10_down = false;
+      bool f9_down = false, f10_down = false, f11_down = false;
       while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         if (msg.message == WM_TIMER && msg.hwnd == hwnd) {
           if (msg.wParam == 1) {
@@ -229,9 +233,11 @@ class Renderer {
             GetWindowThreadProcessId(GetForegroundWindow(), &pid);
             bool ours = pid == GetCurrentProcessId();
             bool f9 = ours && (GetAsyncKeyState(VK_F9) & 0x8000), f10 = ours && (GetAsyncKeyState(VK_F10) & 0x8000);
+            bool f11 = ours && (GetAsyncKeyState(VK_F11) & 0x8000);
             if (f9 && !f9_down) key_dump_ = true;
             if (f10 && !f10_down) key_shot_ = true;
-            f9_down = f9, f10_down = f10;
+            if (f11 && !f11_down) CycleDiagMode();
+            f9_down = f9, f10_down = f10, f11_down = f11;
           }
           continue;
         }
@@ -274,6 +280,7 @@ class Renderer {
                 if (e->type == SDL_EVENT_KEY_DOWN && !e->key.repeat) {
                   if (e->key.scancode == SDL_SCANCODE_F9) key_dump_ = true;
                   if (e->key.scancode == SDL_SCANCODE_F10) key_shot_ = true;
+                  if (e->key.scancode == SDL_SCANCODE_F11) CycleDiagMode();
                 }
                 return true;
               },
@@ -392,6 +399,108 @@ class Renderer {
     queue_cmd_->waitForCommandFence(fences_[slot].get());
     in_flight_[slot] = false;
     if (backend_ok_) backend_.FrameComplete(slot);
+    FlickerAnalyze(slot);
+  }
+
+  // --gtav_native_flicker_catch: every presented frame is copied to a per-slot readback buffer;
+  // once its fence passed, a 160x90 luminance grid is compared with the frames before and after.
+  // Frame n-1 is a one-frame glitch where it differs strongly from both neighbours while n-2 and n
+  // agree (a triangle or plane that exists for one frame; camera motion does not revert). Frames
+  // n-2, n-1 and n go to logs/flicker as PPM.
+  void FlickerCapture(uint32_t slot, uint64_t index, uint32_t front_descriptor, uint32_t w, uint32_t h) {
+    if (!flick_tex_) {
+      flick_tex_ = device_->createTexture(
+          plume::RenderTextureDesc::ColorTarget(kShotW, kShotH, plume::RenderFormat::R8G8B8A8_UNORM));
+      const plume::RenderTexture* color = flick_tex_.get();
+      plume::RenderFramebufferDesc fb;
+      fb.colorAttachments = &color;
+      fb.colorAttachmentsCount = 1;
+      flick_fb_ = device_->createFramebuffer(fb);
+      for (auto& rb : flick_rb_)
+        rb = device_->createBuffer(plume::RenderBufferDesc::ReadbackBuffer(uint64_t(kShotW) * kShotH * 4));
+    }
+    list_->barriers(plume::RenderBarrierStage::GRAPHICS,
+                    plume::RenderTextureBarrier(flick_tex_.get(), plume::RenderTextureLayout::COLOR_WRITE));
+    list_->setFramebuffer(flick_fb_.get());
+    list_->setViewports(plume::RenderViewport(0, 0, float(kShotW), float(kShotH)));
+    list_->setScissors(plume::RenderRect(0, 0, int32_t(kShotW), int32_t(kShotH)));
+    backend_.Blit(list_, front_descriptor, plume::RenderFormat::R8G8B8A8_UNORM);
+    list_->barriers(plume::RenderBarrierStage::COPY,
+                    plume::RenderTextureBarrier(flick_tex_.get(), plume::RenderTextureLayout::COPY_SOURCE));
+    list_->copyTextureRegion(plume::RenderTextureCopyLocation::PlacedFootprint(
+                                 flick_rb_[slot].get(), plume::RenderFormat::R8G8B8A8_UNORM, kShotW, kShotH, 1, kShotW),
+                             plume::RenderTextureCopyLocation::Subresource(flick_tex_.get()));
+    list_->barriers(plume::RenderBarrierStage::GRAPHICS,
+                    plume::RenderTextureBarrier(swap_target_, plume::RenderTextureLayout::COLOR_WRITE));
+    list_->setFramebuffer(framebuffers_[swap_image_].get());
+    list_->setViewports(plume::RenderViewport(0, 0, float(w), float(h)));
+    list_->setScissors(plume::RenderRect(0, 0, int32_t(w), int32_t(h)));
+    flick_index_[slot] = index;
+    flick_pending_[slot] = true;
+  }
+
+  void FlickerAnalyze(uint32_t slot) {
+    if (!flick_pending_[slot]) return;
+    flick_pending_[slot] = false;
+    constexpr uint32_t kGw = 160, kGh = 90, kStep = kShotW / kGw;
+    const uint8_t* px = static_cast<const uint8_t*>(flick_rb_[slot]->map());
+    std::vector<uint8_t> grid(kGw * kGh), rgb(size_t(kShotW) * kShotH * 3);
+    for (uint32_t y = 0; y < kGh; y++)
+      for (uint32_t x = 0; x < kGw; x++) {
+        const uint8_t* p = px + 4 * ((y * kStep + kStep / 2) * kShotW + x * kStep + kStep / 2);
+        grid[y * kGw + x] = uint8_t((p[0] * 3 + p[1] * 6 + p[2]) / 10);
+      }
+    for (uint32_t i = 0; i < kShotW * kShotH; i++) std::memcpy(&rgb[3 * i], px + 4 * i, 3);
+    flick_rb_[slot]->unmap();
+    uint64_t index = flick_index_[slot];
+    // History of the last two frames (grid + image), consecutive guest frames only.
+    if (flick_hist_n_ == 2 && index == flick_hist_index_[1] + 1 && flick_hist_index_[1] == flick_hist_index_[0] + 1) {
+      const auto &g0 = flick_hist_grid_[0], &g1 = flick_hist_grid_[1];
+      uint32_t odd = 0, x0 = kGw, y0 = kGh, x1 = 0, y1 = 0;
+      for (uint32_t y = 0; y < kGh; y++)
+        for (uint32_t x = 0; x < kGw; x++) {
+          uint32_t i = y * kGw + x;
+          int a = g0[i], b = g1[i], c = grid[i];
+          if (std::abs(b - a) > 40 && std::abs(b - c) > 40 && std::abs(a - c) < 16) {
+            odd++;
+            x0 = std::min(x0, x), y0 = std::min(y0, y), x1 = std::max(x1, x), y1 = std::max(y1, y);
+          }
+        }
+      // A stray triangle is one dense region; scattered points over the whole screen are
+      // frame-to-frame dither noise. At least 1% of the grid, filling 30% of its box.
+      uint32_t box = (x1 - x0 + 1) * (y1 - y0 + 1);
+      if (odd * 100 > kGw * kGh && odd * 10 >= box * 3) {
+        flick_count_++;
+        REXLOG_INFO("[native] flicker #{}: guest frame {} differs from both neighbours over {} of {} grid points "
+                    "(box {},{}-{},{} of 160x90){}",
+                    flick_count_, flick_hist_index_[1], odd, kGw * kGh, x0, y0, x1, y1,
+                    flick_count_ <= 40 ? "; frames saved to logs/flicker" : "");
+        if (flick_count_ <= 40) {
+          std::error_code ec;
+          std::string dir = LogPath("flicker");
+          std::filesystem::create_directories(dir, ec);
+          auto write = [&](const std::vector<uint8_t>& img, uint64_t at, const char* tag) {
+            if (FILE* f = std::fopen(fmt::format("{}/flicker_{:06}_{}.ppm", dir, at, tag).c_str(), "wb")) {
+              std::fprintf(f, "P6\n%u %u\n255\n", kShotW, kShotH);
+              std::fwrite(img.data(), 1, img.size(), f);
+              std::fclose(f);
+            }
+          };
+          write(flick_hist_rgb_[0], flick_hist_index_[0], "a_before");
+          write(flick_hist_rgb_[1], flick_hist_index_[1], "b_glitch");
+          write(rgb, index, "c_after");
+        }
+      }
+    }
+    if (flick_hist_n_ < 2) flick_hist_n_++;
+    else {
+      std::swap(flick_hist_grid_[0], flick_hist_grid_[1]);
+      std::swap(flick_hist_rgb_[0], flick_hist_rgb_[1]);
+      flick_hist_index_[0] = flick_hist_index_[1];
+    }
+    flick_hist_grid_[flick_hist_n_ - 1] = std::move(grid);
+    flick_hist_rgb_[flick_hist_n_ - 1] = std::move(rgb);
+    flick_hist_index_[flick_hist_n_ - 1] = index;
   }
 
   void RetireAll() {
@@ -415,6 +524,8 @@ class Renderer {
     if (!swapchain_->acquireTexture(acquires_[slot].get(), &image)) return;
     auto acquire_end = std::chrono::steady_clock::now();
     plume::RenderTexture* target = swapchain_->getTexture(image);
+    swap_target_ = target;
+    swap_image_ = image;
     list_ = lists_[slot].get();
     list_->begin();
     if (backend_ok_) backend_.BeginFrame(slot);
@@ -425,6 +536,16 @@ class Renderer {
       if (std::filesystem::exists(request, ec)) {
         std::filesystem::remove(request, ec);
         key_dump_ = true;
+      }
+      // logs/diag_mode (a mode number): sets the F11 tree diagnostic, then is removed.
+      auto diag = std::filesystem::path(LogPath("diag_mode"));
+      if (std::filesystem::exists(diag, ec)) {
+        std::ifstream in(diag);
+        uint32_t mode = 0;
+        in >> mode;
+        in.close();
+        std::filesystem::remove(diag, ec);
+        SetDiagMode(mode);
       }
     }
     if (backend_ok_ && key_dump_.exchange(false)) {
@@ -494,6 +615,7 @@ class Renderer {
       list_->setViewports(plume::RenderViewport(0, 0, float(w), float(h)));
       list_->setScissors(plume::RenderRect(0, 0, int32_t(w), int32_t(h)));
     }
+    if (front && REXCVAR_GET(gtav_native_flicker_catch)) FlickerCapture(slot, frame.index, front_descriptor, w, h);
     if (front) {
       backend_.Blit(list_, front_descriptor, plume::RenderFormat::B8G8R8A8_UNORM);
     } else {
@@ -751,6 +873,17 @@ class Renderer {
 
   Backend backend_;
   static constexpr uint32_t kShotW = 1280, kShotH = 720;
+  // Flicker catcher (--gtav_native_flicker_catch).
+  std::unique_ptr<plume::RenderTexture> flick_tex_;
+  std::unique_ptr<plume::RenderFramebuffer> flick_fb_;
+  std::unique_ptr<plume::RenderBuffer> flick_rb_[Backend::kFramesInFlight];
+  uint64_t flick_index_[Backend::kFramesInFlight] = {};
+  bool flick_pending_[Backend::kFramesInFlight] = {};
+  std::vector<uint8_t> flick_hist_grid_[2], flick_hist_rgb_[2];
+  uint64_t flick_hist_index_[2] = {};
+  uint32_t flick_hist_n_ = 0, flick_count_ = 0;
+  plume::RenderTexture* swap_target_ = nullptr;
+  uint32_t swap_image_ = 0;
   std::unique_ptr<plume::RenderBuffer> readback_;
   std::unique_ptr<plume::RenderTexture> shot_tex_;
   std::unique_ptr<plume::RenderFramebuffer> shot_fb_;

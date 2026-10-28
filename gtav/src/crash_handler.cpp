@@ -86,11 +86,75 @@ const bool kInstalled = (SetUnhandledExceptionFilter(ReportCrash), true);
 
 #include <sys/prctl.h>
 
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <csignal>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <exception>
+#include <typeinfo>
+
 namespace {
 
 // Let a debugger attach to the running game (gdb -p) under Yama ptrace_scope=1 without
 // root, so hangs can be inspected in place.
 const bool kPtracerAllowed = (prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0), true);
+
+// Aborts (an uncaught C++ exception, a failed libc check) left no trace: apport ignores
+// unpackaged binaries. Write the reason and a stack with module offsets to crash.txt next to
+// the binary (addr2line -e <module> <offset>). SIGSEGV stays with the runtime (guest memory).
+void WriteStack(const char* reason, const char* detail) {
+  int fd = ::open("crash.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0) return;
+  char line[512];
+  int n = std::snprintf(line, sizeof(line), "%s%s%s\n", reason, detail ? ": " : "", detail ? detail : "");
+  (void)!::write(fd, line, size_t(n));
+  void* frames[64];
+  int count = backtrace(frames, 64);
+  for (int i = 0; i < count; i++) {
+    Dl_info info{};
+    const char* module = "?";
+    uintptr_t offset = 0;
+    if (dladdr(frames[i], &info) && info.dli_fname) {
+      module = info.dli_fname;
+      offset = uintptr_t(frames[i]) - uintptr_t(info.dli_fbase);
+    }
+    n = std::snprintf(line, sizeof(line), "  #%d %p %s+0x%zx %s\n", i, frames[i], module, size_t(offset),
+                      info.dli_sname ? info.dli_sname : "");
+    (void)!::write(fd, line, size_t(n));
+  }
+  ::close(fd);
+}
+
+void OnAbort(int) {
+  WriteStack("SIGABRT", nullptr);
+  std::signal(SIGABRT, SIG_DFL);
+  std::raise(SIGABRT);
+}
+
+void OnTerminate() {
+  const char* what = nullptr;
+  char buf[384] = {};
+  if (std::exception_ptr e = std::current_exception()) {
+    try {
+      std::rethrow_exception(e);
+    } catch (const std::exception& ex) {
+      std::snprintf(buf, sizeof(buf), "%s: %s", typeid(ex).name(), ex.what());
+      what = buf;
+    } catch (...) {
+      what = "non-std exception";
+    }
+  }
+  WriteStack("std::terminate", what);
+  std::signal(SIGABRT, SIG_DFL);
+  std::abort();
+}
+
+const bool kCrashReporter = (std::signal(SIGABRT, OnAbort), std::set_terminate(OnTerminate), true);
 
 }  // namespace
 

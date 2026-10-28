@@ -17,6 +17,10 @@ namespace gtav::native {
 
 struct FramePacket;
 
+// Tree-orb diagnostic (backend.cpp DiagFor): F11 cycles the mode, logs/diag_mode sets it.
+void CycleDiagMode();
+void SetDiagMode(uint32_t mode);
+
 class Backend {
  public:
   Backend();

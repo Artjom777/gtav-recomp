@@ -65,9 +65,31 @@ namespace regs = xenos_regs;
 
 namespace {
 
+// Tree-orb diagnostic (F11 cycles, logs/diag_mode sets): on the draws picked by
+// GTAV_NATIVE_DIAG_PS / GTAV_NATIVE_DIAG_VS=hash,hash or ALL (default: VS 49CD0CC3ED116BB1),
+// override one pipeline stage to find the one that drops the leaf pixels.
+enum DiagMode : uint32_t { kDiagOff, kDiagDepthAlways, kDiagNoCull, kDiagFlat, kDiagFlatDepthAlways, kDiagModes };
+const char* const kDiagNames[kDiagModes] = {"off", "depth_always", "no_cull", "flat", "flat+depth_always"};
+std::atomic<uint32_t> g_diag_mode{kDiagOff};
+
+uint32_t DiagFor(uint64_t vs_hash, uint64_t ps_hash) {
+  uint32_t mode = g_diag_mode.load(std::memory_order_relaxed);
+  if (mode == kDiagOff) return kDiagOff;
+  static const std::string ps = std::getenv("GTAV_NATIVE_DIAG_PS") ? std::getenv("GTAV_NATIVE_DIAG_PS") : "";
+  static const std::string vs = std::getenv("GTAV_NATIVE_DIAG_VS") ? std::getenv("GTAV_NATIVE_DIAG_VS")
+                                : ps.empty()                        ? "49CD0CC3ED116BB1"
+                                                                    : "";
+  if (vs == "ALL") return mode;
+  bool picked = (!ps.empty() && ps.find(fmt::format("{:016X}", ps_hash)) != std::string::npos) ||
+                (!vs.empty() && vs.find(fmt::format("{:016X}", vs_hash)) != std::string::npos);
+  return picked ? mode : kDiagOff;
+}
+
 constexpr uint32_t kTextureDescriptors = 32768;
 constexpr uint32_t kSamplerDescriptors = 1024;
-constexpr uint32_t kNull2D = 0, kNull3D = 1, kNullCube = 2, kFirstTextureDescriptor = 3;
+// kOverflow: where a resource goes when the heap is full even after evicting (never sampled on
+// purpose; it used to land on kNull2D, so every "no texture" slot showed the newest texture).
+constexpr uint32_t kNull2D = 0, kNull3D = 1, kNullCube = 2, kOverflow = 3, kFirstTextureDescriptor = 4;
 constexpr uint64_t kUploadChunk = 64ull << 20;
 // Tallest render target: GTA V stacks its four 640x640 sun shadow cascades in one 640x2560 depth
 // surface, so 2048 rows lost the far cascade (distant scenery shadowed by garbage wedges).
@@ -493,6 +515,7 @@ struct CachedTexture {
   uint64_t bytes = 0;  // decoded size: small textures are rechecked every frame
   uint64_t sampled_hash = 0;  // HashGuestTexture(sampled) at the last full check
   uint64_t sample_frame = ~0ull;  // frame of the last sampled check
+  uint64_t used_frame = 0;  // last frame a draw bound it (EvictTextures)
   bool failed = false;
   bool all_zero = false;  // decoded texels all zero (guest data not streamed in yet?)
 };
@@ -524,6 +547,7 @@ struct Backend::Impl {
   std::unique_ptr<RenderTextureView> null_views[3];
   std::unique_ptr<RenderBuffer> zero_buffer;  // dummy vertex stream
   uint32_t next_descriptor = kFirstTextureDescriptor;
+  uint32_t descriptor_overflow_logged = 0;
   std::vector<uint32_t> free_descriptors;
   UploadRing upload;
   uint64_t frame = 0;
@@ -642,7 +666,7 @@ struct Backend::Impl {
     bound_fb = nullptr;
   }
 
-  std::unique_ptr<RenderShader> blit_vs, blit_ps, rectlist_gs, depth_ps, resolve_ps, depth_pack_ps;
+  std::unique_ptr<RenderShader> blit_vs, blit_ps, rectlist_gs, depth_ps, resolve_ps, depth_pack_ps, diag_flat_ps, alpha_ps;
   std::unique_ptr<RenderPipeline> depth_pack_pipeline;
   std::unique_ptr<RenderPipeline> depth_copy_pipeline;
   std::unordered_map<uint32_t, std::unique_ptr<RenderPipeline>> resolve_pipelines;  // by destination format
@@ -745,12 +769,14 @@ struct Backend::Impl {
     if (!t || !t->descriptor) return;
     uint32_t words[6] = {};
     Transition(list, t->texture.get(), RenderTextureLayout::SHADER_READ);
+    // GTAV_NATIVE_DUMP_ALPHA=1: per-draw snapshots (indices 0x100+) show the alpha channel.
+    static const bool alpha_view = std::getenv("GTAV_NATIVE_DUMP_ALPHA") != nullptr;
     DumpTexture(list, t->descriptor, uint32_t(t->format), t->width, t->height, 0xEEEE0000 | index,
-                0xF00000 | index, words);
+                0xF00000 | index, words, alpha_view && index >= 0x100);
   }
 
   void DumpTexture(RenderCommandList* list, uint32_t descriptor, uint32_t format, uint32_t width, uint32_t height,
-                   uint32_t address, uint32_t flags, const uint32_t words[6]) {
+                   uint32_t address, uint32_t flags, const uint32_t words[6], bool alpha_view = false) {
     InvalidateDrawState();
     uint32_t slot = uint32_t(dump_infos.size());
     if (slot >= DumpSlots()) return;
@@ -770,7 +796,7 @@ struct Backend::Impl {
     bound_fb = nullptr;
     list->setViewports(RenderViewport(0, 0, float(kDumpW), float(kDumpH)));
     list->setScissors(RenderRect(0, 0, int32_t(kDumpW), int32_t(kDumpH)));
-    BlitTo(list, descriptor, RenderFormat::R8G8B8A8_UNORM);
+    BlitTo(list, descriptor, RenderFormat::R8G8B8A8_UNORM, alpha_view);
     Transition(list, dump_tex.get(), RenderTextureLayout::COPY_SOURCE);
     list->copyTextureRegion(
         RenderTextureCopyLocation::PlacedFootprint(dump_readback.get(), RenderFormat::R8G8B8A8_UNORM, kDumpW, kDumpH,
@@ -778,14 +804,14 @@ struct Backend::Impl {
         RenderTextureCopyLocation::Subresource(dump_tex.get()));
   }
 
-  void BlitTo(RenderCommandList* list, uint32_t descriptor, RenderFormat format) {
+  void BlitTo(RenderCommandList* list, uint32_t descriptor, RenderFormat format, bool alpha_view = false) {
     InvalidateDrawState();
-    auto& pipeline = blit_pipelines[uint32_t(format)];
+    auto& pipeline = blit_pipelines[uint32_t(format) | (alpha_view ? 0x10000u : 0u)];
     if (!pipeline) {
       RenderGraphicsPipelineDesc desc;
       desc.pipelineLayout = layout.get();
       desc.vertexShader = blit_vs.get();
-      desc.pixelShader = blit_ps.get();
+      desc.pixelShader = alpha_view ? alpha_ps.get() : blit_ps.get();
       desc.renderTargetCount = 1;
       desc.renderTargetFormat[0] = format;
       desc.renderTargetBlend[0] = RenderBlendDesc::Copy();
@@ -840,6 +866,11 @@ struct Backend::Impl {
 
   // Per-frame stats for the bring-up log.
   uint32_t stat_draws = 0, stat_skipped = 0, stat_pipelines_created = 0, stat_textures = 0;
+  // Draws lost this frame to work still in flight (logged per frame: a candidate for the one-frame
+  // black flickers): pipeline still compiling, vertex shader or pixel shader SPIR-V not ready
+  // (a missing pixel shader draws depth-only).
+  uint32_t lost_pipeline = 0, lost_vs = 0, lost_ps = 0;
+  std::string lost_first;
   double t_shader = 0, t_pipeline = 0, t_texture = 0, t_resolve = 0;
 
   // Current framebuffer binding.
@@ -901,13 +932,51 @@ struct Backend::Impl {
   }
   RenderTarget* bound_depth = nullptr;
 
+  // Guest textures stay cached after the game streams them out, so a long drive filled the
+  // 32768-entry descriptor heap (and VRAM). At frame start, when under 10% of the heap is left,
+  // the least recently bound textures (unused for 10 s or more) are released down to 20% free;
+  // their descriptors and textures go through the per-frame deferred frees (in use by frames
+  // still on the GPU). The slot memo and fetch cache are reset per frame, so nothing still
+  // holds an evicted descriptor.
+  uint32_t textures_evicted = 0;
+  void EvictTextures() {
+    auto available = [&] { return kTextureDescriptors - next_descriptor + uint32_t(free_descriptors.size()); };
+    if (available() >= kTextureDescriptors / 10) return;
+    constexpr uint64_t kMinIdleFrames = 600;
+    std::vector<std::pair<uint64_t, uint64_t>> idle;  // used_frame, key
+    for (const auto& [key, t] : textures)
+      if (frame - t.used_frame >= kMinIdleFrames && (t.texture || t.failed)) idle.emplace_back(t.used_frame, key);
+    std::sort(idle.begin(), idle.end());
+    uint32_t want = kTextureDescriptors / 5, freed = 0, released = 0;
+    for (const auto& [used, key] : idle) {
+      if (available() + freed >= want) break;
+      auto it = textures.find(key);
+      CachedTexture& t = it->second;
+      if (t.descriptor >= kFirstTextureDescriptor) {
+        pending_free_descriptors.push_back(t.descriptor);
+        freed++;
+      }
+      if (t.view) dead_views.push_back(std::move(t.view));
+      if (t.texture) dead_textures.push_back(std::move(t.texture));
+      textures.erase(it);
+      released++;
+    }
+    textures_evicted += released;
+    REXLOG_INFO("[native] texture cache: {} free descriptors left, released {} textures idle for {}+ frames "
+                "({} descriptors back after this frame; {} released so far, {} cached)",
+                available(), released, kMinIdleFrames, freed, textures_evicted, textures.size());
+  }
+
   uint32_t AllocDescriptor() {
     if (!free_descriptors.empty()) {
       uint32_t d = free_descriptors.back();
       free_descriptors.pop_back();
       return d;
     }
-    return next_descriptor < kTextureDescriptors ? next_descriptor++ : kNull2D;
+    if (next_descriptor < kTextureDescriptors) return next_descriptor++;
+    if (descriptor_overflow_logged++ < 8)
+      REXLOG_WARN("[native] texture descriptor heap full ({} cached textures); resource left unbound", textures.size());
+    return kOverflow;
   }
 
   void Transition(RenderCommandList* list, RenderTexture* t, RenderTextureLayout layout) {
@@ -963,6 +1032,7 @@ struct Backend::Impl {
       texture_set->setTexture(uint32_t(i), null_textures[i].get(), RenderTextureLayout::SHADER_READ,
                               null_views[i].get());
     }
+    texture_set->setTexture(kOverflow, null_textures[0].get(), RenderTextureLayout::SHADER_READ, null_views[0].get());
     writeback_resolves = REXCVAR_GET(gtav_native) == "on";
     if (writeback_resolves)
       for (auto& pool : query_pools) pool = device->createOcclusionQueryPool(kMaxQueries);
@@ -976,6 +1046,9 @@ struct Backend::Impl {
     rectlist_gs = device->createShader(g_native_rectlist_gs, sizeof(g_native_rectlist_gs), "main",
                                        RenderShaderFormat::SPIRV);
     depth_ps = device->createShader(g_native_depth_ps, sizeof(g_native_depth_ps), "PSDepth", RenderShaderFormat::SPIRV);
+    diag_flat_ps = device->createShader(g_native_diag_flat_ps, sizeof(g_native_diag_flat_ps), "PSDiagFlat",
+                                        RenderShaderFormat::SPIRV);
+    alpha_ps = device->createShader(g_native_alpha_ps, sizeof(g_native_alpha_ps), "PSAlpha", RenderShaderFormat::SPIRV);
     resolve_ps = device->createShader(g_native_resolve_ps, sizeof(g_native_resolve_ps), "PSResolve",
                                       RenderShaderFormat::SPIRV);
     depth_pack_ps = device->createShader(g_native_depth_pack_ps, sizeof(g_native_depth_pack_ps), "PSDepthPack",
@@ -1238,6 +1311,7 @@ struct Backend::Impl {
     }
     uint64_t key = Hash(words, 24);
     auto& t = textures[key];
+    t.used_frame = frame;
     tprof.lookups++;
     if (t.failed) return dim == 2 ? kNull3D : kNull2D;
     // Guest memory changes under a cached texture, and the emulator's write watches see every
@@ -1452,10 +1526,10 @@ struct Backend::Impl {
 
   uint64_t PipelineKey(const DrawCommand& d, const vertex_layout::HostLayout& vl, RenderTarget* const color[4],
                        uint32_t count, RenderTarget* depth, const uint8_t* r, RenderPrimitiveTopology topology,
-                       uint32_t spec) {
+                       uint32_t spec, uint32_t diag) {
     struct {
       uint64_t vs, ps;
-      uint32_t topology, count, spec, msaa;
+      uint32_t topology, count, spec, msaa, diag;
       uint32_t formats[5];
       uint32_t depthcontrol, blend[4], mask, stencil[2], mode, alpha_to_mask;
     } k{};
@@ -1464,6 +1538,7 @@ struct Backend::Impl {
     k.topology = uint32_t(topology) | d.primitive << 8;
     k.count = count;
     k.spec = spec;
+    k.diag = diag;
     k.msaa = regs::Surface(r).msaa;
     for (uint32_t i = 0; i < count; i++) k.formats[i] = uint32_t(color[i]->format);
     k.formats[4] = depth ? uint32_t(depth->format) : 0;
@@ -1486,7 +1561,7 @@ struct Backend::Impl {
 
   RenderPipeline* Pipeline(uint64_t key, RenderShader* vs, RenderShader* ps, const vertex_layout::HostLayout& vl,
                            RenderTarget* const color[4], uint32_t count, RenderTarget* depth, const uint8_t* r,
-                           RenderPrimitiveTopology topology, uint32_t spec, bool rect_list) {
+                           RenderPrimitiveTopology topology, uint32_t spec, bool rect_list, uint32_t diag) {
     auto it = pipelines.find(key);
     if (it != pipelines.end()) return it->second.get();
     if (auto p = pending_pipelines.find(key); p != pending_pipelines.end()) {
@@ -1509,6 +1584,7 @@ struct Backend::Impl {
                         !(no_depth_shadow && count && color[0]->format == RenderFormat::R16G16_SNORM);
     desc.depthWriteEnabled = depth && (dc & 4);
     desc.depthFunction = Compare((dc >> 4) & 7);
+    if (diag == kDiagDepthAlways || diag == kDiagFlatDepthAlways) desc.depthFunction = RenderComparisonFunction::ALWAYS;
     desc.depthClipEnabled = true;
     // GTAV_NATIVE_NO_STENCIL=1: bring-up diagnostic that ignores the stencil test.
     static const bool no_stencil = std::getenv("GTAV_NATIVE_NO_STENCIL") != nullptr;
@@ -1536,6 +1612,7 @@ struct Backend::Impl {
                     : cull_front            ? RenderCullMode::FRONT
                     : cull_back             ? RenderCullMode::BACK
                                             : RenderCullMode::NONE;
+    if (diag == kDiagNoCull) desc.cullMode = RenderCullMode::NONE;
     desc.frontFace = (mode & 4) ? RenderFrontFace::CLOCKWISE : RenderFrontFace::COUNTER_CLOCKWISE;
     desc.multisampling = RenderMultisampling(SampleCount(regs::Surface(r).msaa));
     // RB_COLORCONTROL.alpha_to_mask_enable: coverage from oC0.w (GTA's tree LOD billboards and
@@ -1565,6 +1642,13 @@ struct Backend::Impl {
                           bd.blendOp == RenderBlendOperation::ADD && bd.srcBlendAlpha == RenderBlend::ONE &&
                           bd.dstBlendAlpha == RenderBlend::ZERO && bd.blendOpAlpha == RenderBlendOperation::ADD);
       bd.renderTargetWriteMask = uint8_t((mask >> (4 * i)) & 0xF);
+      if (diag == kDiagFlat || diag == kDiagFlatDepthAlways) {
+        // Magenta into RT0's colour only (also from the alpha-only leaf pass); RT0 alpha and the other
+        // G-buffer targets keep what is behind (the lighting pass reads RT0 alpha: writing it turned
+        // the magenta black).
+        bd.blendEnabled = false;
+        bd.renderTargetWriteMask = i == 0 ? 0x7 : 0;
+      }
     }
     desc.depthTargetFormat = depth ? depth->format : RenderFormat::UNKNOWN;
 
@@ -1603,6 +1687,12 @@ struct Backend::Impl {
     }
     auto pipeline = device->createGraphicsPipeline(desc);
     return (pipelines[key] = std::move(pipeline)).get();
+  }
+
+  void NoteLost(uint32_t& counter, const char* what, const DrawCommand& d, const uint8_t* r) {
+    if (!counter++ && lost_first.empty())
+      lost_first = fmt::format("{} (vs {:016X} ps {:016X}, rt0 {:03X}, {} indices)", what, d.vs_hash, d.ps_hash,
+                               regs::Color(r, 0).base, d.count);
   }
 
   // Where a frame's recording time goes, logged every 300 frames ("[native] record ms per frame").
@@ -1708,8 +1798,10 @@ struct Backend::Impl {
     RenderShader* ps = Shader(d.ps_hash, true);
     if (!vs || d.count == 0 || d.element_count == 0) {
       stat_skipped++;
+      if (!vs && d.count && d.element_count) NoteLost(lost_vs, "vs", d, r);
       return;
     }
+    if (!ps && d.ps_hash) NoteLost(lost_ps, "ps", d, r);
     RenderTopologyInfo topo = Topology(d.primitive);
     if (topo.skip) {
       stat_skipped++;
@@ -2030,10 +2122,14 @@ struct Backend::Impl {
     slots[slot_count++] = RenderInputSlot(kDummyStream, 0);
     prof.Mark(prof.streams);
 
-    uint64_t pkey = PipelineKey(d, vl, color, count, depth, r, topo.topology, spec);
-    RenderPipeline* pipeline = Pipeline(pkey, vs, ps, vl, color, count, depth, r, topo.topology, spec, d.primitive == 8);
+    uint32_t diag = count ? DiagFor(d.vs_hash, d.ps_hash) : kDiagOff;
+    if (diag == kDiagFlat || diag == kDiagFlatDepthAlways) ps = diag_flat_ps.get();
+    uint64_t pkey = PipelineKey(d, vl, color, count, depth, r, topo.topology, spec, diag);
+    RenderPipeline* pipeline =
+        Pipeline(pkey, vs, ps, vl, color, count, depth, r, topo.topology, spec, d.primitive == 8, diag);
     if (!pipeline) {
       stat_skipped++;
+      NoteLost(lost_pipeline, "pipeline", d, r);
       return;
     }
     prof.Mark(prof.pipe);
@@ -2264,12 +2360,15 @@ struct Backend::Impl {
     prof.Mark(prof.submit);
     // Dump frame: the scene's HDR target (EDRAM base --gtav_native_dump_rt, default 2D0) after
     // every draw into it, to find the draw that introduces an artifact (dump index in commands.txt).
-    if (dumping && count && per_draw_budget > 0 &&
-        regs::Color(r, 0).base == uint32_t(REXCVAR_GET(gtav_native_dump_rt)) &&
+    // The watched surface may be any of the draw's targets (G-buffer RT2 at 600, for instance).
+    int dump_slot = -1;
+    for (uint32_t i = 0; dumping && i < count && dump_slot < 0; i++)
+      if (regs::Color(r, int(i)).base == uint32_t(REXCVAR_GET(gtav_native_dump_rt))) dump_slot = int(i);
+    if (dumping && dump_slot >= 0 && per_draw_budget > 0 &&
         ++rt_draws_seen > uint32_t(std::max(0, REXCVAR_GET(gtav_native_dump_rt_skip)))) {
       per_draw_budget--;
-      dump_log += fmt::format("  -> snapshot {} after this draw\n", dump_infos.size());
-      DumpTarget(list, color[0], 0x100 + per_draw_budget);
+      dump_log += fmt::format("  -> snapshot {} after this draw (target {})\n", dump_infos.size(), dump_slot);
+      DumpTarget(list, color[dump_slot], 0x100 + per_draw_budget);
     }
     // Dump frame: snapshot 16_16 (shadow) targets after their first draws.
     if (dumping && count && color[0]->format == RenderFormat::R16G16_SNORM && snapshot_budget > 0) {
@@ -2342,7 +2441,27 @@ struct Backend::Impl {
         list->clearColor(0, col);
       }
     }
+    // G-buffer RT2 (600) leftover alpha: the G-buffer clear (target 0 at 180) leaves RT2 alone, and
+    // where no G-buffer draw lands (sky) the Xbox keeps alpha 1 there (the emulator's resolve of
+    // RT2 to 06AA0000 has it; natively the top tile kept 0). That alpha is a flag the screen-space
+    // shadow pass multiplies into and the 80x45 tile classification of the tiled lighting reads
+    // (blocky shadows). GTAV_NATIVE_GBUF_ALPHA1=<hex EDRAM bases> (default 600; "none" disables):
+    // those targets get (0,0,0,1) at the G-buffer clear.
+    static const std::string alpha1 = std::getenv("GTAV_NATIVE_GBUF_ALPHA1") ? std::getenv("GTAV_NATIVE_GBUF_ALPHA1") : "600";
+    if ((c.flags & 1) && regs::Color(r, 0).base == 0x180 && alpha1 != "none") {
+      for (auto& [key, t] : this->targets) {
+        if (t.depth || !t.texture || ((key >> 17) & 0x3FFF) != surface.pitch || (key >> 31) != surface.msaa ||
+            ((key >> 12) & 0xF) != 0 || ("," + alpha1 + ",").find(fmt::format(",{:X},", key & 0xFFF)) == std::string::npos)
+          continue;
+        RenderTarget* rt = &t;
+        BindTargets(list, &rt, 1, nullptr);
+        list->clearColor(0, RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
+        if (rt3_alpha_logged++ < 3)
+          REXLOG_INFO("[native] G-buffer clear: target {:03X} cleared to alpha 1", uint32_t(key & 0xFFF));
+      }
+    }
   }
+  uint32_t rt3_alpha_logged = 0;
 
   // The depth resolve as the raw D24S8 word (see PSDepthPack), a second variant at the same
   // address for guests that fetch it through an 8888 view (GTA V's SSAO reads the stencil so).
@@ -2745,8 +2864,11 @@ struct Backend::Impl {
       // exactly on its 16_16 resolves, the same /32 the fixed-16 rule above already applies;
       // applying both zeroed SSAO in the emulator comparison.
       bool encode_7e3 = !depth_resolve && IsFixed10(uint32_t(regs::Color(r, int(source)).format)) && src->float_data;
-      int32_t push[6] = {int32_t(src_descriptor), 0, int32_t(x1) - int32_t(px), int32_t(y1) - int32_t(py), 0,
-                         encode_7e3 ? 1 : 0};
+      // GTAV_NATIVE_DEPTH_FLOAT24=0 turns off the 20e4 rounding of float24 depth copies (PSDepth).
+      static const bool float24_round = !std::getenv("GTAV_NATIVE_DEPTH_FLOAT24") ||
+                                        std::string(std::getenv("GTAV_NATIVE_DEPTH_FLOAT24")) != "0";
+      int32_t mode = depth_resolve ? (float24_round && regs::Depth(r).float24 ? 2 : 0) : (encode_7e3 ? 1 : 0);
+      int32_t push[6] = {int32_t(src_descriptor), 0, int32_t(x1) - int32_t(px), int32_t(y1) - int32_t(py), 0, mode};
       std::memcpy(&push[4], &scale, 4);
       list->setGraphicsPushConstants(0, push, 0, sizeof(push));
       list->drawInstanced(3, 1, 0, 0);
@@ -2840,6 +2962,7 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   s.last_vs.valid = s.last_ps.valid = false;  // upload memory is per frame
   s.fetch_cache.valid = false;
   s.slot_generation++;
+  s.EvictTextures();
   s.InvalidateDrawState();
   s.prof = {};
   int32_t dump_at = REXCVAR_GET(gtav_native_dump_frame);
@@ -2895,6 +3018,11 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
       s.prof_frames = 0;
     }
   }
+  if (s.lost_pipeline || s.lost_vs || s.lost_ps)
+    REXLOG_INFO("[native] frame {} lost draws: {} pipelines compiling, {} vertex / {} pixel shaders not ready; first: {}",
+                f.index, s.lost_pipeline, s.lost_vs, s.lost_ps, s.lost_first);
+  s.lost_pipeline = s.lost_vs = s.lost_ps = 0;
+  s.lost_first.clear();
   if (f.index % 150 == 0)
     REXLOG_INFO("[native] replay frame {}: {} drawn, {} skipped, {} new pipelines ({} total), {} texture uploads, "
                 "{} targets, {} resolve targets, descriptors {} used / {} free, {} textures cached",
@@ -2951,7 +3079,8 @@ void Backend::FrameComplete(uint32_t slot) {
   }
   p.upload.Reset();
   auto& pending = p.pending_free_descriptors;
-  impl_->free_descriptors.insert(impl_->free_descriptors.end(), pending.begin(), pending.end());
+  for (uint32_t d : pending)
+    if (d >= kFirstTextureDescriptor) impl_->free_descriptors.push_back(d);
   pending.clear();
   // Views and framebuffers reference their textures: release them first.
   p.dead_framebuffers.clear();
@@ -3126,6 +3255,14 @@ void Backend::WriteDump() {
   }
   s.dump_readback->unmap();
   REXLOG_INFO("[native] dumped {} resolves of frame {} to {}", s.dump_infos.size(), s.dump_frame, dir);
+}
+
+void CycleDiagMode() { SetDiagMode(g_diag_mode.load() + 1); }
+
+void SetDiagMode(uint32_t mode) {
+  mode %= kDiagModes;
+  g_diag_mode.store(mode);
+  REXLOG_INFO("[native] tree diagnostic mode {} ({})", mode, kDiagNames[mode]);
 }
 
 }  // namespace gtav::native

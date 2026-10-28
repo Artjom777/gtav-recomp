@@ -118,8 +118,16 @@ add_custom_command(
     COMMAND ${GTAV_DXC}
             -T ps_6_0 -E PSDigits -spirv -fspv-target-env=vulkan1.1 -Vn g_native_digits_ps
             -Fh ${GTAV_NATIVE_SHADER_DIR}/native_digits_ps.h ${GTAV_BLIT_HLSL}
+    COMMAND ${GTAV_DXC}
+            -T ps_6_0 -E PSAlpha -spirv -fspv-target-env=vulkan1.1 -Vn g_native_alpha_ps
+            -Fh ${GTAV_NATIVE_SHADER_DIR}/native_alpha_ps.h ${GTAV_BLIT_HLSL}
+    COMMAND ${GTAV_DXC}
+            -T ps_6_0 -E PSDiagFlat -spirv -fspv-target-env=vulkan1.1 -Vn g_native_diag_flat_ps
+            -Fh ${GTAV_NATIVE_SHADER_DIR}/native_diag_flat_ps.h ${GTAV_BLIT_HLSL}
     COMMAND ${CMAKE_COMMAND} -E echo "#pragma once" > ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h
     COMMAND ${CMAKE_COMMAND} -E echo "#include \"native_digits_ps.h\"" >> ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h
+    COMMAND ${CMAKE_COMMAND} -E echo "#include \"native_diag_flat_ps.h\"" >> ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h
+    COMMAND ${CMAKE_COMMAND} -E echo "#include \"native_alpha_ps.h\"" >> ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h
     COMMAND ${CMAKE_COMMAND} -E echo "#include \"native_resolve_memory_cs.h\"" >> ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h
     COMMAND ${CMAKE_COMMAND} -E echo "#include \"native_rectlist_gs.h\"" >> ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h
     COMMAND ${CMAKE_COMMAND} -E echo "#include \"native_depth_ps.h\"" >> ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h

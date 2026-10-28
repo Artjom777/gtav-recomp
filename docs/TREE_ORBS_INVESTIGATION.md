@@ -60,3 +60,58 @@ makes no difference.
 - Unattended runs: `--gtav_native_hidden=true --audio_mute=true`, `touch build/gtav/logs/dump_request`.
   Spawn point (Vespucci beach) has no LOD trees; orbs need the owner to drive.
 - "[native] draw data rewritten after capture" stats every 300 frames.
+
+## 2026-10-27 late: stage-isolation switch (plan ~/.claude/plans/zippy-scribbling-otter.md)
+- F11 (or `echo N > build/gtav/logs/diag_mode`) cycles a diagnostic mode on the picked draws:
+  0 off, 1 depth_always, 2 no_cull, 3 flat (magenta RT0 rgb, no textures/kill, keeps depth),
+  4 flat+depth_always. Selection: `GTAV_NATIVE_DIAG_PS` / `GTAV_NATIVE_DIAG_VS=hash,hash`
+  (default VS 49CD0CC3ED116BB1). Mode changes are logged as "[native] tree diagnostic mode".
+- Read: flat+depth_always full canopy but flat sparse -> depth; flat full but normal sparse -> PS;
+  flat+depth_always sparse -> geometry; no_cull fixes it -> winding.
+- First hidden run (logs/shots_diag, the idle camera moved between modes, so no same-spot A/B):
+  all modes work without errors; an orb was visible in mode off. VS 49CD0CC3 is also used by
+  buildings, so the default selection is broad. The first build wrote RT0 alpha, and the lighting
+  turned the magenta black; flat now writes RT0 rgb only.
+- Facts behind the plan: tree colour passes are dc=00708767 (GEQUAL, write); the D0B9D6DC alpha
+  pass comes after them (GREATER, no write). Host depth is always D32F_S8, and the VS position
+  isn't `precise`.
+
+## 2026-10-27 night: the orb is a tree whose wind-animated leaves collapse to a point
+- Owner F11 run (logs/orbs_f11.log, shots 7137-7310): orbs unchanged in all modes with the
+  default VS 49CD0CC3 selection -> the orb/leaves are not 49CD0CC3 draws.
+- Per-draw G-buffer RT0 dump (frame_3288): the orb pixels are written by VS 9B97485ECA9FB310 /
+  PS 2E65367EB25FB139 (n=2487, canopy hull, no cutout; solid on Xbox too, normally inside the leaves).
+- GTAV_NATIVE_DIAG_VS=ALL x-ray dumps (frame_60472 depth_always, frame_60675 flat): healthy trees'
+  leaves are VS B870B2FE / PS 1884ED2D. The orb tree's leaf draw (same world matrix as the hull,
+  found by gWorld translation in draws.bin) is VS AF15EF63BB4B093F / PS 6A8524D9: **0 pixels in every
+  mode**, including depth_always + flat PS -> its vertices are degenerate.
+- VS AF15EF63 = wind/micro-movement tree VS: position *= _globalEntityScale (c232).wzz. In the bad
+  frames c232 = (0.4, 0.4, 0, 0) for EVERY AF15EF63 draw -> all vertices collapse onto gWorld(3).
+  In good frames c232 holds per-tree scales (1.0, 0.853/1.172, ...). Across all dumps the frames are
+  bimodal, and both kinds occur in one run (exact.log 39680 good / 40610 bad), so it is not shadow
+  vs on. Command buffers: none ran in these sessions (not that path).
+- Next: find the path that writes c232 for these draws on the GPU but bypasses the D3D shadow +
+  inline (83813580) capture. --gtav_native_pm4_scan=true logs ALU constant writes in the PM4
+  stream between draws (SET_CONSTANT / LOAD_ALU_CONSTANT / type0 / SET_CONSTANT2, one IB level) and
+  per AF15EF63 draw: captured c232 vs the last ring write to it.
+
+## ROOT CAUSE (2026-10-27 night): XenosRecomp ignored conditional exec (cexec bN / cexec p0)
+- Shadow-mode capture triggered by --gtav_native_dump_on_collapse (120 frames of collapsed leaf
+  draws): native frame 7046 vs emulator 7040-7047, leaf draws n=966 / n=1092 (VS AF15EF63):
+  the EMULATOR HAS THE SAME c232 = (0.4, 0.4, 0, 0) (tools/native/compare_leaf_scale.py).
+- Microcode (build/ucode_disasm): every c232 use is in `cexec b0` blocks (b0 = bPlayerCollEnabled,
+  player-collision displacement + entity scale); with b0 off the GPU skips them and the leaf keeps its
+  unscaled position, so the game leaves c232 unset. XenosRecomp emitted CondExec / CondExecEnd /
+  CondExecPred* instructions unconditionally (only CondJmp got an if), so the leaves were scaled by
+  the stale zeros and collapsed; the canopy hull showed through as the orb. Bimodal per frame =
+  whether the player-collision bool is on.
+- Fix: shader_recompiler.cpp wraps conditional execs in `if ((g_Booleans & bN) ==/!= 0)` /
+  `if ([!]p0)` and closes before the End-variant return (also fixed shouldReturn missing
+  CondExecPredCleanEnd). All shaders regenerated into derive/native/census5 (affects every shader
+  with conditional execs, not just trees).
+- Verified unattended (logs/collapse_verify.log, dump frame_25280, "on" mode, census5 SPIR-V
+  installed in build/gtav/spirv; old set in build/gtav/spirv_pre_cexec): in a frame with c232 =
+  (0.4,0.4,0,0) for 120 frames, AF15EF63 leaf draws now paint pixels (48 / 121 / 0 occluded) and a
+  previously bare trunk gets its full canopy. Before the fix such draws covered 0 pixels in every mode.
+  Owner road test pending. Diagnostics left in (all off by default): F11 modes,
+  --gtav_native_pm4_scan, --gtav_native_dump_on_collapse.

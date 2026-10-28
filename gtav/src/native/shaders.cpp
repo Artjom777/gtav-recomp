@@ -38,6 +38,7 @@ uint32_t be32(const uint8_t* p) { return uint32_t(p[0]) << 24 | p[1] << 16 | p[2
 std::mutex g_mutex;
 std::unordered_map<uint32_t, uint64_t> g_object_hash;  // guest shader object -> container hash
 std::unordered_map<uint32_t, uint64_t> g_object_ucode_hash;  // -> microcode hash (Xenia's key)
+std::unordered_map<uint64_t, uint64_t> g_ucode_container;  // microcode hash -> container hash
 std::atomic<uint32_t> g_created{0}, g_dumped{0};
 
 void OnCreate(const uint8_t* base, uint32_t container, uint32_t object, bool pixel) {
@@ -55,6 +56,7 @@ void OnCreate(const uint8_t* base, uint32_t container, uint32_t object, bool pix
     std::lock_guard lock(g_mutex);
     g_object_hash[object] = hash;
     g_object_ucode_hash[object] = ucode_hash;
+    g_ucode_container[ucode_hash] = hash;
   }
   OnShaderCreated(c, size, hash, pixel);
   uint32_t created = g_created.fetch_add(1, std::memory_order_relaxed);
@@ -100,6 +102,12 @@ uint64_t ShaderUcodeHash(uint32_t guest_object) {
   std::lock_guard lock(g_mutex);
   auto it = g_object_ucode_hash.find(guest_object);
   return it == g_object_ucode_hash.end() ? 0 : it->second;
+}
+
+uint64_t ContainerForUcode(uint64_t ucode_hash) {
+  std::lock_guard lock(g_mutex);
+  auto it = g_ucode_container.find(ucode_hash);
+  return it == g_ucode_container.end() ? 0 : it->second;
 }
 
 }  // namespace gtav::native

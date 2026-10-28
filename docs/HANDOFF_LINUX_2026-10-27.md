@@ -157,3 +157,55 @@ Plane frames `frame_77408` / `frame_80983` show the older bright "wedges" over d
 - `play.cmd` currently passes `--gtav_audio_unsync=false` (~62 fps cap). It was an experiment for
   the bursts and didn't fix them; restore uncapped by removing the flag.
 - Another session ran `Skate.exe` overnight; don't run GTA beside a game someone else started.
+
+## 10-27 night (Linux): blocky shadows/reflections traced (not fixed yet)
+Dumps: frame_24735 / frame_25552 (owner, "on"), frame_7046 + logs/emu_dump/frame_7040-7047 (shadow pair).
+- The blocks are 16x16 tiles: the tiled lighting pass draws 8 variants (rect lists, 10800 idx =
+  80x45 tiles) and VS E43FC991.. picks a tile by its 80x45 tile data (058C7000, read via
+  vfetchIndirect from ResolvedMemory, so the data is this frame's): `r1.y > 0.05` and
+  `tiledPenumbraOffsetValue > r1.z` with r1.yz = tile.zw.
+- tile.w (and every level of its 640x360 -> 80x45 chain, 065A2000) is the ONLY channel that
+  differs from the emulator (tools/native/compare_raw.py; depth formats 22/23 now decoded).
+- Producer chain of w: PS D258EBE3 (640x360) takes max of 06AA0000 (resolve #40) .w; #40's
+  alpha = PS 487A191F (plain copy of 06AA0000 resolve #28) x shadow pass PS 5416149F (alpha only,
+  blend dst*src.a; its inputs - cascades 0526F000, 1D lookup 0526C000, depth - all match).
+- So resolve #28's alpha (surface 0x480 = G-buffer RT3 + RT2's bottom tile via the tile alias)
+  differs: sky alpha 0 natively vs 1 in the emulator (nothing draws the sky; the Xbox value is
+  whatever EDRAM held there), lit ground 1.0 vs 0.8.
+- Root cause class: EDRAM aliasing. Native targets are separate textures per base/format/pitch;
+  only TileAlias copies one case. Fix direction: model EDRAM ownership like Xenia's render
+  target cache (when a target is bound, copy in the overlapping ranges last written through
+  other targets/clears), or find the specific producer of 0x480's leftover alpha.
+- 10-27 late: RT3-alpha experiment (GTAV_NATIVE_GBUF_RT3_ALPHA=1, backend Clear) did NOT remove the
+  tile blocks (owner shots native_015104/015301): the sky alpha is not the main cause.
+
+## Streaky terrain/road textures (owner, countryside road; dumps frame_15104/15301/15302)
+- Already in the G-buffer (normals RT 026_05E72000 shows the horizontal smears), so G-buffer
+  drawing, not lighting. Terrain = VS 6E5A219F / PS A497EF58 (182 draws). The cexec fix only
+  added a redundant `if (p0)` around its parallax loop (identical semantics) -> not a regression
+  from census5 as far as the HLSL shows. Suspect: the parallax-occlusion loop (i31 = 8 literal,
+  r0.xy += r4.xy steps by parallaxScaleBias; height from s3.w) or the inputs it uses.
+- Next: per-draw RT0/RT1 snapshots at a streak spot (--gtav_native_dump_rt=384), pick a terrain
+  draw, and A/B with the parallax step forced off (e.g. GTAV_NATIVE_SKIP_PS on that PS variant, or
+  a diag that zeros parallaxScaleBias).
+
+## 10-27 late night: blocky shadows - two fixes in (backend.cpp / native_blit.hlsl)
+1. G-buffer RT2 (EDRAM 600) leftover alpha: RT2 alpha is a 0/1 flag the screen-space shadow pass
+   multiplies into (06AA0000) and the 80x45 tile classification reads. Where nothing draws (sky)
+   the Xbox has 1, natively 0 -> wrong tile variants. Clear() now sets RT2 to (0,0,0,1) at the
+   G-buffer clear (GTAV_NATIVE_GBUF_ALPHA1=<hex bases>, default 600, "none" disables).
+2. Float24 depth: the Xbox stores D24FS8 depth as 20e4 (truncated); GTA's shadow bias is tuned to
+   it. Depth copies of float24 surfaces (PSDepth, mode 2) now round to 20e4
+   (GTAV_NATIVE_DEPTH_FLOAT24=0 disables). Debug shader variants of ps 5416149F showed the PCF term
+   (not lookup/fade) was 0 on facades the emulator lit.
+- Tile channel w vs emulator (80x45): 40% off -> 8% (frame_7238/emu 7239); mid/bottom exact,
+  top band still 1.04 (leftover EDRAM content of other surfaces; full EDRAM model needed).
+
+## Audio: 16 kHz whine = one broken phase of the game's 32->48 kHz resampler
+- --xma_dump_raw (new SDK cvar): decoded XMA streams are 24/32/44.1/48 kHz and clean.
+- Final mix (audio_dump_raw): the 15.8-16.2 kHz band carries as much energy as 200-8000 Hz;
+  second-difference residual by sample phase mod 3 = 1.995e-2 / 1.29e-2 / 1.14e-2 (mod 2 and 4
+  flat) -> a period-3 error = one of the three 2:3 output phases computed wrong (sidebands 16k +- f).
+  The resampler is guest code (recompiled VMX); next: find it from audio-thread stacks
+  (hangdump.sh) and check its generated code. Also done: vmaxfp/vminfp now return NaN like
+  AltiVec (codegen; did not remove the whine).
