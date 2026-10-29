@@ -13,6 +13,8 @@
 #include <iterator>
 #include <memory>
 #include <mutex>
+#include <thread>
+#include <vector>
 
 #ifdef __linux__
 #include <fcntl.h>
@@ -42,7 +44,8 @@ bool Interesting(uint32_t p) { return (g_interest[p >> 6] >> (p & 63)) & 1; }
 std::atomic<uint64_t> g_epoch{1};
 std::once_flag g_init;
 bool g_ready = false;
-uint64_t g_harvests = 0, g_pages = 0, g_found = 0;
+uint64_t g_harvests = 0, g_found = 0;
+std::atomic<uint64_t> g_pages{0};
 double g_ms = 0;
 
 void Mark(uint32_t physical, uint64_t bytes, uint64_t epoch) {
@@ -128,7 +131,7 @@ void Init() {
 // Harvest (`protect`): marks the pages of [start, end) of a view written since the last harvest
 // with `epoch` and protects them again in the same call. Otherwise only counts them (Pending).
 bool ScanView(const View& v, uint64_t start, uint64_t end, bool protect, uint64_t epoch) {
-  static page_region regions[4096];
+  thread_local page_region regions[4096];
   auto* mem = REX_KERNEL_MEMORY();
   while (start < end) {
     pm_scan_arg a{};
@@ -181,7 +184,7 @@ namespace {
 // from are marked and protected again, each run in one call (PAGEMAP_SCAN reports what it
 // protects, so a write landing between the two scans is marked too).
 bool HarvestSpan(const View& v, uint64_t start, uint64_t end, uint64_t epoch) {
-  static page_region regions[4096];
+  thread_local page_region regions[4096];
   uint32_t view_physical = v.physical;
   uint64_t base = reinterpret_cast<uintptr_t>(v.host);
   while (start < end) {
@@ -197,7 +200,7 @@ bool HarvestSpan(const View& v, uint64_t start, uint64_t end, uint64_t epoch) {
     if (n < 0) return false;
     uint64_t walk_end = a.walk_end;
     // Copy the regions out: ScanView below reuses its own buffer.
-    static page_region found[4096];
+    thread_local page_region found[4096];
     std::copy(regions, regions + n, found);
     for (long i = 0; i < n; i++) {
       uint32_t first = uint32_t(view_physical + ((found[i].start - base) >> 0)) >> kPageShift;
@@ -251,19 +254,58 @@ bool HarvestView(const View& v, uint64_t epoch) {
 }  // namespace
 #endif
 
+#ifdef __linux__
+namespace {
+void HarvestOne(uint32_t i, uint64_t epoch) {
+  const View& v = g_views[i];
+  if (!HarvestView(v, epoch)) {  // unknown: everything counts as written
+    static std::atomic<int> logged{0};
+    if (logged++ < 5) REXLOG_INFO("[native] write watch: PAGEMAP_SCAN failed ({})", std::strerror(errno));
+    Mark(v.physical, v.size, epoch);
+  }
+}
+
+// The views are scanned in parallel (~1.2 ms a frame on the render thread alone): one helper
+// thread per view after the first, which the render thread scans itself.
+struct HarvestHelpers {
+  std::atomic<uint32_t> generation{0}, done{0};
+  std::atomic<uint64_t> epoch{0};
+  std::vector<std::thread> threads;
+  void Start() {
+    for (uint32_t i = 1; i < g_view_count; i++)
+      threads.emplace_back([this, i] {
+        uint32_t seen = 0;
+        for (;;) {
+          generation.wait(seen, std::memory_order_acquire);
+          seen = generation.load(std::memory_order_acquire);
+          HarvestOne(i, epoch.load(std::memory_order_acquire));
+          done.fetch_add(1, std::memory_order_acq_rel);
+          done.notify_all();
+        }
+      });
+    for (auto& t : threads) t.detach();
+  }
+  void Run(uint64_t e) {
+    done.store(0, std::memory_order_release);
+    epoch.store(e, std::memory_order_release);
+    generation.fetch_add(1, std::memory_order_acq_rel);
+    generation.notify_all();
+    HarvestOne(0, e);
+    for (uint32_t d; (d = done.load(std::memory_order_acquire)) < threads.size();) done.wait(d);
+  }
+};
+HarvestHelpers g_helpers;
+std::once_flag g_helpers_started;
+}  // namespace
+#endif
+
 void Harvest() {
   if (!Enabled()) return;
 #ifdef __linux__
   auto start = std::chrono::steady_clock::now();
   uint64_t epoch = g_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
-  for (uint32_t i = 0; i < g_view_count; i++) {
-    const View& v = g_views[i];
-    if (!HarvestView(v, epoch)) {  // unknown: everything counts as written
-      static int logged = 0;
-      if (logged++ < 5) REXLOG_INFO("[native] write watch: PAGEMAP_SCAN failed ({})", std::strerror(errno));
-      Mark(v.physical, v.size, epoch);
-    }
-  }
+  std::call_once(g_helpers_started, [] { g_helpers.Start(); });
+  g_helpers.Run(epoch);
   g_harvests++;
   g_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 #endif
@@ -344,8 +386,8 @@ void Touch(uint32_t physical, uint32_t size) {
 }
 
 Stats TakeStats() {
-  Stats s{g_harvests, g_pages, g_ms};
-  g_harvests = g_pages = 0;
+  Stats s{g_harvests, g_pages.exchange(0), g_ms};
+  g_harvests = 0;
   g_ms = 0;
   return s;
 }
