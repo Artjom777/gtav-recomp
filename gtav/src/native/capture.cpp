@@ -631,6 +631,8 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
   const ConstantUse& ps_use = pixel_shader ? ShaderConstants(pixel_shader) : kNoConstants;
   d.vs_const_count = uint16_t(vs_use.count);
   d.ps_const_count = uint16_t(ps_use.count);
+  d.vs_use = &vs_use;
+  d.ps_use = &ps_use;
   d.vs_consts = push_constants(0, dev + d3d::kDevVsConstants, vs_use, prev ? &prev->vs_consts : nullptr);
   d.ps_consts = push_constants(1, dev + d3d::kDevPsConstants, ps_use, prev ? &prev->ps_consts : nullptr);
   // --gtav_native_dump_on_collapse: wind-animated tree leaf draws (VS AF15EF63) whose

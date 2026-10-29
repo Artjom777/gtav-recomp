@@ -39,6 +39,15 @@ struct ThreadTable {
   std::string name;
   std::unordered_map<uint64_t, Site> sites;  // wrapper << 32 | caller
 };
+// Semaphores (--gtav_wait_profile): ms waited per (handle, waiting thread) and releases per
+// (handle, releasing thread, caller), to see who wakes whom.
+struct HandleStats {
+  std::unordered_map<std::string, double> waited_ms;
+  std::unordered_map<std::string, uint64_t> releases;
+};
+std::mutex g_handles_mutex;
+std::unordered_map<uint32_t, HandleStats> g_handles;
+
 std::mutex g_tables_mutex;
 std::vector<std::shared_ptr<ThreadTable>> g_tables;
 Clock::time_point g_window_start = Clock::now();
@@ -91,6 +100,22 @@ void Report() {
                           sites[i].second.ms / (window * 10), sites[i].second.count);
     REXLOG_INFO("[waits] {} ({}) waits {:.1f}% of the time{}", t->name, t->tid, total / (window * 10), line);
   }
+  std::unordered_map<uint32_t, HandleStats> handles;
+  {
+    std::lock_guard lock(g_handles_mutex);
+    handles.swap(g_handles);
+  }
+  for (auto& [handle, h] : handles) {
+    double total = 0;
+    std::string waiters, releasers;
+    for (auto& [name, ms] : h.waited_ms) {
+      total += ms;
+      if (ms > window * 1000 * 0.05) waiters += fmt::format(" {} {:.1f}%", name, ms / (window * 10));
+    }
+    if (waiters.empty()) continue;
+    for (auto& [name, n] : h.releases) releasers += fmt::format(" | {} x{}", name, n);
+    REXLOG_INFO("[waits] semaphore {:08X} waited by{}; released by{}", handle, waiters, releasers);
+  }
 }
 
 uint32_t Be32(const uint8_t* base, uint32_t address) {
@@ -136,6 +161,30 @@ void WaitProfileTimed(uint32_t wrapper, PPCContext& ctx, uint8_t* base, void (*c
   Timed(wrapper, ctx, base, [&] { call(ctx, base); });
 }
 }  // namespace gtav
+
+// RAGE's semaphore helpers: wait (r3 handle, r4 count) and release (r3 handle, r4 count).
+REX_EXTERN(__imp__sub_83216200);
+REX_HOOK_RAW(sub_83216200) {
+  if (!REXCVAR_GET(gtav_wait_profile)) return __imp__sub_83216200(ctx, base);
+  uint32_t handle = ctx.r3.u32;
+  auto start = Clock::now();
+  __imp__sub_83216200(ctx, base);
+  double ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+  auto& t = Table();
+  std::lock_guard lock(g_handles_mutex);
+  g_handles[handle].waited_ms[t.name] += ms;
+}
+
+REX_EXTERN(__imp__sub_83216298);
+REX_HOOK_RAW(sub_83216298) {
+  if (REXCVAR_GET(gtav_wait_profile)) {
+    auto& t = Table();
+    std::string key = fmt::format("{} from {:08X}", t.name, uint32_t(ctx.lr));
+    std::lock_guard lock(g_handles_mutex);
+    g_handles[ctx.r3.u32].releases[key]++;
+  }
+  __imp__sub_83216298(ctx, base);
+}
 
 #define GTAV_WAIT_HOOK(addr)                                                  \
   REX_EXTERN(__imp__sub_##addr);                                              \

@@ -5,6 +5,7 @@
 #include "capture.h"
 #include "frame.h"
 #include "textures.h"
+#include "shaders.h"
 #include "write_watch.h"
 #include "vertex_layout.h"
 #include "xenos_regs.h"
@@ -689,7 +690,9 @@ struct Backend::Impl {
   std::unordered_map<uint64_t, CachedTexture> textures;
   std::unordered_map<uint64_t, uint32_t> samplers;  // desc hash -> descriptor index
   std::vector<std::unique_ptr<RenderSampler>> sampler_objects;
-  std::unordered_map<uint64_t, CachedBuffer> buffers;
+  std::unordered_map<uint64_t, CachedBuffer> buffers;  // never erased: entries keep their address
+  // Direct-mapped memo in front of `buffers` (~4,000 lookups a frame were 6% of the render thread).
+  std::array<std::pair<uint64_t, CachedBuffer*>, 4096> buffer_memo{};
   std::unordered_map<const RenderTexture*, RenderTextureLayout> layouts;
   // Objects replaced mid-frame stay alive until the frame's commands completed.
   std::vector<std::unique_ptr<RenderTexture>> dead_textures;
@@ -1487,7 +1490,9 @@ struct Backend::Impl {
   template <class F>
   const RenderBuffer* GuestBuffer(uint64_t key, uint32_t physical, const uint8_t* guest, uint64_t guest_size,
                                   uint64_t host_size, const F& convert) {
-    auto& b = buffers[key];
+    auto& memo = buffer_memo[(key ^ (key >> 29)) & (buffer_memo.size() - 1)];
+    if (memo.first != key || !memo.second) memo = {key, &buffers[key]};
+    auto& b = *memo.second;
     if (b.buffer && b.checked_frame == frame) return b.buffer.get();
     const bool watching = write_watch::Enabled() && !REXCVAR_GET(gtav_native_exact_cache);
     if (b.buffer && watching && b.size == host_size && b.watch.ranges[0] == physical &&
@@ -2084,25 +2089,32 @@ struct Backend::Impl {
   // The guest's ALU constants are big-endian: byte-swapped 16 bytes at a time into upload memory.
   // The capture shares a block between consecutive draws with equal constants (same offset).
   struct LastConstants {
-    uint32_t offset = 0, bytes = 0;
+    uint32_t offset = 0;
+    const ConstantUse* use = nullptr;
     UploadAllocation gpu{};
     bool valid = false;
   };
   LastConstants last_vs, last_ps;
 
-  // Only the registers the shaders read (`count`) are swapped: the rest of the block is undefined.
+  // Only the registers the shader reads (`use`, all when null) are swapped: the rest of the block
+  // is undefined.
   __attribute__((target("ssse3"))) UploadAllocation ConstantUpload(const uint8_t* src, uint32_t offset,
-                                                                   uint32_t count, LastConstants& last) {
-    uint32_t bytes = std::min<uint32_t>(count, 256) * 16;
-    if (last.valid && last.offset == offset && last.bytes >= bytes) return last.gpu;
+                                                                   const ConstantUse* use, LastConstants& last) {
+    if (last.valid && last.offset == offset && (last.use == use || !last.use)) return last.gpu;
     auto a = upload.Allocate(kAluSize);
     const __m128i swap = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
-    for (uint32_t i = 0; i < bytes; i += 16) {
-      __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i));
-      _mm_storeu_si128(reinterpret_cast<__m128i*>(a.cpu + i), _mm_shuffle_epi8(v, swap));
-    }
+    auto run = [&](uint32_t first, uint32_t count) {
+      for (uint32_t i = first * 16; i < (first + count) * 16; i += 16) {
+        __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(a.cpu + i), _mm_shuffle_epi8(v, swap));
+      }
+    };
+    if (use)
+      for (const auto& r : use->runs) run(r.first, r.count);
+    else
+      run(0, 256);
     last.offset = offset;
-    last.bytes = bytes;
+    last.use = use;
     last.gpu = a;
     last.valid = true;
     return a;
@@ -2203,8 +2215,8 @@ struct Backend::Impl {
     const uint8_t* vsrc = f.At(d.vs_consts);
     const uint8_t* psrc = f.At(d.ps_consts);
     // (Dumps read every register: they get the whole block.)
-    UploadAllocation vsc = ConstantUpload(vsrc, d.vs_consts, dumping ? 256 : d.vs_const_count, last_vs),
-                     psc = ConstantUpload(psrc, d.ps_consts, dumping ? 256 : d.ps_const_count, last_ps);
+    UploadAllocation vsc = ConstantUpload(vsrc, d.vs_consts, dumping ? nullptr : d.vs_use, last_vs),
+                     psc = ConstantUpload(psrc, d.ps_consts, dumping ? nullptr : d.ps_use, last_ps);
     // Shared constants are built here and copied into upload memory once: that memory is
     // write-combined, and reading it back (or scattering 4-byte writes) cost ~100 ms a frame.
     alignas(16) uint8_t shared_cpu[kSharedConstantsSize] = {};

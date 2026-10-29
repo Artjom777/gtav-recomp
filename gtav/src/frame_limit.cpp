@@ -24,6 +24,9 @@ REXCVAR_DEFINE_INT32(gtav_fps_limit, 30, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_audio_unsync, true, "GTAV",
                     "Above 30 fps: stop the audio update waiting for the next 16 ms audio frame "
                     "(otherwise the game cannot exceed 62.5 fps)");
+REXCVAR_DEFINE_BOOL(gtav_audio_next_pass, true, "GTAV",
+                    "Above 30 fps: the audio engine runs a game thread's sound commands at its next "
+                    "5.3 ms pass instead of three passes later (the update thread waits for that every frame)");
 
 namespace {
 
@@ -47,6 +50,20 @@ const bool g_timer_resolution = [] { return timeBeginPeriod(1) == TIMERR_NOERROR
 #endif
 
 }  // namespace
+
+// The audio engine (XAudio2 processing passes, 256 samples = 5.3 ms) keeps a command buffer per
+// game thread: sub_831B83A0(engine, stamp) marks the calling thread's buffer submitted at audio
+// pass `stamp`, and the pass handler (sub_831CD850) runs it once the pass counter reaches
+// stamp + 3, then releases that thread's semaphore. The update thread waits on it at the start
+// of every frame (sub_8248EA58 -> sub_831B83F0): 16 ms after its submission, so ~60 fps at most
+// (a quarter of the update thread's time at 14 ms frames). Stamped two passes earlier, the next
+// pass runs it.
+REX_EXTERN(__imp__sub_831B83A0);
+REX_HOOK_RAW(sub_831B83A0) {
+  if (REXCVAR_GET(gtav_fps_limit) != 30 && REXCVAR_GET(gtav_audio_next_pass) && ctx.r4.u32 >= 2)
+    ctx.r4.u64 = ctx.r4.u32 - 2;
+  __imp__sub_831B83A0(ctx, base);
+}
 
 REX_EXTERN(__imp__sub_827B5878);
 REX_HOOK_RAW(sub_827B5878) {

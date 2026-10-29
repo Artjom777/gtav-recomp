@@ -180,11 +180,10 @@ namespace {
 // Unprotected pages of a view (written, or never protected): the runs of them copies were made
 // from are marked and protected again, each run in one call (PAGEMAP_SCAN reports what it
 // protects, so a write landing between the two scans is marked too).
-bool HarvestView(const View& v, uint64_t epoch) {
+bool HarvestSpan(const View& v, uint64_t start, uint64_t end, uint64_t epoch) {
   static page_region regions[4096];
-  auto* mem = REX_KERNEL_MEMORY();
   uint32_t view_physical = v.physical;
-  uint64_t base = reinterpret_cast<uintptr_t>(v.host), start = base, end = base + v.size;
+  uint64_t base = reinterpret_cast<uintptr_t>(v.host);
   while (start < end) {
     pm_scan_arg a{};
     a.size = sizeof(a);
@@ -221,6 +220,31 @@ bool HarvestView(const View& v, uint64_t epoch) {
     }
     if (walk_end <= start) break;
     start = walk_end;
+  }
+  return true;
+}
+// Only the 2 MB blocks holding pages copies were made from are scanned (a whole view is
+// ~390,000 page table entries, ~1.5 ms a frame for all four).
+bool HarvestView(const View& v, uint64_t epoch) {
+  constexpr uint32_t kBlockPages = 512, kBlockWords = kBlockPages / 64;
+  uint64_t base = reinterpret_cast<uintptr_t>(v.host);
+  uint32_t first_block = v.physical / (kBlockPages << kPageShift);
+  uint32_t last_block = uint32_t((uint64_t(v.physical) + v.size - 1) / (kBlockPages << kPageShift));
+  auto any = [](uint32_t block) {
+    for (uint32_t w = 0; w < kBlockWords; w++)
+      if (g_interest[block * kBlockWords + w]) return true;
+    return false;
+  };
+  for (uint32_t b = first_block; b <= last_block;) {
+    if (!any(b)) {
+      b++;
+      continue;
+    }
+    uint32_t span = b;
+    while (b <= last_block && any(b)) b++;
+    uint64_t lo = std::max<uint64_t>(uint64_t(span) * kBlockPages << kPageShift, v.physical);
+    uint64_t hi = std::min<uint64_t>(uint64_t(b) * kBlockPages << kPageShift, uint64_t(v.physical) + v.size);
+    if (!HarvestSpan(v, base + (lo - v.physical), base + (hi - v.physical), epoch)) return false;
   }
   return true;
 }

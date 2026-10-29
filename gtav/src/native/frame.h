@@ -38,6 +38,8 @@ struct StreamBinding {
 
 enum class CommandKind : uint8_t { kDraw, kClear, kResolve, kQuery };
 
+struct ConstantUse;  // shaders.h
+
 struct DrawCommand {
   bool indexed = false;
   bool index32 = false;
@@ -56,6 +58,8 @@ struct DrawCommand {
   // Float constant registers the shaders read: only these are copied (blocks are kAluSize, the rest
   // undefined).
   uint16_t vs_const_count = 256, ps_const_count = 256;
+  const ConstantUse* vs_use = nullptr;  // the registers each shader reads (shaders.h); null = all
+  const ConstantUse* ps_use = nullptr;
   uint32_t element_count = 0;
   VertexElement elements[kMaxVertexElements];
   StreamBinding streams[kMaxStreams];
