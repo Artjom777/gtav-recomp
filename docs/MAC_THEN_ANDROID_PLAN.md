@@ -15,8 +15,13 @@ perf pass and how portable each piece is, section 4 = macOS); `docs/HANDOFF_WIND
 
 ## 0. What the owner brings
 
-- **Flash drive** with the two game ISOs (Disc 1 Install, Disc 2 Play) and the folder
-  `gtav_mac_bundle_2026-10-29/` (made on Linux; game-derived, private):
+- **The owner's Samsung phone** (copied 10-29, sizes verified): `Internal storage/Download/`
+  holds `gtav_isos/` (both ISOs, 8,738,846,720 bytes each) and `gtav_mac_bundle_2026-10-29/`.
+  macOS cannot mount Android storage itself: use Android Studio's Device Explorer
+  (`/sdcard/Download/`) or `adb pull /sdcard/Download/gtav_isos ~/gtav-data/iso` and
+  `adb pull /sdcard/Download/gtav_mac_bundle_2026-10-29 ~/` (USB debugging on). The ISOs are
+  also on the owner's flash drive. If `xiso.py` fails on an ISO, compare its size first.
+- The folder `gtav_mac_bundle_2026-10-29/` (made on Linux; game-derived, private):
   - `assets/default.xex` (disc 2) + `default.xexp` (TU27 disc-2 patch): codegen input.
   - `tu27/tu00000009_00000000` (the TU27 title update package) and its extracted `disc001/`,
     `disc002/` (`default.xexp`, `update.rpf`). **TU27 is required**: the base disc build hangs in
