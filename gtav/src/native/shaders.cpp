@@ -23,6 +23,7 @@
 #include <cstring>
 #include <cstdio>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -31,7 +32,8 @@ REXCVAR_DEFINE_STRING(gtav_native_shader_dump, "", "GTAV",
                       "Directory to dump every Xenos shader container the game creates");
 
 // SDK (librexgpu): float constant registers a shader's ucode can read (256 if indexed).
-extern "C" uint32_t rex_shader_float_constant_count(bool pixel, const uint32_t* ucode_dwords, uint32_t dword_count);
+extern "C" bool rex_shader_float_constant_bitmap(bool pixel, const uint32_t* ucode_dwords, uint32_t dword_count,
+                                                 uint64_t out[4]);
 
 namespace gtav::native {
 namespace {
@@ -41,7 +43,32 @@ uint32_t be32(const uint8_t* p) { return uint32_t(p[0]) << 24 | p[1] << 16 | p[2
 std::mutex g_mutex;
 std::unordered_map<uint32_t, uint64_t> g_object_hash;  // guest shader object -> container hash
 std::unordered_map<uint32_t, uint64_t> g_object_ucode_hash;  // -> microcode hash (Xenia's key)
-std::unordered_map<uint32_t, uint32_t> g_object_consts;  // -> float constant registers it can read
+std::unordered_map<uint32_t, const ConstantUse*> g_object_consts;  // -> float constant registers it reads
+// Interned by microcode hash and never freed: lookups hand out plain pointers.
+std::unordered_map<uint64_t, std::unique_ptr<ConstantUse>> g_constant_uses;
+const ConstantUse g_all_constants;
+
+const ConstantUse* MakeConstantUse(bool pixel, const uint8_t* ucode, uint32_t size, uint64_t ucode_hash) {
+  auto& slot = g_constant_uses[ucode_hash ^ (pixel ? 1 : 0)];
+  if (slot) return slot.get();
+  uint64_t bits[4];
+  auto use = std::make_unique<ConstantUse>();
+  if (size >= 4 && rex_shader_float_constant_bitmap(pixel, reinterpret_cast<const uint32_t*>(ucode), size / 4, bits)) {
+    use->runs.clear();
+    use->count = 0;
+    for (uint32_t r = 0; r < 256; r++) {
+      if (!((bits[r >> 6] >> (r & 63)) & 1)) continue;
+      // Gaps of up to 2 registers are copied too: fewer, longer copies.
+      if (!use->runs.empty() && r - (use->runs.back().first + use->runs.back().count) <= 2)
+        use->runs.back().count = uint16_t(r + 1 - use->runs.back().first);
+      else
+        use->runs.push_back({uint16_t(r), 1});
+      use->count = r + 1;
+    }
+  }
+  slot = std::move(use);
+  return slot.get();
+}
 std::unordered_map<uint64_t, uint64_t> g_ucode_container;  // microcode hash -> container hash
 std::atomic<uint32_t> g_created{0}, g_dumped{0};
 // Bumped by every create: invalidates the per-thread lookup caches below.
@@ -52,7 +79,7 @@ std::atomic<uint32_t> g_generation{1};
 struct CachedLookup {
   uint32_t object = 0, generation = 0;
   uint64_t hash = 0, ucode_hash = 0;
-  uint32_t consts = 256;
+  const ConstantUse* consts = nullptr;
 };
 const CachedLookup& Lookup(uint32_t guest_object) {
   thread_local CachedLookup cache[64];
@@ -64,7 +91,7 @@ const CachedLookup& Lookup(uint32_t guest_object) {
   auto ut = g_object_ucode_hash.find(guest_object);
   auto ct = g_object_consts.find(guest_object);
   e = {guest_object, generation, it == g_object_hash.end() ? 0 : it->second,
-       ut == g_object_ucode_hash.end() ? 0 : ut->second, ct == g_object_consts.end() ? 256u : ct->second};
+       ut == g_object_ucode_hash.end() ? 0 : ut->second, ct == g_object_consts.end() ? &g_all_constants : ct->second};
   return e;
 }
 
@@ -79,15 +106,13 @@ void OnCreate(const uint8_t* base, uint32_t container, uint32_t object, bool pix
   uint32_t header = be32(c + 0x18);
   uint32_t ucode_offset = be32(c + 4) + be32(c + header), ucode_size = be32(c + header + 4);
   uint64_t ucode_hash = ucode_offset + ucode_size <= size ? XXH3_64bits(c + ucode_offset, ucode_size) : 0;
-  uint32_t consts = ucode_offset + ucode_size <= size && ucode_size >= 4
-                        ? rex_shader_float_constant_count(pixel, reinterpret_cast<const uint32_t*>(c + ucode_offset),
-                                                          ucode_size / 4)
-                        : 256;
   {
     std::lock_guard lock(g_mutex);
     g_object_hash[object] = hash;
     g_object_ucode_hash[object] = ucode_hash;
-    g_object_consts[object] = consts;
+    g_object_consts[object] = ucode_offset + ucode_size <= size
+                                  ? MakeConstantUse(pixel, c + ucode_offset, ucode_size, ucode_hash)
+                                  : &g_all_constants;
     g_ucode_container[ucode_hash] = hash;
     g_generation.fetch_add(1, std::memory_order_release);
   }
@@ -129,7 +154,7 @@ uint64_t ShaderHash(uint32_t guest_object) { return Lookup(guest_object).hash; }
 
 uint64_t ShaderUcodeHash(uint32_t guest_object) { return Lookup(guest_object).ucode_hash; }
 
-uint32_t ShaderConstantCount(uint32_t guest_object) { return Lookup(guest_object).consts; }
+const ConstantUse& ShaderConstants(uint32_t guest_object) { return *Lookup(guest_object).consts; }
 
 uint64_t ContainerForUcode(uint64_t ucode_hash) {
   std::lock_guard lock(g_mutex);

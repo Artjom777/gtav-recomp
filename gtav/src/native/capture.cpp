@@ -539,6 +539,9 @@ void FenceCopiesRecorded(uint64_t frame) {
   g_copy_cv.notify_all();
 }
 
+// Constant bytes per kind (fetch, vs, ps): {compared, copied}, logged every 300 frames.
+static uint64_t g_copy_bytes[3][2];
+
 static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive, int32_t base_vertex,
                                uint32_t start, uint32_t count) {
   FlushIndexedVertices();
@@ -583,46 +586,58 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
   // block instead (the replay then skips the byte swap and texture lookups by offset). Compared
   // before copying: pushing 10 KB a draw and taking it back cost ~8% of the game thread.
   const DrawCommand* prev = g_packet.draws.empty() ? nullptr : &g_packet.draws.back();
-  // Blocks keep their full size (the renderer reads them by offset), but only the `used` bytes the
-  // shaders read are copied and compared.
-  auto push_or_share = [](const uint8_t* src, uint32_t used, uint32_t size, const uint32_t* previous) {
-    if (previous && std::memcmp(src, g_packet.At(*previous), used) == 0) return *previous;
+  // Blocks keep their full size (the renderer reads them by offset), but only the registers the
+  // shaders read are copied and compared (the rest of a block is undefined).
+  auto push_or_share = [](const uint8_t* src, uint32_t size, const uint32_t* previous, int kind) {
+    g_copy_bytes[kind][0] += size;
+    if (previous && std::memcmp(src, g_packet.At(*previous), size) == 0) return *previous;
+    g_copy_bytes[kind][1] += size;
+    return g_packet.Push(src, size);
+  };
+  d.fetch = push_or_share(dev + d3d::kDevFetchConstants, kFetchSize, prev ? &prev->fetch : nullptr, 0);
+  FlushInlineConstants();
+  // Constants the D3D shadow does not hold yet (written by inline PM4 packets) are patched in.
+  auto push_constants = [&](uint32_t bank, const uint8_t* shadow, const ConstantUse& use, const uint32_t* previous) {
+    const uint8_t* src = shadow;
+    alignas(16) uint8_t patched[kAluSize];
+    if (g_inline_consts.any) {
+      for (const auto& run : use.runs) std::memcpy(patched + 16 * run.first, shadow + 16 * run.first, 16 * run.count);
+      for (const auto& run : use.runs)
+        for (uint32_t i = run.first; i < uint32_t(run.first + run.count); i++)
+          if (g_inline_consts.valid[bank][i]) std::memcpy(patched + 16 * i, g_inline_consts.data[bank][i], 16);
+      src = patched;
+    }
+    uint32_t bytes = 0;
+    for (const auto& run : use.runs) bytes += 16 * run.count;
+    g_copy_bytes[1 + bank][0] += bytes;
+    if (previous) {
+      const uint8_t* old = g_packet.At(*previous);
+      bool same = true;
+      for (const auto& run : use.runs)
+        if (std::memcmp(src + 16 * run.first, old + 16 * run.first, 16 * run.count) != 0) {
+          same = false;
+          break;
+        }
+      if (same) return *previous;
+    }
+    g_copy_bytes[1 + bank][1] += bytes;
     uint32_t at = uint32_t(g_packet.arena.size());
-    std::memcpy(g_packet.arena.Grow(size), src, used);
+    uint8_t* dst = g_packet.arena.Grow(kAluSize);
+    for (const auto& run : use.runs) std::memcpy(dst + 16 * run.first, src + 16 * run.first, 16 * run.count);
     return at;
   };
-  d.vs_const_count = uint16_t(ShaderConstantCount(vertex_shader));
-  d.ps_const_count = uint16_t(pixel_shader ? ShaderConstantCount(pixel_shader) : 0);
-  d.fetch = push_or_share(dev + d3d::kDevFetchConstants, kFetchSize, kFetchSize, prev ? &prev->fetch : nullptr);
-  FlushInlineConstants();
-  const bool inline_consts = g_inline_consts.any;
-  if (inline_consts) d.vs_const_count = d.ps_const_count = 256;  // patched below
-  d.vs_consts = push_or_share(dev + d3d::kDevVsConstants, d.vs_const_count * 16u, kAluSize,
-                              prev && !inline_consts ? &prev->vs_consts : nullptr);
-  d.ps_consts = push_or_share(dev + d3d::kDevPsConstants, d.ps_const_count * 16u, kAluSize,
-                              prev && !inline_consts ? &prev->ps_consts : nullptr);
-  if (inline_consts) {
-    for (uint32_t bank = 0; bank < 2; bank++) {
-      uint8_t* dst = g_packet.arena.data() + (bank ? d.ps_consts : d.vs_consts);
-      for (uint32_t i = 0; i < 256; i++)
-        if (g_inline_consts.valid[bank][i]) std::memcpy(dst + 16 * i, g_inline_consts.data[bank][i], 16);
-    }
-  }
+  const ConstantUse& vs_use = ShaderConstants(vertex_shader);
+  static const ConstantUse kNoConstants{0, {}};
+  const ConstantUse& ps_use = pixel_shader ? ShaderConstants(pixel_shader) : kNoConstants;
+  d.vs_const_count = uint16_t(vs_use.count);
+  d.ps_const_count = uint16_t(ps_use.count);
+  d.vs_consts = push_constants(0, dev + d3d::kDevVsConstants, vs_use, prev ? &prev->vs_consts : nullptr);
+  d.ps_consts = push_constants(1, dev + d3d::kDevPsConstants, ps_use, prev ? &prev->ps_consts : nullptr);
   // --gtav_native_dump_on_collapse: wind-animated tree leaf draws (VS AF15EF63) whose
   // _globalEntityScale (c232) has z = 0 collapse to a point (black tree "orbs"). OnCaptureSwap
   // requests a frame dump once that lasts (to compare with the emulator in shadow mode).
   if (REXCVAR_GET(gtav_native_dump_on_collapse) && d.vs_hash == 0xAF15EF63BB4B093Full)
     (be32(g_packet.At(d.vs_consts) + 232 * 16 + 8) == 0 ? g_collapse.frame_bad : g_collapse.frame_good) = true;
-  // Inline constants patch the pushed copies: those are compared after patching.
-  if (prev && inline_consts) {
-    auto share = [](uint32_t& offset, uint32_t previous, uint32_t size) {
-      if (offset == previous || std::memcmp(g_packet.At(offset), g_packet.At(previous), size) != 0) return;
-      if (offset + size == g_packet.arena.size()) g_packet.arena.Shrink(size);
-      offset = previous;
-    };
-    share(d.ps_consts, prev->ps_consts, kAluSize);  // last pushed first, so the arena can shrink
-    share(d.vs_consts, prev->vs_consts, kAluSize);
-  }
   // The device's own field, as DrawIndexedVertices reads it: SetIndices (83806E70) is not the
   // only writer, so the hooked value can be stale.
   uint32_t index_buffer = be32(dev + d3d::kDevIndexBuffer);
@@ -1059,6 +1074,13 @@ void OnCaptureSwap(uint32_t front_buffer) {
                 g_query_stats.issued, g_query_stats.native, g_query_stats.stale, g_query_stats.pending,
                 g_query_stats.fallback, g_queries.size());
     g_query_stats = {};
+  }
+  if (g_buffer_stats.frames % 300 == 299) {
+    auto kb = [](uint64_t b) { return b / 300 / 1024; };
+    REXLOG_INFO("[native] capture constants per frame (KB compared / copied): fetch {}/{} vs {}/{} ps {}/{}",
+                kb(g_copy_bytes[0][0]), kb(g_copy_bytes[0][1]), kb(g_copy_bytes[1][0]), kb(g_copy_bytes[1][1]),
+                kb(g_copy_bytes[2][0]), kb(g_copy_bytes[2][1]));
+    std::memset(g_copy_bytes, 0, sizeof(g_copy_bytes));
   }
   if (++g_buffer_stats.frames % 300 == 0 && g_buffer_stats.runs) {
     REXLOG_INFO("[native] command buffers: {} known, per 300 frames {} runs ({} with nothing recorded), "
