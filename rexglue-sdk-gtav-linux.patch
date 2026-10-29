@@ -434,7 +434,7 @@ index cbdd7f7..6b9067c 100644
    return true;
  }
 diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
-index 9ac8d15..ddb5709 100644
+index 9ac8d15..f5ba30f 100644
 --- a/src/core/threading_posix.cpp
 +++ b/src/core/threading_posix.cpp
 @@ -50,6 +50,8 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
@@ -446,7 +446,7 @@ index 9ac8d15..ddb5709 100644
  // SIGEV_THREAD_ID in timer_create(...) is a Linux extension
  #define REX_HAS_SIGEV_THREAD_ID 1
  #ifdef __GLIBC__
-@@ -267,6 +269,23 @@ static sem_t* RexCreateAnonymousSemaphore() {
+@@ -267,8 +269,33 @@ static sem_t* RexCreateAnonymousSemaphore() {
  }
  #endif  // __APPLE__
  
@@ -458,19 +458,47 @@ index 9ac8d15..ddb5709 100644
 +#if REX_PLATFORM_LINUX
 +static std::atomic<uint32_t> multi_wait_epoch_{0};
 +static std::atomic<int32_t> multi_waiters_{0};
-+static inline void NotifyMultiWaiters() {
++static inline void NotifyAllMultiWaiters() {
 +  multi_wait_epoch_.fetch_add(1, std::memory_order_seq_cst);
 +  if (multi_waiters_.load(std::memory_order_seq_cst) > 0)
 +    syscall(SYS_futex, &multi_wait_epoch_, FUTEX_WAKE_PRIVATE, INT32_MAX, nullptr, nullptr, 0);
 +}
 +#else
-+static inline void NotifyMultiWaiters() {}
++static inline void NotifyAllMultiWaiters() {}
 +#endif
 +
  class PosixConditionBase {
   public:
++  // Threads inside WaitMultiple on this handle: a signal wakes the multi-waiters only then (one
++  // futex wake per signal of any handle was ~10,000 syscalls a second on GTA V's update thread).
++  std::atomic<int32_t> multi_waiters_here_{0};
++  void NotifyMultiWaiters() {
++    std::atomic_thread_fence(std::memory_order_seq_cst);  // the state change before the count
++    if (multi_waiters_here_.load(std::memory_order_seq_cst) > 0) NotifyAllMultiWaiters();
++  }
++
    PosixConditionBase() {
-@@ -336,6 +355,10 @@ class PosixConditionBase {
+ #if REX_PLATFORM_LINUX
+     // Use robust mutexes so waits can recover if owner thread terminates.
+@@ -330,12 +357,28 @@ class PosixConditionBase {
+       return std::make_pair(result, 0);
+     }
+ 
++#if REX_PLATFORM_LINUX
++    // Registered before the handles are checked: a signal from then on bumps the epoch.
++    struct Registration {
++      std::vector<PosixConditionBase*>& handles;
++      explicit Registration(std::vector<PosixConditionBase*>& h) : handles(h) {
++        for (auto* handle : handles) handle->multi_waiters_here_.fetch_add(1, std::memory_order_seq_cst);
++      }
++      ~Registration() {
++        for (auto* handle : handles) handle->multi_waiters_here_.fetch_sub(1, std::memory_order_seq_cst);
++      }
++    } registration(handles);
++#endif
+     auto start_time = std::chrono::steady_clock::now();
+     auto end_time = (timeout == std::chrono::milliseconds::max())
+                         ? std::chrono::steady_clock::time_point::max()
                          : start_time + timeout;
  
      while (true) {
@@ -481,7 +509,7 @@ index 9ac8d15..ddb5709 100644
        size_t first_signaled = std::numeric_limits<size_t>::max();
        bool condition_met = false;
        bool all_locked = true;
-@@ -411,6 +434,19 @@ class PosixConditionBase {
+@@ -411,6 +454,19 @@ class PosixConditionBase {
          return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
        }
  
@@ -501,7 +529,7 @@ index 9ac8d15..ddb5709 100644
        if (timeout == std::chrono::milliseconds::max()) {
          std::this_thread::sleep_for(std::chrono::milliseconds(1));
        } else {
-@@ -418,6 +454,7 @@ class PosixConditionBase {
+@@ -418,6 +474,7 @@ class PosixConditionBase {
          auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
          std::this_thread::sleep_for(sleep_time);
        }
@@ -509,7 +537,7 @@ index 9ac8d15..ddb5709 100644
      }
    }
  
-@@ -450,6 +487,7 @@ class PosixCondition<Event> : public PosixConditionBase {
+@@ -450,6 +507,7 @@ class PosixCondition<Event> : public PosixConditionBase {
      auto lock = std::unique_lock<std::mutex>(mutex_);
      signal_ = true;
      cond_.notify_all();
@@ -517,7 +545,7 @@ index 9ac8d15..ddb5709 100644
      return true;
    }
  
-@@ -487,6 +525,7 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
+@@ -487,6 +545,7 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
      }
      count_ += release_count;
      cond_.notify_all();
@@ -525,7 +553,7 @@ index 9ac8d15..ddb5709 100644
      return true;
    }
  
-@@ -519,6 +558,7 @@ class PosixCondition<Mutant> : public PosixConditionBase {
+@@ -519,6 +578,7 @@ class PosixCondition<Mutant> : public PosixConditionBase {
        // Free to be acquired by another thread
        if (count_ == 0) {
          cond_.notify_all();
@@ -533,7 +561,7 @@ index 9ac8d15..ddb5709 100644
        }
        return true;
      }
-@@ -551,6 +591,7 @@ class PosixCondition<Timer> : public PosixConditionBase {
+@@ -551,6 +611,7 @@ class PosixCondition<Timer> : public PosixConditionBase {
      std::lock_guard<std::mutex> lock(mutex_);
      signal_ = true;
      cond_.notify_all();
@@ -541,7 +569,7 @@ index 9ac8d15..ddb5709 100644
      return true;
    }
  
-@@ -979,6 +1020,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -979,6 +1040,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
        exit_code_ = exit_code;
        signaled_ = true;
        cond_.notify_all();
@@ -549,11 +577,11 @@ index 9ac8d15..ddb5709 100644
      }
      if (is_current_thread) {
        pthread_exit(reinterpret_cast<void*>(exit_code));
-@@ -1449,6 +1491,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+@@ -1449,6 +1511,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
      thread->handle_.exit_code_ = 0;
      thread->handle_.signaled_ = true;
      thread->handle_.cond_.notify_all();
-+    NotifyMultiWaiters();
++    thread->handle_.NotifyMultiWaiters();
    }
  
    current_thread_ = nullptr;
