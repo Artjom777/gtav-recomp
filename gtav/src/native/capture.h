@@ -51,5 +51,10 @@ QueryOverride OverrideQueryResult(uint32_t query, uint32_t* samples);
 // Guest frame boundary (before the guest's Swap runs): hands the frame to the renderer.
 void OnCaptureSwap(uint32_t front_buffer);
 uint64_t GuestFrame();
+// Render thread, before recording frame f: moves the fence-time copies of its draws into it.
+struct FramePacket;
+void ApplyFenceCopies(FramePacket& f);
+// Render thread, after recording frame `frame` (its guest memory has been read).
+void FenceCopiesRecorded(uint64_t frame);
 
 }  // namespace gtav::native

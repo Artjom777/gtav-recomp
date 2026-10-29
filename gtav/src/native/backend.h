@@ -51,6 +51,7 @@ class Backend {
   // Counters of the last executed frame, for the hitch log.
   struct FrameStats {
     uint32_t draws, skipped, pipelines_created, textures;
+    uint32_t rewritten;  // draws whose guest data changed since the D3D call, drawn without a copy
     double shader_ms, pipeline_ms, texture_ms, resolve_ms;  // time in cache misses / resolves
   };
   FrameStats LastStats() const;

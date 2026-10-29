@@ -600,6 +600,7 @@ struct Backend::Impl {
   uint32_t alpha_funcs_logged = 0;
   uint32_t zero_textures_logged = 0;
   uint64_t data_changed_draws = 0, data_checked_draws = 0;  // DrawDataHash mismatches at record time
+  uint64_t data_changed_snapped = 0, data_snapped_draws = 0;  // ... of them / all draws with a capture copy
   std::set<uint64_t> data_changed_examples;  // RB_COLORCONTROL alpha functions already logged (bit per function)
 
   static uint64_t SampleGuest(uint32_t address, uint32_t size) {
@@ -958,7 +959,7 @@ struct Backend::Impl {
   }
 
   // Per-frame stats for the bring-up log.
-  uint32_t stat_draws = 0, stat_skipped = 0, stat_pipelines_created = 0, stat_textures = 0;
+  uint32_t stat_draws = 0, stat_skipped = 0, stat_pipelines_created = 0, stat_textures = 0, stat_rewritten = 0;
   // Draws lost this frame to work still in flight (logged per frame: a candidate for the one-frame
   // black flickers): pipeline still compiling, vertex shader or pixel shader SPIR-V not ready
   // (a missing pixel shader draws depth-only).
@@ -2025,8 +2026,14 @@ struct Backend::Impl {
     // record-time profile every 300 frames)
     if (DrawDataHash(d, [](uint32_t a) { return REX_KERNEL_MEMORY()->TranslatePhysical(a); }) != d.data_hash) {
       data_changed_draws++;
-      if (data_changed_examples.size() < 6) data_changed_examples.insert(d.ps_hash);
+      if (d.snap_vertices) {
+        data_changed_snapped++;  // drawn from a copy (fence copy, --gtav_native_snapshot_draws)
+      } else {
+        stat_rewritten++;  // mostly buffers the game fills after the D3D call (harmless)
+        if (data_changed_examples.size() < 6) data_changed_examples.insert(d.ps_hash);
+      }
     }
+    if (d.snap_vertices) data_snapped_draws++;
     data_checked_draws++;
     // GTAV_NATIVE_SKIP_PS / GTAV_NATIVE_SKIP_VS=hash,hash: bring-up diagnostic that drops draws using
     // these pixel / vertex shaders (bisecting the lighting pass).
@@ -3278,7 +3285,7 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   s.frame++;
   s.bound_fb = nullptr;
   s.grow_list = list;
-  s.stat_draws = s.stat_skipped = s.stat_pipelines_created = s.stat_textures = 0;
+  s.stat_draws = s.stat_skipped = s.stat_pipelines_created = s.stat_textures = s.stat_rewritten = 0;
   s.t_shader = s.t_pipeline = s.t_texture = s.t_resolve = 0;
   s.tile_split = 0;
   s.tile_resolves.clear();
@@ -3327,9 +3334,10 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
       double n = s.prof_frames;
       std::string ex;
       for (uint64_t h : s.data_changed_examples) ex += fmt::format(" {:016X}", h);
-      REXLOG_INFO("[native] draw data rewritten after capture: {} of {} draws (ps{})", s.data_changed_draws,
-                  s.data_checked_draws, ex);
-      s.data_changed_draws = s.data_checked_draws = 0;
+      REXLOG_INFO("[native] draw data rewritten after capture: {} of {} draws, {} of them drawn from the capture "
+                  "copy ({} draws copied; others ps{})",
+                  s.data_changed_draws, s.data_checked_draws, s.data_changed_snapped, s.data_snapped_draws, ex);
+      s.data_changed_draws = s.data_checked_draws = s.data_changed_snapped = s.data_snapped_draws = 0;
       s.data_changed_examples.clear();
       REXLOG_INFO("[native] record ms per frame: setup {:.2f} consts {:.2f} textures {:.2f} streams {:.2f} "
                   "pipeline {:.2f} bind+draw {:.2f} (draws only; {} draws this frame)",
@@ -3393,7 +3401,7 @@ void Backend::RequestDump() { impl_->dump_request = true; }
 
 Backend::FrameStats Backend::LastStats() const {
   return {impl_->stat_draws, impl_->stat_skipped, impl_->stat_pipelines_created, impl_->stat_textures,
-          impl_->t_shader, impl_->t_pipeline, impl_->t_texture, impl_->t_resolve};
+          impl_->stat_rewritten, impl_->t_shader, impl_->t_pipeline, impl_->t_texture, impl_->t_resolve};
 }
 
 void Backend::FrameComplete(uint32_t slot) {

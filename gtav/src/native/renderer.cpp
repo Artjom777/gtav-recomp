@@ -3,6 +3,7 @@
 #include "renderer.h"
 
 #include "backend.h"
+#include "capture.h"
 #include "frame.h"
 #include "menu.h"
 #include "paths.h"
@@ -43,6 +44,8 @@ REXCVAR_DEFINE_BOOL(gtav_native_vsync, true, "GTAV", "Native renderer: wait for 
 REXCVAR_DEFINE_BOOL(gtav_native_flicker_catch, false, "GTAV",
                     "Native renderer: detect one-frame glitches (a frame unlike both neighbours), save them to "
                     "logs/flicker and log them");
+REXCVAR_DEFINE_BOOL(gtav_native_replay, false, "GTAV",
+                    "Native renderer: keep the last 90 presented frames; F8 writes them to logs/replay");
 REXCVAR_DEFINE_BOOL(gtav_native_fps, false, "GTAV", "Native renderer: on-screen frames-per-second counter");
 REXCVAR_DEFINE_BOOL(gtav_native_hidden, false, "GTAV",
                     "Native renderer: keep every game window hidden (unattended test runs)");
@@ -244,7 +247,7 @@ class Renderer {
       SetTimer(hwnd, 1, 500, nullptr);  // hide the SDK window again if it reappears ("on")
       SetTimer(hwnd, 2, 50, nullptr);   // F9/F10 while either game window has focus
       MSG msg;
-      bool f9_down = false, f10_down = false, f11_down = false;
+      bool f8_down = false, f9_down = false, f10_down = false, f11_down = false;
       while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         if (msg.message == WM_TIMER && msg.hwnd == hwnd) {
           if (msg.wParam == 1) {
@@ -254,11 +257,12 @@ class Renderer {
             GetWindowThreadProcessId(GetForegroundWindow(), &pid);
             bool ours = pid == GetCurrentProcessId();
             bool f9 = ours && (GetAsyncKeyState(VK_F9) & 0x8000), f10 = ours && (GetAsyncKeyState(VK_F10) & 0x8000);
-            bool f11 = ours && (GetAsyncKeyState(VK_F11) & 0x8000);
+            bool f11 = ours && (GetAsyncKeyState(VK_F11) & 0x8000), f8 = ours && (GetAsyncKeyState(VK_F8) & 0x8000);
+            if (f8 && !f8_down) key_replay_ = true;
             if (f9 && !f9_down) key_dump_ = true;
             if (f10 && !f10_down) key_shot_ = true;
             if (f11 && !f11_down) CycleDiagMode();
-            f9_down = f9, f10_down = f10, f11_down = f11;
+            f8_down = f8, f9_down = f9, f10_down = f10, f11_down = f11;
           }
           continue;
         }
@@ -332,6 +336,7 @@ class Renderer {
           SDL_AddEventWatch(
               [](void*, SDL_Event* e) {
                 if (e->type == SDL_EVENT_KEY_DOWN && !e->key.repeat) {
+                  if (e->key.scancode == SDL_SCANCODE_F8) key_replay_ = true;
                   if (e->key.scancode == SDL_SCANCODE_F9) key_dump_ = true;
                   if (e->key.scancode == SDL_SCANCODE_F10) key_shot_ = true;
                   if (e->key.scancode == SDL_SCANCODE_F11) CycleDiagMode();
@@ -512,7 +517,7 @@ class Renderer {
     flick_rb_[slot]->unmap();
     uint64_t index = flick_index_[slot];
     // History of the last two frames (grid + image), consecutive guest frames only.
-    if (flick_hist_n_ == 2 && index == flick_hist_index_[1] + 1 && flick_hist_index_[1] == flick_hist_index_[0] + 1) {
+    if (REXCVAR_GET(gtav_native_flicker_catch) && flick_hist_n_ == 2 && index == flick_hist_index_[1] + 1 && flick_hist_index_[1] == flick_hist_index_[0] + 1) {
       const auto &g0 = flick_hist_grid_[0], &g1 = flick_hist_grid_[1];
       uint32_t odd = 0, x0 = kGw, y0 = kGh, x1 = 0, y1 = 0;
       for (uint32_t y = 0; y < kGh; y++)
@@ -550,6 +555,10 @@ class Renderer {
         }
       }
     }
+    if (REXCVAR_GET(gtav_native_replay)) {
+      if (replay_.size() >= kReplayFrames) replay_.pop_front();
+      replay_.push_back({index, rgb, flick_stats_[slot]});
+    }
     if (flick_hist_n_ < 2) flick_hist_n_++;
     else {
       std::swap(flick_hist_grid_[0], flick_hist_grid_[1]);
@@ -559,6 +568,31 @@ class Renderer {
     flick_hist_grid_[flick_hist_n_ - 1] = std::move(grid);
     flick_hist_rgb_[flick_hist_n_ - 1] = std::move(rgb);
     flick_hist_index_[flick_hist_n_ - 1] = index;
+  }
+
+  // F8 (--gtav_native_replay): the last kReplayFrames presented frames, written on a worker
+  // thread to logs/replay/<frame>/ as PPM with each frame's counters in frames.txt.
+  void WriteReplay(uint64_t now) {
+    if (!REXCVAR_GET(gtav_native_replay)) {
+      REXLOG_INFO("[native] F8: replay is off (--gtav_native_replay=true)");
+      return;
+    }
+    std::string dir = fmt::format("{}/{:06}", LogPath("replay"), now);
+    REXLOG_INFO("[native] F8: writing the last {} frames to {}", replay_.size(), dir);
+    std::thread([frames = std::move(replay_), dir] {
+      std::error_code ec;
+      std::filesystem::create_directories(dir, ec);
+      std::ofstream list(dir + "/frames.txt");
+      for (const auto& r : frames) {
+        list << fmt::format("frame_{:06}.ppm: {}\n", r.index, r.stats);
+        if (FILE* f = std::fopen(fmt::format("{}/frame_{:06}.ppm", dir, r.index).c_str(), "wb")) {
+          std::fprintf(f, "P6\n%u %u\n255\n", kShotW, kShotH);
+          std::fwrite(r.rgb.data(), 1, r.rgb.size(), f);
+          std::fclose(f);
+        }
+      }
+    }).detach();
+    replay_.clear();
   }
 
   void RetireAll() {
@@ -693,7 +727,16 @@ class Renderer {
       list_->setViewports(plume::RenderViewport(0, 0, float(w), float(h)));
       list_->setScissors(plume::RenderRect(0, 0, int32_t(w), int32_t(h)));
     }
-    if (front && REXCVAR_GET(gtav_native_flicker_catch)) FlickerCapture(slot, frame.index, front_descriptor, w, h);
+    if (front && (REXCVAR_GET(gtav_native_flicker_catch) || REXCVAR_GET(gtav_native_replay))) {
+      if (backend_ok_) {
+        auto st = backend_.LastStats();
+        flick_stats_[slot] = fmt::format("{} draws, {} skipped, {} read after a rewrite, {} new pipelines, "
+                                         "{} texture uploads",
+                                         st.draws, st.skipped, st.rewritten, st.pipelines_created, st.textures);
+      }
+      FlickerCapture(slot, frame.index, front_descriptor, w, h);
+    }
+    if (key_replay_.exchange(false)) WriteReplay(frame.index);
     if (front) {
       backend_.Blit(list_, front_descriptor, plume::RenderFormat::B8G8R8A8_UNORM);
     } else {
@@ -875,8 +918,10 @@ class Renderer {
       space_cv_.notify_one();
       render_frame_ = frame.index;
       render_state_ = 1;  // recording + presenting
+      ApplyFenceCopies(frame);
       Validate(frame);
       Present(frame);
+      FenceCopiesRecorded(frame.index);
       render_state_ = 2;
       {
         std::lock_guard lock(recorded_mutex_);
@@ -901,6 +946,7 @@ class Renderer {
   }
 
   static inline std::atomic<bool> key_dump_{false}, key_shot_{false};  // F9 / F10 (window thread)
+  static inline std::atomic<bool> key_replay_{false};                   // F8
   std::string readback_restore_;  // readback_resolve to restore after a shadow-mode F9 dump
   uint64_t readback_restore_at_ = 0;
   uint64_t native_dump_at_ = 0;  // guest frame to dump (F9; delayed in shadow mode)
@@ -966,6 +1012,14 @@ class Renderer {
   std::vector<uint8_t> flick_hist_grid_[2], flick_hist_rgb_[2];
   uint64_t flick_hist_index_[2] = {};
   uint32_t flick_hist_n_ = 0, flick_count_ = 0;
+  std::string flick_stats_[Backend::kFramesInFlight];
+  struct ReplayFrame {
+    uint64_t index;
+    std::vector<uint8_t> rgb;
+    std::string stats;
+  };
+  static constexpr size_t kReplayFrames = 90;
+  std::deque<ReplayFrame> replay_;
   plume::RenderTexture* swap_target_ = nullptr;
   uint32_t swap_image_ = 0;
   std::unique_ptr<plume::RenderBuffer> readback_;

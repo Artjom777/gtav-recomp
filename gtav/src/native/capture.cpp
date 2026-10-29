@@ -31,6 +31,10 @@
 #endif
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <map>
 #include <cstring>
 #include <fstream>
 #include <mutex>
@@ -40,6 +44,12 @@ REXCVAR_DECLARE(std::string, gtav_native);
 REXCVAR_DEFINE_BOOL(gtav_native_snapshot_draws, false, "GTAV",
                     "Copy every draw's vertex and index data at the D3D call instead of reading guest "
                     "memory when the frame is recorded");
+REXCVAR_DEFINE_BOOL(gtav_native_fence_wait, false, "GTAV",
+                    "The command processor waits at a GPU fence until the renderer recorded the draws before "
+                    "it (textures too) when their frame is complete, instead of copying their vertex data");
+REXCVAR_DEFINE_BOOL(gtav_native_fence_copy, true, "GTAV",
+                    "Copy a draw's vertex and index data when the GPU fence after it is reached before the "
+                    "frame was recorded (the game may reuse that memory from then on)");
 REXCVAR_DEFINE_BOOL(gtav_native_dump_on_collapse, false, "GTAV",
                     "Diagnostic: dump the first frame with a collapsed tree leaf draw (tree orbs)");
 REXCVAR_DEFINE_BOOL(gtav_native_pm4_scan, false, "GTAV",
@@ -345,6 +355,155 @@ void OnDraw(uint32_t write, uint64_t vs_hash, const uint8_t* captured_vs) {
 }
 }  // namespace pm4scan
 
+// Copies the index slice and the vertex range a draw reaches (all or nothing), through push(data,
+// size) -> offset, into d.snap_*.
+template <class Push>
+static void SnapshotDrawData(DrawCommand& d, Push&& push) {
+  auto* mem = REX_KERNEL_MEMORY();
+  uint32_t first = d.start, last = d.start + d.count;  // vertices [first, last)
+  if (d.indexed) {
+    uint32_t isz = d.index32 ? 4 : 2;
+    const uint8_t* ip = d.index_address ? mem->TranslatePhysical(d.index_address) : nullptr;
+    first = ~0u, last = 0;
+    if (ip && uint64_t(d.start + d.count) * isz <= d.index_size) {
+      ip += size_t(d.start) * isz;
+      d.snap_index = push(ip, d.count * isz);
+      d.snap_index_size = d.count * isz;
+      for (uint32_t i = 0; i < d.count; i++) {
+        uint32_t v = isz == 4 ? be32(ip + 4 * i) : uint32_t(ip[2 * i] << 8 | ip[2 * i + 1]);
+        if (isz == 4 || v != 0xFFFF) first = std::min(first, v), last = std::max(last, v + 1);
+      }
+      if (first < last) first += uint32_t(d.base_vertex), last += uint32_t(d.base_vertex);
+    }
+  }
+  if (first < last && last - first <= (1u << 20)) {
+    d.snap_first = first;
+    d.snap_vertices = last - first;
+    for (uint32_t s = 0; s < kMaxStreams; s++) {
+      const auto& sb = d.streams[s];
+      if (!sb.address || !sb.stride || sb.size <= sb.offset) continue;
+      uint64_t lo = uint64_t(first) * sb.stride, hi = std::min<uint64_t>(uint64_t(last) * sb.stride, sb.size - sb.offset);
+      if (lo >= hi) { d.snap_vertices = 0; break; }
+      d.snap_stream[s] = push(mem->TranslatePhysical(sb.address + sb.offset) + lo, uint32_t(hi - lo));
+      d.snap_vertices = std::min<uint32_t>(d.snap_vertices, uint32_t((hi - lo) / sb.stride));
+    }
+  }
+  if (!d.snap_vertices) d.snap_index_size = 0;  // all or nothing
+}
+
+// --gtav_native_fence_copy: the renderer records a frame after its Swap, but the command processor
+// writes the GPU fences that follow each draw as it goes (mid-frame), and from then on the game
+// may reuse the draw's memory (streaming recycles it constantly while driving): a draw read after
+// that rendered from new data for one frame (huge stray meshes over the sky). Every draw is
+// queued with the fence that follows it; when the command processor reaches that fence before
+// the frame is recorded, the draw's data is copied then; during the recording it waits instead.
+// A copy at the D3D call itself is too early: some buffers are still being filled then.
+struct PendingCopy {
+  uint64_t frame;
+  uint32_t draw, fence;
+  bool indexed, index32;
+  int32_t base_vertex;
+  uint32_t start, count, index_address, index_size;
+  StreamBinding streams[kMaxStreams];
+};
+struct FenceCopy {
+  std::vector<uint8_t> bytes;
+  DrawCommand d;  // snap_* offsets into bytes
+};
+static std::mutex g_copy_mutex;
+static std::condition_variable g_copy_cv;
+static std::deque<PendingCopy> g_pending_copies;
+static std::map<std::pair<uint64_t, uint32_t>, FenceCopy> g_fence_copies;  // (frame, draw)
+static uint64_t g_copy_floor = 0;           // frames below this were recorded
+static uint64_t g_recording = ~0ull;        // frame being recorded
+static std::atomic<uint32_t> g_fence_address{0};  // guest physical, where the GPU writes the fence
+static constexpr uint32_t kDevFence = 11036;      // next fence value (InsertFence 8380E440)
+static constexpr uint32_t kDevFenceDone = 11024;  // -> where the GPU writes the completed fence
+static struct {
+  uint64_t copies = 0, bytes = 0, waits = 0, wait_timeouts = 0;
+  double wait_ms = 0;
+} g_copy_stats;
+
+static void FenceReached(uint32_t value) {
+  std::unique_lock lock(g_copy_mutex);
+  while (!g_pending_copies.empty() && int32_t(value - g_pending_copies.front().fence) >= 0) {
+    const PendingCopy& p = g_pending_copies.front();
+    if (p.frame < g_copy_floor) {
+      g_pending_copies.pop_front();
+      continue;
+    }
+    // Being read right now (or --gtav_native_fence_wait: handed to the renderer, not read yet): the
+    // GPU is not done before the renderer. Waiting also covers textures, which are never copied.
+    // Never for the frame the game is still building: it may itself wait on this fence (loading
+    // screens poll queries), and the renderer cannot record that frame before its Swap.
+    if (p.frame == g_recording ||
+        (REXCVAR_GET(gtav_native_fence_wait) && p.frame < g_frame.load(std::memory_order_relaxed))) {
+      uint64_t frame = p.frame;
+      auto start = std::chrono::steady_clock::now();
+      g_copy_stats.waits++;
+      if (!g_copy_cv.wait_for(lock, std::chrono::milliseconds(100), [&] { return g_copy_floor > frame; }))
+        g_copy_stats.wait_timeouts++;
+      g_copy_stats.wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+      if (g_copy_floor <= frame) {
+        if (frame != g_recording) goto copy;  // timed out (the game waits on its own frame): copy
+        break;
+      }
+      continue;
+    }
+  copy:
+    FenceCopy c;
+    c.d.indexed = p.indexed, c.d.index32 = p.index32, c.d.base_vertex = p.base_vertex;
+    c.d.start = p.start, c.d.count = p.count, c.d.index_address = p.index_address, c.d.index_size = p.index_size;
+    std::copy(std::begin(p.streams), std::end(p.streams), c.d.streams);
+    SnapshotDrawData(c.d, [&](const uint8_t* data, uint32_t size) {
+      uint32_t at = uint32_t(c.bytes.size());
+      c.bytes.insert(c.bytes.end(), data, data + size);
+      return at;
+    });
+    if (c.d.snap_vertices) {
+      g_copy_stats.copies++;
+      g_copy_stats.bytes += c.bytes.size();
+      g_fence_copies[{p.frame, p.draw}] = std::move(c);
+    }
+    g_pending_copies.pop_front();
+  }
+}
+
+void ApplyFenceCopies(FramePacket& f) {
+  std::lock_guard lock(g_copy_mutex);
+  g_recording = f.index;
+  for (auto it = g_fence_copies.begin(); it != g_fence_copies.end() && it->first.first <= f.index;
+       it = g_fence_copies.erase(it)) {
+    if (it->first.first != f.index || it->first.second >= f.draws.size()) continue;
+    DrawCommand& d = f.draws[it->first.second];
+    const FenceCopy& c = it->second;
+    if (d.snap_vertices) continue;
+    uint32_t base = f.Push(c.bytes.data(), uint32_t(c.bytes.size()));
+    d.snap_first = c.d.snap_first;
+    d.snap_vertices = c.d.snap_vertices;
+    for (uint32_t s = 0; s < kMaxStreams; s++) d.snap_stream[s] = c.d.snap_stream[s] + base;
+    d.snap_index = c.d.snap_index + base;
+    d.snap_index_size = c.d.snap_index_size;
+  }
+}
+
+void FenceCopiesRecorded(uint64_t frame) {
+  {
+    std::lock_guard lock(g_copy_mutex);
+    g_recording = ~0ull;
+    g_copy_floor = frame + 1;
+    while (!g_pending_copies.empty() && g_pending_copies.front().frame <= frame) g_pending_copies.pop_front();
+    if (frame % 300 == 0) {
+      auto& st = g_copy_stats;
+      REXLOG_INFO("[native] fence copies per 300 frames: {} draws ({} KB), GPU waited for the renderer {} times "
+                  "({:.1f} ms, {} timeouts), {} queued",
+                  st.copies, st.bytes / 1024, st.waits, st.wait_ms, st.wait_timeouts, g_pending_copies.size());
+      st = {};
+    }
+  }
+  g_copy_cv.notify_all();
+}
+
 static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive, int32_t base_vertex,
                                uint32_t start, uint32_t count) {
   FlushIndexedVertices();
@@ -450,36 +609,14 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
   d.depth_stencil = be32(dev + d3d::kDevDepthStencil);
   d.data_hash = DrawDataHash(d, [](uint32_t a) { return REX_KERNEL_MEMORY()->TranslatePhysical(a); });
   if (REXCVAR_GET(gtav_native_snapshot_draws) && !d.is_inline) {
-    auto* mem = REX_KERNEL_MEMORY();
-    uint32_t first = d.start, last = d.start + d.count;  // vertices [first, last)
-    if (d.indexed) {
-      uint32_t isz = d.index32 ? 4 : 2;
-      const uint8_t* ip = d.index_address ? mem->TranslatePhysical(d.index_address) : nullptr;
-      first = ~0u, last = 0;
-      if (ip && uint64_t(d.start + d.count) * isz <= d.index_size) {
-        ip += size_t(d.start) * isz;
-        d.snap_index = g_packet.Push(ip, d.count * isz);
-        d.snap_index_size = d.count * isz;
-        for (uint32_t i = 0; i < d.count; i++) {
-          uint32_t v = isz == 4 ? be32(ip + 4 * i) : uint32_t(ip[2 * i] << 8 | ip[2 * i + 1]);
-          if (isz == 4 || v != 0xFFFF) first = std::min(first, v), last = std::max(last, v + 1);
-        }
-        if (first < last) first += uint32_t(d.base_vertex), last += uint32_t(d.base_vertex);
-      }
-    }
-    if (first < last && last - first <= (1u << 20)) {
-      d.snap_first = first;
-      d.snap_vertices = last - first;
-      for (uint32_t s = 0; s < kMaxStreams; s++) {
-        const auto& sb = d.streams[s];
-        if (!sb.address || !sb.stride || sb.size <= sb.offset) continue;
-        uint64_t lo = uint64_t(first) * sb.stride, hi = std::min<uint64_t>(uint64_t(last) * sb.stride, sb.size - sb.offset);
-        if (lo >= hi) { d.snap_vertices = 0; break; }
-        d.snap_stream[s] = g_packet.Push(mem->TranslatePhysical(sb.address + sb.offset) + lo, uint32_t(hi - lo));
-        d.snap_vertices = std::min<uint32_t>(d.snap_vertices, uint32_t((hi - lo) / sb.stride));
-      }
-    }
-    if (!d.snap_vertices) d.snap_index_size = 0;  // all or nothing
+    SnapshotDrawData(d, [](const uint8_t* data, uint32_t size) { return g_packet.Push(data, size); });
+  } else if (!d.is_inline && REXCVAR_GET(gtav_native_fence_copy)) {
+    if (uint32_t done = be32(dev + kDevFenceDone)) g_fence_address = GuestPhysical(done);
+    PendingCopy p{GuestFrame(), uint32_t(g_packet.draws.size()), be32(dev + kDevFence), d.indexed, d.index32,
+                  d.base_vertex, d.start, d.count, d.index_address, d.index_size, {}};
+    std::copy(std::begin(d.streams), std::end(d.streams), p.streams);
+    std::lock_guard lock(g_copy_mutex);
+    g_pending_copies.push_back(p);
   }
   g_packet.commands.push_back({CommandKind::kDraw, uint32_t(g_packet.draws.size()), WritePointer(device)});
   g_packet.draws.push_back(d);
@@ -887,3 +1024,19 @@ void OnCaptureSwap(uint32_t front_buffer) {
 uint64_t GuestFrame() { return g_frame.load(std::memory_order_relaxed); }
 
 }  // namespace gtav::native
+
+#ifdef _WIN32
+#define GTAV_HOOK_EXPORT __declspec(dllexport)
+#else
+#define GTAV_HOOK_EXPORT __attribute__((visibility("default")))  // exported by the link options
+#endif
+// Called by the SDK's command processor (gpu_skip_rendering) before every EVENT_WRITE_SHD.
+extern "C" GTAV_HOOK_EXPORT void rex_skip_rendering_fence(uint32_t address, uint32_t value) {
+  uint32_t fence = gtav::native::g_fence_address.load(std::memory_order_relaxed);
+  static uint32_t logged = 0;
+  if (fence && logged < 4) {
+    logged++;
+    REXLOG_INFO("[native] GPU event write {:08X} = {:08X} (game fence at {:08X})", address, value, fence);
+  }
+  if (fence && (address & 0x1FFFFFFF) == (fence & 0x1FFFFFFF)) gtav::native::FenceReached(value);
+}
