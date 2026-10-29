@@ -161,3 +161,45 @@ for audio). Water is done; see "Fixed 10-28" below.
   pipeline wait (40 ms), command processor lag (6 ms), per-pixel sun tiles, texture hashing.
 - After each change: visual A/B (flicker while driving, phone, shadows, water) plus the
   "record ms per frame" log lines.
+
+## DONE 10-29 afternoon: performance pass (headless), ~37-48 fps -> ~100-117 fps (hidden benches)
+Local commits ca3622e..a58ec9c (not pushed: owner to play-test first). Numbers are hidden runs
+on this laptop (RTX 4050, "on" mode, uncapped, --gtav_native_vsync=false): moving around
+(tools/native/input_run_around.txt) ~96-107 fps at 1,600-2,600 draws; standing at spawn ~117.
+Heavy scenes (the beach, ~3,400 draws) were not reachable headlessly.
+
+What gated the frame, in the order found:
+- Render thread: a diagnostic hash of every draw's indices (now --gtav_native_check_draw_data),
+  per-frame hashing of textures/buffers (now the kernel tracks guest writes: write_watch.cpp,
+  userfaultfd async write-protect + PAGEMAP_SCAN; only pages copies were made from are
+  protected; the four guest views are scanned in parallel; --gtav_native_write_watch_verify
+  re-hashes "unchanged" copies and counts misses: 0), full 4 KB constant swaps (only the register
+  runs each shader reads now, from xenia's ucode analysis: SDK rex_shader_float_constant_bitmap),
+  vertex layout rebuilt per draw. Record 19-23 ms -> ~7 ms at ~1,800 draws.
+- Game render thread (capture): 10 KB of constant copies per draw (now only the used runs).
+- Command processor: GetRegisterInfo's switch per register write, one virtual call per
+  register (type-0 packets are range writes now), shader loads under gpu_skip_rendering.
+- Update thread (the bottleneck now): SDL's ~1024-sample audio period made the guest's audio
+  engine run four 5.3 ms passes in a burst every 21 ms, and the update thread waits for a pass
+  every frame (SDK --audio_device_frames=256). WaitMultiple polled in 1 ms steps (futex now,
+  per-handle). GPU fence waits took the whole 6 ms command processor lag (kicks are let through
+  while the game blocks on a fence: gpu_fence_wait.cpp + SDK rex_skip_rendering_gpu_waiters /
+  rex_skip_rendering_wake). Game code built with -mcmodel=small -march=x86-64-v3.
+
+Owner checks (play-test, then push):
+- Driving flicker, phone box, shadows/car reflections, water: unchanged visuals expected.
+- Audio: the device period is now 256 samples (5.3 ms); listen for crackles (none in logs).
+- Esc menu "Low GPU latency" (command processor 2 ms behind instead of 6): +23% fps in an A/B
+  run; OFF by default because 6 ms is what fixed the foliage flicker. Try it while driving.
+- build/gtav/gtav_settings.ini has gtav_native_vsync=true: fps capped at the display refresh.
+
+Tools: tools/native/bench.sh NAME SECS [flags] (hidden timing run; BENCH_PERF=1 perf profile,
+needs kernel.perf_event_paranoid=1; BENCH_INPUT=none stands still), tools/native/ab.sh NAME
+SETTING A B (flips a runtime setting during ONE run: separate runs see different scenes and
+misled two comparisons), --gtav_wait_profile (per-thread waits by caller, who releases the
+semaphores, audio/update timeline, GPU fence distances). Tried and dropped: SDK mprotect write
+watch (250 ms stalls), protecting a copy's pages at each recheck (missed writes), audio command
+stamp hook (no effect), command processor lag 0/3 as default, PGO (GTAV_PGO, ~3%, off).
+Next levers: the update thread is game code (~8 ms/frame); our renderer ~4 us/draw (parallel
+recording would help heavy scenes); the SDK global critical-region mutex is contended
+(object table lookups) - ~6% kernel time on the update thread.
