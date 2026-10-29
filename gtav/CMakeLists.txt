@@ -91,6 +91,8 @@ set(GTAV_NATIVE_SHADER_DIR ${CMAKE_BINARY_DIR}/native_shaders)
 set(GTAV_BLIT_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/native_blit.hlsl)
 set(GTAV_RECTLIST_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/native_rectlist.hlsl)
 set(GTAV_MEMORY_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/native_memory.hlsl)
+# Replacement for one generated game shader (tile classification), see the file.
+set(GTAV_TILE_CLASSIFY_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/ps_D258EBE32001470C_tiles.hlsl)
 add_custom_command(
     OUTPUT ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h
     COMMAND ${CMAKE_COMMAND} -E make_directory ${GTAV_NATIVE_SHADER_DIR}
@@ -122,6 +124,10 @@ add_custom_command(
             -T ps_6_0 -E PSAlpha -spirv -fspv-target-env=vulkan1.1 -Vn g_native_alpha_ps
             -Fh ${GTAV_NATIVE_SHADER_DIR}/native_alpha_ps.h ${GTAV_BLIT_HLSL}
     COMMAND ${GTAV_DXC}
+            -T ps_6_0 -HV 2021 -all-resources-bound -spirv -fvk-use-dx-layout -Wno-ignored-attributes
+            -Qstrip_debug -Vn g_native_tile_classify_ps
+            -Fh ${GTAV_NATIVE_SHADER_DIR}/native_tile_classify_ps.h ${GTAV_TILE_CLASSIFY_HLSL}
+    COMMAND ${GTAV_DXC}
             -T ps_6_0 -E PSDiagFlat -spirv -fspv-target-env=vulkan1.1 -Vn g_native_diag_flat_ps
             -Fh ${GTAV_NATIVE_SHADER_DIR}/native_diag_flat_ps.h ${GTAV_BLIT_HLSL}
     COMMAND ${CMAKE_COMMAND} -E echo "#pragma once" > ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h
@@ -135,7 +141,8 @@ add_custom_command(
     COMMAND ${CMAKE_COMMAND} -E echo "#include \"native_depth_pack_ps.h\"" >> ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h
     COMMAND ${CMAKE_COMMAND} -E echo "#include \"native_blit_vs.h\"" >> ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h
     COMMAND ${CMAKE_COMMAND} -E echo "#include \"native_blit_ps.h\"" >> ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h
-    DEPENDS ${GTAV_BLIT_HLSL} ${GTAV_RECTLIST_HLSL} ${GTAV_MEMORY_HLSL}
+    COMMAND ${CMAKE_COMMAND} -E echo "#include \"native_tile_classify_ps.h\"" >> ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h
+    DEPENDS ${GTAV_BLIT_HLSL} ${GTAV_RECTLIST_HLSL} ${GTAV_MEMORY_HLSL} ${GTAV_TILE_CLASSIFY_HLSL}
     VERBATIM)
 add_custom_target(gtav_native_shaders DEPENDS ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h)
 add_dependencies(gtav gtav_native_shaders)

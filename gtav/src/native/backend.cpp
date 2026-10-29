@@ -59,6 +59,9 @@ REXCVAR_DEFINE_INT32(gtav_native_dump_frame, 0, "GTAV",
                      "Dump every resolve of this guest frame to logs/native_dump/ as PNG");
 REXCVAR_DEFINE_INT32(gtav_native_dump_frames, 1, "GTAV",
                      "Frame dumps: one request (F9) dumps this many consecutive frames (~350 MB each)");
+REXCVAR_DEFINE_BOOL(gtav_native_tile_penumbra_all, true, "GTAV",
+                    "Deferred sun lighting: every 16x16 tile takes the per-pixel penumbra variant "
+                    "(shaders/ps_D258EBE32001470C_tiles.hlsl); false uses the game's classification (blocky)");
 
 namespace gtav::native {
 
@@ -1205,7 +1208,10 @@ struct Backend::Impl {
     std::unique_ptr<RenderShader> shader;
     std::vector<uint8_t> data;
     std::unique_ptr<RenderShader> ready;
-    if (int got = g_spirv_preload.TakeShader(name, &ready, &data); got == 1) {
+    if (pixel && hash == 0xD258EBE32001470Cull && REXCVAR_GET(gtav_native_tile_penumbra_all)) {
+      shader = device->createShader(g_native_tile_classify_ps, sizeof(g_native_tile_classify_ps), "main",
+                                    RenderShaderFormat::SPIRV);
+    } else if (int got = g_spirv_preload.TakeShader(name, &ready, &data); got == 1) {
       shader = std::move(ready);
     } else if (got == 2) {
       shader = device->createShader(data.data(), data.size(), "main", RenderShaderFormat::SPIRV);
