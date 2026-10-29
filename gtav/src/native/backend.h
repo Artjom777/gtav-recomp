@@ -11,6 +11,7 @@
 #include <plume_render_interface.h>
 
 #include <cstdint>
+#include <vector>
 #include <memory>
 
 struct ImDrawData;
@@ -55,6 +56,16 @@ class Backend {
     double shader_ms, pipeline_ms, texture_ms, resolve_ms;  // time in cache misses / resolves
   };
   FrameStats LastStats() const;
+
+  // One line per draw of the last executed frame, for the glitch inspector (--gtav_native_flicker_catch).
+  struct DrawNote {
+    uint64_t vs, ps;
+    uint32_t rt0, depth, vb, vb_size, stride, ib, start, count, prim;
+    int32_t base_vertex;
+    uint32_t tex[4];  // base addresses of the first four bound textures
+    uint8_t copied, rewritten, skipped, uploads;  // data from a copy / changed since the D3D call / texture uploads
+  };
+  const std::vector<DrawNote>& LastNotes() const;
 
   // Frame dump (--gtav_native_dump_frame=N): every resolve of guest frame N is captured right
   // after it executes; WriteDump saves them as PNGs once the frame's fence passed.

@@ -519,24 +519,29 @@ class Renderer {
     // History of the last two frames (grid + image), consecutive guest frames only.
     if (REXCVAR_GET(gtav_native_flicker_catch) && flick_hist_n_ == 2 && index == flick_hist_index_[1] + 1 && flick_hist_index_[1] == flick_hist_index_[0] + 1) {
       const auto &g0 = flick_hist_grid_[0], &g1 = flick_hist_grid_[1];
-      uint32_t odd = 0, x0 = kGw, y0 = kGh, x1 = 0, y1 = 0;
+      // Odd points: frame n-1 differs strongly from both neighbours, which agree. GTA's dither
+      // and fades scatter single odd points every frame; a glitch fills whole 4x4-point (32 px)
+      // blocks. At least 6 blocks at least half odd.
+      constexpr uint32_t kBw = kGw / 4, kBh = (kGh + 3) / 4;
+      uint32_t block_odd[kBw * kBh] = {};
       for (uint32_t y = 0; y < kGh; y++)
         for (uint32_t x = 0; x < kGw; x++) {
           uint32_t i = y * kGw + x;
           int a = g0[i], b = g1[i], c = grid[i];
-          if (std::abs(b - a) > 40 && std::abs(b - c) > 40 && std::abs(a - c) < 16) {
-            odd++;
-            x0 = std::min(x0, x), y0 = std::min(y0, y), x1 = std::max(x1, x), y1 = std::max(y1, y);
-          }
+          if (std::abs(b - a) > 40 && std::abs(b - c) > 40 && std::abs(a - c) < 16) block_odd[(y / 4) * kBw + x / 4]++;
         }
-      // A stray triangle is one dense region; scattered points over the whole screen are
-      // frame-to-frame dither noise. At least 1% of the grid, filling 30% of its box.
-      uint32_t box = (x1 - x0 + 1) * (y1 - y0 + 1);
-      if (odd * 100 > kGw * kGh && odd * 10 >= box * 3) {
+      uint32_t odd = 0, x0 = kGw, y0 = kGh, x1 = 0, y1 = 0;
+      for (uint32_t by = 0; by < kBh; by++)
+        for (uint32_t bx = 0; bx < kBw; bx++)
+          if (block_odd[by * kBw + bx] >= 8) {
+            odd++;
+            x0 = std::min(x0, bx * 4), y0 = std::min(y0, by * 4), x1 = std::max(x1, bx * 4 + 3), y1 = std::max(y1, by * 4 + 3);
+          }
+      if (odd >= 6) {
         flick_count_++;
-        REXLOG_INFO("[native] flicker #{}: guest frame {} differs from both neighbours over {} of {} grid points "
-                    "(box {},{}-{},{} of 160x90){}",
-                    flick_count_, flick_hist_index_[1], odd, kGw * kGh, x0, y0, x1, y1,
+        REXLOG_INFO("[native] flicker #{}: guest frame {} differs from both neighbours in {} of {} 32-px "
+                    "blocks (box {},{}-{},{} of 160x90){}",
+                    flick_count_, flick_hist_index_[1], odd, kBw * kBh, x0, y0, x1, y1,
                     flick_count_ <= 40 ? "; frames saved to logs/flicker" : "");
         if (flick_count_ <= 40) {
           std::error_code ec;
@@ -552,6 +557,20 @@ class Renderer {
           write(flick_hist_rgb_[0], flick_hist_index_[0], "a_before");
           write(flick_hist_rgb_[1], flick_hist_index_[1], "b_glitch");
           write(rgb, index, "c_after");
+          auto notes = [&](const std::vector<Backend::DrawNote>& list, uint64_t at, const char* tag) {
+            std::ofstream out(fmt::format("{}/flicker_{:06}_{}.txt", dir, at, tag));
+            uint32_t k = 0;
+            for (const auto& n : list)
+              out << fmt::format("{:4} vs {:016X} ps {:016X} rt {:08X} ds {:08X} vb {:08X}+{:X}/{} ib {:08X} "
+                                 "start {} count {} prim {} bv {} tex {:08X} {:08X} {:08X} {:08X}{}{}{}{}\n",
+                                 k++, n.vs, n.ps, n.rt0, n.depth, n.vb, n.vb_size, n.stride, n.ib, n.start, n.count,
+                                 n.prim, n.base_vertex, n.tex[0], n.tex[1], n.tex[2], n.tex[3],
+                                 n.copied ? " COPY" : "", n.rewritten ? " REWRITTEN" : "", n.skipped ? " SKIPPED" : "",
+                                 n.uploads ? fmt::format(" UPLOADS {}", n.uploads) : "");
+          };
+          notes(flick_hist_notes_[0], flick_hist_index_[0], "a_before");
+          notes(flick_hist_notes_[1], flick_hist_index_[1], "b_glitch");
+          notes(flick_notes_[slot], index, "c_after");
         }
       }
     }
@@ -563,11 +582,13 @@ class Renderer {
     else {
       std::swap(flick_hist_grid_[0], flick_hist_grid_[1]);
       std::swap(flick_hist_rgb_[0], flick_hist_rgb_[1]);
+      std::swap(flick_hist_notes_[0], flick_hist_notes_[1]);
       flick_hist_index_[0] = flick_hist_index_[1];
     }
     flick_hist_grid_[flick_hist_n_ - 1] = std::move(grid);
     flick_hist_rgb_[flick_hist_n_ - 1] = std::move(rgb);
     flick_hist_index_[flick_hist_n_ - 1] = index;
+    flick_hist_notes_[flick_hist_n_ - 1] = std::move(flick_notes_[slot]);
   }
 
   // F8 (--gtav_native_replay): the last kReplayFrames presented frames, written on a worker
@@ -734,6 +755,7 @@ class Renderer {
                                          "{} texture uploads",
                                          st.draws, st.skipped, st.rewritten, st.pipelines_created, st.textures);
       }
+      if (backend_ok_ && REXCVAR_GET(gtav_native_flicker_catch)) flick_notes_[slot] = backend_.LastNotes();
       FlickerCapture(slot, frame.index, front_descriptor, w, h);
     }
     if (key_replay_.exchange(false)) WriteReplay(frame.index);
@@ -1013,6 +1035,7 @@ class Renderer {
   uint64_t flick_hist_index_[2] = {};
   uint32_t flick_hist_n_ = 0, flick_count_ = 0;
   std::string flick_stats_[Backend::kFramesInFlight];
+  std::vector<Backend::DrawNote> flick_notes_[Backend::kFramesInFlight], flick_hist_notes_[2];
   struct ReplayFrame {
     uint64_t index;
     std::vector<uint8_t> rgb;

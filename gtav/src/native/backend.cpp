@@ -44,6 +44,7 @@
 #include <vector>
 
 REXCVAR_DECLARE(std::string, gtav_native_spirv_dir);
+REXCVAR_DECLARE(bool, gtav_native_flicker_catch);
 REXCVAR_DEFINE_INT32(gtav_native_dump_rt, 0x2D0, "GTAV",
                      "Frame dumps: EDRAM base of the color target snapshotted after every draw (0x2D0 = scene HDR)");
 REXCVAR_DEFINE_INT32(gtav_native_dump_rt_skip, 0, "GTAV",
@@ -53,6 +54,9 @@ REXCVAR_DEFINE_BOOL(gtav_native_exact_cache, false, "GTAV",
                     "(no sampled-hash shortcut for large ones)");
 REXCVAR_DEFINE_INT32(gtav_native_dump_rt_count, 150, "GTAV",
                      "Frame dumps: number of per-draw snapshots of --gtav_native_dump_rt (~2.7 MB each at 720p)");
+REXCVAR_DEFINE_DOUBLE(gtav_native_pipeline_wait_ms, 40.0, "GTAV",
+                      "Background pipeline compiles: a frame waits up to this long in total for its draws' "
+                      "pipelines before skipping them (0: never wait)");
 REXCVAR_DEFINE_BOOL(gtav_native_async_pipelines, true, "GTAV",
                     "Create new pipelines on worker threads (the draw is skipped until ready) instead of "
                     "stalling the frame");
@@ -600,7 +604,9 @@ struct Backend::Impl {
   uint32_t alpha_funcs_logged = 0;
   uint32_t zero_textures_logged = 0;
   uint64_t data_changed_draws = 0, data_checked_draws = 0;  // DrawDataHash mismatches at record time
-  uint64_t data_changed_snapped = 0, data_snapped_draws = 0;  // ... of them / all draws with a capture copy
+  uint64_t data_changed_snapped = 0, data_snapped_draws = 0;
+  std::vector<Backend::DrawNote> notes;  // this frame's draws (only with --gtav_native_flicker_catch)
+  bool take_notes = false;  // ... of them / all draws with a capture copy
   std::set<uint64_t> data_changed_examples;  // RB_COLORCONTROL alpha functions already logged (bit per function)
 
   static uint64_t SampleGuest(uint32_t address, uint32_t size) {
@@ -964,6 +970,25 @@ struct Backend::Impl {
   // black flickers): pipeline still compiling, vertex shader or pixel shader SPIR-V not ready
   // (a missing pixel shader draws depth-only).
   uint32_t lost_pipeline = 0, lost_vs = 0, lost_ps = 0;
+  double pipeline_wait_ms = 0;  // this frame's waits for background pipeline compiles
+
+  // A draw whose pipeline is still compiling in the background waits for it while this frame's
+  // budget (--gtav_native_pipeline_wait_ms) lasts: a skipped draw is a one-frame hole (a car
+  // vanishing, the sky going dark). Only compiles longer than the budget still skip.
+  bool WaitForJob(const PipelineJob& job) {
+    if (job.done.load(std::memory_order_acquire)) return true;
+    double budget = REXCVAR_GET(gtav_native_pipeline_wait_ms) - pipeline_wait_ms;
+    if (budget <= 0) return false;
+    auto start = std::chrono::steady_clock::now();
+    bool done = false;
+    for (;;) {
+      if ((done = job.done.load(std::memory_order_acquire))) break;
+      if (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() >= budget) break;
+      std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+    pipeline_wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    return done;
+  }
   std::string lost_first;
   double t_shader = 0, t_pipeline = 0, t_texture = 0, t_resolve = 0;
 
@@ -1776,7 +1801,7 @@ struct Backend::Impl {
     auto it = pipelines.find(key);
     if (it != pipelines.end()) return it->second.get();
     if (auto p = pending_pipelines.find(key); p != pending_pipelines.end()) {
-      if (!p->second->done.load(std::memory_order_acquire)) return nullptr;
+      if (!WaitForJob(*p->second)) return nullptr;
       auto& done = pipelines[key] = std::move(p->second->result);
       pending_pipelines.erase(p);
       return done.get();
@@ -1894,8 +1919,11 @@ struct Backend::Impl {
       job->desc.inputSlots = job->slots.data();
       job->desc.specConstants = &job->spec;
       pending_pipelines[key] = job;
-      pipeline_compiler.Enqueue(device, std::move(job));
-      return nullptr;
+      pipeline_compiler.Enqueue(device, job);
+      if (!WaitForJob(*job)) return nullptr;
+      auto& done = pipelines[key] = std::move(job->result);
+      pending_pipelines.erase(key);
+      return done.get();
     }
     auto pipeline = device->createGraphicsPipeline(desc);
     return (pipelines[key] = std::move(pipeline)).get();
@@ -2020,6 +2048,26 @@ struct Backend::Impl {
   }
 
   void Draw(RenderCommandList* list, const FramePacket& f, const DrawCommand& d) {
+    if (!take_notes) return DrawImpl(list, f, d, nullptr);
+    Backend::DrawNote& n = notes.emplace_back();
+    n = {d.vs_hash, d.ps_hash, d.render_targets[0], d.depth_stencil, d.streams[0].address, d.streams[0].size,
+         d.streams[0].stride, d.indexed ? d.index_address : 0, d.start, d.count, d.primitive, d.base_vertex,
+         {}, uint8_t(d.snap_vertices != 0), 0, 0, 0};
+    const uint8_t* fetch = f.At(d.fetch);
+    for (uint32_t slot = 0, k = 0; slot < 32 && k < 4; slot++) {
+      uint32_t w0 = be32(fetch + slot * 24), w1 = be32(fetch + slot * 24 + 4);
+      if ((w0 & 3) == 2 && (w1 & ~0xFFFu)) n.tex[k++] = w1 & ~0xFFFu;
+    }
+    size_t at = notes.size() - 1;
+    uint32_t skipped = stat_skipped, uploads = stat_textures, rewritten = stat_rewritten;
+    DrawImpl(list, f, d, nullptr);
+    auto& m = notes[at];
+    m.skipped = stat_skipped != skipped;
+    m.uploads = uint8_t(std::min<uint32_t>(stat_textures - uploads, 255));
+    m.rewritten = stat_rewritten != rewritten;
+  }
+
+  void DrawImpl(RenderCommandList* list, const FramePacket& f, const DrawCommand& d, void*) {
     prof.Start();
     const uint8_t* r = f.At(d.regs);
     // Did the game rewrite this draw's vertex/index memory since the D3D call? (logged with the
@@ -3286,6 +3334,8 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   s.bound_fb = nullptr;
   s.grow_list = list;
   s.stat_draws = s.stat_skipped = s.stat_pipelines_created = s.stat_textures = s.stat_rewritten = 0;
+  s.notes.clear();
+  s.take_notes = REXCVAR_GET(gtav_native_flicker_catch);
   s.t_shader = s.t_pipeline = s.t_texture = s.t_resolve = 0;
   s.tile_split = 0;
   s.tile_resolves.clear();
@@ -3359,6 +3409,7 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
     REXLOG_INFO("[native] frame {} lost draws: {} pipelines compiling, {} vertex / {} pixel shaders not ready; first: {}",
                 f.index, s.lost_pipeline, s.lost_vs, s.lost_ps, s.lost_first);
   s.lost_pipeline = s.lost_vs = s.lost_ps = 0;
+  s.pipeline_wait_ms = 0;
   s.lost_first.clear();
   if (f.index % 150 == 0)
     REXLOG_INFO("[native] replay frame {}: {} drawn, {} skipped, {} new pipelines ({} total), {} texture uploads, "
@@ -3398,6 +3449,8 @@ void Backend::EndFrame(uint32_t slot) { impl_->SwapFrameState(impl_->parked[slot
 bool Backend::Dumping() const { return impl_->dumping; }
 
 void Backend::RequestDump() { impl_->dump_request = true; }
+
+const std::vector<Backend::DrawNote>& Backend::LastNotes() const { return impl_->notes; }
 
 Backend::FrameStats Backend::LastStats() const {
   return {impl_->stat_draws, impl_->stat_skipped, impl_->stat_pipelines_created, impl_->stat_textures,
