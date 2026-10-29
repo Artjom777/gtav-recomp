@@ -23,7 +23,7 @@
 #define XXH_INLINE_ALL
 #include <imgui.h>
 #include <xxhash.h>
-#include <immintrin.h>
+#include "byteswap_simd.h"
 
 #include <algorithm>
 #include <chrono>
@@ -2324,16 +2324,12 @@ struct Backend::Impl {
 
   // Only the registers the shader reads (`use`, all when null) are swapped: the rest of the block
   // is undefined.
-  __attribute__((target("ssse3"))) UploadAllocation ConstantUpload(const uint8_t* src, uint32_t offset,
-                                                                   const ConstantUse* use, LastConstants& last) {
+  GTAV_SWAP16_TARGET UploadAllocation ConstantUpload(const uint8_t* src, uint32_t offset, const ConstantUse* use,
+                                                    LastConstants& last) {
     if (last.valid && last.offset == offset && (last.use == use || !last.use)) return last.gpu;
     auto a = upload.Allocate(kAluSize);
-    const __m128i swap = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
     auto run = [&](uint32_t first, uint32_t count) {
-      for (uint32_t i = first * 16; i < (first + count) * 16; i += 16) {
-        __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i));
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(a.cpu + i), _mm_shuffle_epi8(v, swap));
-      }
+      for (uint32_t i = first * 16; i < (first + count) * 16; i += 16) Swap16Bytes(a.cpu + i, src + i, 4);
     };
     if (use)
       for (const auto& r : use->runs) run(r.first, r.count);
@@ -2347,14 +2343,9 @@ struct Backend::Impl {
   }
 
   // Big-endian 16- or 32-bit indices to host order, 16 bytes at a time.
-  __attribute__((target("ssse3"))) static void SwapIndices(uint8_t* out, const uint8_t* in, uint32_t bytes,
-                                                           uint32_t unit) {
-    const __m128i swap = unit == 4 ? _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12)
-                                   : _mm_setr_epi8(1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14);
+  GTAV_SWAP16_TARGET static void SwapIndices(uint8_t* out, const uint8_t* in, uint32_t bytes, uint32_t unit) {
     uint32_t i = 0;
-    for (; i + 16 <= bytes; i += 16)
-      _mm_storeu_si128(reinterpret_cast<__m128i*>(out + i),
-                       _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(in + i)), swap));
+    for (; i + 16 <= bytes; i += 16) Swap16Bytes(out + i, in + i, unit);
     for (; i + unit <= bytes; i += unit)
       for (uint32_t b = 0; b < unit; b++) out[i + b] = in[i + unit - 1 - b];
   }

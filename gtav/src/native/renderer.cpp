@@ -332,6 +332,15 @@ class Renderer {
           r->window_ = SDL_CreateWindow(on ? "GTA V" : "GTA V - native renderer (shadow)", 1280, 720,
                                         SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE |
                                             (REXCVAR_GET(gtav_native_hidden) ? SDL_WINDOW_HIDDEN : 0));
+#ifdef __APPLE__
+          // Plume's Vulkan backend (MoltenVK) on macOS takes the NSWindow and a CAMetalLayer.
+          if (r->window_) {
+            r->metal_view_ = SDL_Metal_CreateView(r->window_);
+            r->render_window_.window = SDL_GetPointerProperty(SDL_GetWindowProperties(r->window_),
+                                                              SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, nullptr);
+            r->render_window_.view = r->metal_view_ ? SDL_Metal_GetLayer(r->metal_view_) : nullptr;
+          }
+#endif
           // F9 (dump the next frame) and F10 (screenshot; marks audio captures) from any of the
           // process's windows, like the Win32 timer poll. The watch runs where the SDK pumps events.
           SDL_AddEventWatch(
@@ -376,7 +385,13 @@ class Renderer {
     // Init steps are logged: a cold first boot after a rebuild sometimes never got past here.
     REXLOG_INFO("[native] init: queue created, creating the swap chain");
     swapchain_ = queue_cmd_->createSwapChain(
-        plume::RenderSwapChainDesc(window_, plume::RenderFormat::B8G8R8A8_UNORM, kSwapchainBuffers));
+        plume::RenderSwapChainDesc(
+#ifdef __APPLE__
+            render_window_,
+#else
+            window_,
+#endif
+            plume::RenderFormat::B8G8R8A8_UNORM, kSwapchainBuffers));
     menu::LoadSettings();
     vsync_ = REXCVAR_GET(gtav_native_vsync);
     swapchain_->setVsyncEnabled(vsync_);
@@ -1029,6 +1044,10 @@ class Renderer {
   std::thread window_thread_;
 #else
   SDL_Window* window_ = nullptr;
+#ifdef __APPLE__
+  SDL_MetalView metal_view_ = nullptr;
+  plume::RenderWindow render_window_ = {};
+#endif
 #endif
   std::unique_ptr<plume::RenderInterface> interface_;
   std::unique_ptr<plume::RenderDevice> device_;

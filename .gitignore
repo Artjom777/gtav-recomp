@@ -12,3 +12,5 @@ build-dll/
 build-launcher/
 dist/
 __pycache__/
+rexglue-sdk/
+.DS_Store

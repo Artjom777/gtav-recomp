@@ -25,8 +25,8 @@
 #define XXH_INLINE_ALL
 #include <xxhash.h>
 
+#include "safe_read.h"
 #ifndef _WIN32
-#include <sys/uio.h>
 #include <unistd.h>
 #endif
 
@@ -228,9 +228,7 @@ bool SafeCopy(uint32_t phys, uint32_t size, std::vector<uint8_t>& out) {
   std::memcpy(out.data(), REX_KERNEL_MEMORY()->TranslatePhysical(phys), size);
   return true;
 #else
-  iovec local{out.data(), size};
-  iovec remote{const_cast<uint8_t*>(REX_KERNEL_MEMORY()->TranslatePhysical(phys)), size};
-  return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == ssize_t(size);
+  return SafeReadMemory(out.data(), REX_KERNEL_MEMORY()->TranslatePhysical(phys), size);
 #endif
 }
 struct Expected {
