@@ -205,6 +205,8 @@ recording would help heavy scenes); the SDK global critical-region mutex is cont
 (object table lookups) - ~6% kernel time on the update thread.
 
 ## NEXT SESSION (owner, 10-29): the Android port, working well
+**Changed (owner, 10-29): macOS port first on the owner's Mac, then Android from the Mac. Full
+plan: docs/MAC_THEN_ANDROID_PLAN.md.** The notes below still apply to Android.
 Owner play-tested the performance pass ("that looks great"); pushed d10cd61 with
 docs/HANDOFF_WINDOWS_MAC_2026-10-29.md. Next on this machine: get GTA V running well on Android.
 Starting facts:
