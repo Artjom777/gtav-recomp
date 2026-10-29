@@ -203,3 +203,21 @@ stamp hook (no effect), command processor lag 0/3 as default, PGO (GTAV_PGO, ~3%
 Next levers: the update thread is game code (~8 ms/frame); our renderer ~4 us/draw (parallel
 recording would help heavy scenes); the SDK global critical-region mutex is contended
 (object table lookups) - ~6% kernel time on the update thread.
+
+## NEXT SESSION (owner, 10-29): the Android port, working well
+Owner play-tested the performance pass ("that looks great"); pushed d10cd61 with
+docs/HANDOFF_WINDOWS_MAC_2026-10-29.md. Next on this machine: get GTA V running well on Android.
+Starting facts:
+- Nothing Android exists yet: no NDK/SDK on this machine, no Android build of the SDK or game.
+  The SDK has a few REX_PLATFORM_ANDROID paths from xenia (memory_posix, mapped_memory_posix,
+  threading_posix, Vulkan instance/presenter).
+- arm64: the x86 intrinsics in gtav/src/native/backend.cpp (SSSE3 byte swaps) need NEON/scalar
+  paths; -mcmodel/-march block in gtav/CMakeLists.txt is x86 only; the generated code is
+  portable C++ (check the SDK's PPC intrinsics header for x86-only bits).
+- Write watch (write_watch.cpp) needs userfaultfd + PAGEMAP_SCAN (kernel 6.7+); Android apps are
+  normally blocked from userfaultfd, so expect the hashing fallback (costlier on a phone CPU).
+- The 5.3 ms audio pass cadence matters (update thread waits for it): check the `[waits]
+  timeline` on the device (AAudio period).
+- Memory: the guest arena is a 4.8 GB shared mapping (+ views); phones need a smaller/differently
+  backed arena or a 64-bit address space with overcommit; game data (~8 GB) must live on device.
+- Plan the session first (toolchain, build, packaging, input, data location, perf targets).
