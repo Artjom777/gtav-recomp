@@ -40,6 +40,7 @@ constexpr const char* kSettings[] = {
     "gtav_native_fps",
     "gtav_native_tile_penumbra_all",
     "gtav_native_async_pipelines",
+    "gpu_skip_rendering_lag_ms",
 };
 
 std::filesystem::path SettingsPath() { return ExeDir() / "gtav_settings.ini"; }
@@ -56,10 +57,17 @@ void SetBool(const char* name, bool value) { rex::cvar::SetFlagByName(name, valu
 // Presets: the two ends of the trade-off. "Best image" draws everything exactly as soon as it
 // appears (new pipelines are built on the spot, a short hitch the first time an effect shows up)
 // with the per-pixel sun shadows; "Max performance" keeps the frame moving (new effects are
-// skipped for a frame or two while they compile) and lets the game skip shadow work per tile.
+// skipped for a frame or two while they compile), lets the game skip shadow work per tile and
+// lets the emulated GPU trail the game less.
+// How far the emulated GPU trails the game's kicks (ms): 6 is the tested value (foliage stopped
+// flickering while driving); 2 is ~20% faster (the game waits on GPU fences every frame).
+constexpr const char* kSafeGpuLag = "6";
+constexpr const char* kFastGpuLag = "2";
+
 void ApplyPreset(bool best) {
   SetBool("gtav_native_tile_penumbra_all", best);
   SetBool("gtav_native_async_pipelines", !best);
+  rex::cvar::SetFlagByName("gpu_skip_rendering_lag_ms", best ? kSafeGpuLag : kFastGpuLag);
   if (!best) {
     rex::cvar::SetFlagByName("gtav_fps_limit", "0");
     SetBool("gtav_native_vsync", false);
@@ -154,6 +162,16 @@ void Build(uint32_t fps, double frame_ms) {
   check("Compile new effects in the background", "gtav_native_async_pipelines",
         "On: no hitch when a new effect first appears; it is skipped for a frame or two instead.\n"
         "Off: it is drawn from its first frame, with a short hitch while it is built.");
+  {
+    bool fast = std::atoi(rex::cvar::GetFlagByName("gpu_skip_rendering_lag_ms").c_str()) < std::atoi(kSafeGpuLag);
+    if (ImGui::Checkbox("Low GPU latency", &fast)) {
+      rex::cvar::SetFlagByName("gpu_skip_rendering_lag_ms", fast ? kFastGpuLag : kSafeGpuLag);
+      changed = true;
+    }
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("On: the emulated GPU trails the game by 2 ms instead of 6 (about 20%% more fps).\n"
+                        "Off: the tested setting; with On, watch foliage and distant meshes while driving.");
+  }
   if (changed) SaveSettings();
   ImGui::End();
   if (!open) g_open = false;
