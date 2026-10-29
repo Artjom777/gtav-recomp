@@ -73,3 +73,7 @@ for audio). Water is done; see "Fixed 10-28" below.
   target cache (TileAlias / MsaaAlias are the hand-coded cases so far). Car reflections come from
   the reflection probe / cube resolves; re-check them after the 95617bd polygon-offset fix. Get an
   F9 dump at a car with blocky reflections and compare with the emulator (shadow mode).
+- Owner (10-28 night, during the audio play-test): the SHADOWS are also still blocky. Treat both
+  in the same session: the remaining shadow blocks (top band) were already suspected to share
+  the EDRAM-leftover cause with the reflections (NEXT_SESSION_2026-10-28.md section 3). Get F9
+  dumps of both (a car with blocky reflections, a spot with blocky shadows) in one sitting.
