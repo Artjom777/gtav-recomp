@@ -32,6 +32,7 @@ set(GTAV_SOURCES
     src/native/d3d_hooks.cpp
     src/native/renderer.cpp
     src/native/shaders.cpp
+    src/native/menu.cpp
     src/native/backend.cpp
     src/native/textures.cpp
     src/native/shader_compiler.cpp
@@ -91,6 +92,7 @@ set(GTAV_NATIVE_SHADER_DIR ${CMAKE_BINARY_DIR}/native_shaders)
 set(GTAV_BLIT_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/native_blit.hlsl)
 set(GTAV_RECTLIST_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/native_rectlist.hlsl)
 set(GTAV_MEMORY_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/native_memory.hlsl)
+set(GTAV_MENU_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/native_menu.hlsl)
 # Replacement for one generated game shader (tile classification), see the file.
 set(GTAV_TILE_CLASSIFY_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/ps_D258EBE32001470C_tiles.hlsl)
 add_custom_command(
@@ -124,6 +126,12 @@ add_custom_command(
             -T ps_6_0 -E PSAlpha -spirv -fspv-target-env=vulkan1.1 -Vn g_native_alpha_ps
             -Fh ${GTAV_NATIVE_SHADER_DIR}/native_alpha_ps.h ${GTAV_BLIT_HLSL}
     COMMAND ${GTAV_DXC}
+            -T vs_6_0 -E VSMenu -HV 2021 -spirv -Vn g_native_menu_vs
+            -Fh ${GTAV_NATIVE_SHADER_DIR}/native_menu_vs.h ${GTAV_MENU_HLSL}
+    COMMAND ${GTAV_DXC}
+            -T ps_6_0 -E PSMenu -HV 2021 -spirv -Vn g_native_menu_ps
+            -Fh ${GTAV_NATIVE_SHADER_DIR}/native_menu_ps.h ${GTAV_MENU_HLSL}
+    COMMAND ${GTAV_DXC}
             -T ps_6_0 -HV 2021 -all-resources-bound -spirv -fvk-use-dx-layout -Wno-ignored-attributes
             -Qstrip_debug -Vn g_native_tile_classify_ps
             -Fh ${GTAV_NATIVE_SHADER_DIR}/native_tile_classify_ps.h ${GTAV_TILE_CLASSIFY_HLSL}
@@ -142,7 +150,9 @@ add_custom_command(
     COMMAND ${CMAKE_COMMAND} -E echo "#include \"native_blit_vs.h\"" >> ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h
     COMMAND ${CMAKE_COMMAND} -E echo "#include \"native_blit_ps.h\"" >> ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h
     COMMAND ${CMAKE_COMMAND} -E echo "#include \"native_tile_classify_ps.h\"" >> ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h
-    DEPENDS ${GTAV_BLIT_HLSL} ${GTAV_RECTLIST_HLSL} ${GTAV_MEMORY_HLSL} ${GTAV_TILE_CLASSIFY_HLSL}
+    COMMAND ${CMAKE_COMMAND} -E echo "#include \"native_menu_vs.h\"" >> ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h
+    COMMAND ${CMAKE_COMMAND} -E echo "#include \"native_menu_ps.h\"" >> ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h
+    DEPENDS ${GTAV_BLIT_HLSL} ${GTAV_RECTLIST_HLSL} ${GTAV_MEMORY_HLSL} ${GTAV_TILE_CLASSIFY_HLSL} ${GTAV_MENU_HLSL}
     VERBATIM)
 add_custom_target(gtav_native_shaders DEPENDS ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h)
 add_dependencies(gtav gtav_native_shaders)

@@ -4,6 +4,7 @@
 
 #include "backend.h"
 #include "frame.h"
+#include "menu.h"
 #include "paths.h"
 #include "shader_compiler.h"
 
@@ -161,6 +162,26 @@ class Renderer {
   static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     // F9 (dump the next frame to logs/native_dump) and F10 (screenshot to logs/shots) are polled
     // by the window thread's timer, so they work from the SDK's window too (shadow mode).
+    // Settings menu: Esc toggles it; mouse and navigation keys while it is open (menu.h).
+    switch (msg) {
+      case WM_MOUSEMOVE: menu::OnMouseMove(float(short(LOWORD(lp))), float(short(HIWORD(lp)))); break;
+      case WM_LBUTTONDOWN: case WM_LBUTTONUP: menu::OnMouseButton(0, msg == WM_LBUTTONDOWN); break;
+      case WM_RBUTTONDOWN: case WM_RBUTTONUP: menu::OnMouseButton(1, msg == WM_RBUTTONDOWN); break;
+      case WM_MOUSEWHEEL: menu::OnMouseWheel(float(GET_WHEEL_DELTA_WPARAM(wp)) / WHEEL_DELTA); break;
+      case WM_KEYDOWN:
+      case WM_KEYUP: {
+        bool down = msg == WM_KEYDOWN;
+        if (wp == VK_ESCAPE && down && !(lp & (1 << 30))) menu::OnEscape();
+        if (wp == VK_UP) menu::OnKey(menu::Key::kUp, down);
+        if (wp == VK_DOWN) menu::OnKey(menu::Key::kDown, down);
+        if (wp == VK_LEFT) menu::OnKey(menu::Key::kLeft, down);
+        if (wp == VK_RIGHT) menu::OnKey(menu::Key::kRight, down);
+        if (wp == VK_RETURN) menu::OnKey(menu::Key::kEnter, down);
+        if (wp == VK_SPACE) menu::OnKey(menu::Key::kSpace, down);
+        if (wp == VK_TAB) menu::OnKey(menu::Key::kTab, down);
+        break;
+      }
+    }
     if (msg == WM_CLOSE) {  // the native window is the game window: closing it quits
       REXLOG_INFO("[native] window closed, exiting");
       ExitProcess(0);
@@ -253,6 +274,39 @@ class Renderer {
   }
 #endif
 
+#ifndef _WIN32
+  // Settings menu input (menu.h queues it while the menu is open): the native window's mouse and
+  // the navigation keys.
+  static void MenuInput(const SDL_Event* e) {
+    switch (e->type) {
+      case SDL_EVENT_MOUSE_MOTION: menu::OnMouseMove(e->motion.x, e->motion.y); break;
+      case SDL_EVENT_MOUSE_BUTTON_DOWN:
+      case SDL_EVENT_MOUSE_BUTTON_UP: {
+        int b = e->button.button == SDL_BUTTON_LEFT ? 0 : e->button.button == SDL_BUTTON_RIGHT ? 1 : 2;
+        menu::OnMouseButton(b, e->type == SDL_EVENT_MOUSE_BUTTON_DOWN);
+        break;
+      }
+      case SDL_EVENT_MOUSE_WHEEL: menu::OnMouseWheel(e->wheel.y); break;
+      case SDL_EVENT_KEY_DOWN:
+      case SDL_EVENT_KEY_UP: {
+        bool down = e->type == SDL_EVENT_KEY_DOWN;
+        switch (e->key.scancode) {
+          case SDL_SCANCODE_UP: menu::OnKey(menu::Key::kUp, down); break;
+          case SDL_SCANCODE_DOWN: menu::OnKey(menu::Key::kDown, down); break;
+          case SDL_SCANCODE_LEFT: menu::OnKey(menu::Key::kLeft, down); break;
+          case SDL_SCANCODE_RIGHT: menu::OnKey(menu::Key::kRight, down); break;
+          case SDL_SCANCODE_RETURN: menu::OnKey(menu::Key::kEnter, down); break;
+          case SDL_SCANCODE_SPACE: menu::OnKey(menu::Key::kSpace, down); break;
+          case SDL_SCANCODE_TAB: menu::OnKey(menu::Key::kTab, down); break;
+          default: break;
+        }
+        break;
+      }
+      default: break;
+    }
+  }
+#endif
+
   bool Init() {
 #ifdef _WIN32
     if (!CreateNativeWindow()) return false;
@@ -281,7 +335,9 @@ class Renderer {
                   if (e->key.scancode == SDL_SCANCODE_F9) key_dump_ = true;
                   if (e->key.scancode == SDL_SCANCODE_F10) key_shot_ = true;
                   if (e->key.scancode == SDL_SCANCODE_F11) CycleDiagMode();
+                  if (e->key.scancode == SDL_SCANCODE_ESCAPE) menu::OnEscape();
                 }
+                MenuInput(e);
                 return true;
               },
               nullptr);
@@ -315,7 +371,9 @@ class Renderer {
     REXLOG_INFO("[native] init: queue created, creating the swap chain");
     swapchain_ = queue_cmd_->createSwapChain(
         plume::RenderSwapChainDesc(window_, plume::RenderFormat::B8G8R8A8_UNORM, kSwapchainBuffers));
-    swapchain_->setVsyncEnabled(REXCVAR_GET(gtav_native_vsync));
+    menu::LoadSettings();
+    vsync_ = REXCVAR_GET(gtav_native_vsync);
+    swapchain_->setVsyncEnabled(vsync_);
     REXLOG_INFO("[native] init: swap chain created, resizing");
     swapchain_->resize();
     REXLOG_INFO("[native] init: swap chain {}x{}", swapchain_->getWidth(), swapchain_->getHeight());
@@ -510,6 +568,10 @@ class Renderer {
   // Two frames in flight: frame N+1 is recorded while the GPU runs frame N, so a frame costs
   // max(record, GPU) instead of record + GPU. Shot and dump frames are waited for at once.
   void Present(const FramePacket& frame) {
+    if (vsync_ != REXCVAR_GET(gtav_native_vsync)) {  // switched from the menu
+      vsync_ = REXCVAR_GET(gtav_native_vsync);
+      swapchain_->setVsyncEnabled(vsync_);
+    }
     if (swapchain_->needsResize()) {
       RetireAll();
       swapchain_->resize();
@@ -536,6 +598,22 @@ class Renderer {
       if (std::filesystem::exists(request, ec)) {
         std::filesystem::remove(request, ec);
         key_dump_ = true;
+      }
+      // logs/menu_toggle (any content): same as Esc, for testing the menu without a keyboard.
+      auto toggle = std::filesystem::path(LogPath("menu_toggle"));
+      if (std::filesystem::exists(toggle, ec)) {
+        std::filesystem::remove(toggle, ec);
+        menu::OnEscape();
+      }
+      // logs/menu_set ("name=value"): sets a menu setting the way its control does.
+      auto set = std::filesystem::path(LogPath("menu_set"));
+      if (std::filesystem::exists(set, ec)) {
+        std::ifstream in(set);
+        std::string line;
+        std::getline(in, line);
+        in.close();
+        std::filesystem::remove(set, ec);
+        if (auto eq = line.find('='); eq != std::string::npos) menu::TestSet(line.substr(0, eq), line.substr(eq + 1));
       }
       // logs/diag_mode (a mode number): sets the F11 tree diagnostic, then is removed.
       auto diag = std::filesystem::path(LogPath("diag_mode"));
@@ -632,6 +710,11 @@ class Renderer {
     }
     if (backend_ok_ && REXCVAR_GET(gtav_native_fps))
       backend_.DrawCounter(list_, fps_value_, 8, 8, std::max(1u, h / 720), plume::RenderFormat::B8G8R8A8_UNORM);
+    if (backend_ok_) {
+      double frame_ms = fps_value_ ? 1000.0 / fps_value_ : 0.0;
+      if (ImDrawData* menu_data = menu::Frame(w, h, fps_value_, frame_ms))
+        backend_.DrawMenu(list_, menu_data, plume::RenderFormat::B8G8R8A8_UNORM);
+    }
     list_->barriers(plume::RenderBarrierStage::NONE,
                     plume::RenderTextureBarrier(target, plume::RenderTextureLayout::PRESENT));
     list_->end();
@@ -841,6 +924,7 @@ class Renderer {
   std::atomic<uint64_t> dropped_{0};
   std::chrono::steady_clock::time_point fps_since_ = std::chrono::steady_clock::now();
   uint32_t fps_frames_ = 0, fps_value_ = 0;
+  bool vsync_ = true;  // the swap chain's current setting (the menu changes the cvar)
   struct Timing {  // render thread, per 300 presented frames
     double record_sum = 0, record_max = 0, gpu_sum = 0, gpu_max = 0;
     double acquire_sum = 0, submit_sum = 0, present_sum = 0, idle_sum = 0;

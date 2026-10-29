@@ -77,3 +77,37 @@ for audio). Water is done; see "Fixed 10-28" below.
   in the same session: the remaining shadow blocks (top band) were already suspected to share
   the EDRAM-leftover cause with the reflections (NEXT_SESSION_2026-10-28.md section 3). Get F9
   dumps of both (a car with blocky reflections, a spot with blocky shadows) in one sitting.
+
+## 10-28 late night: blocky shadows + car reflections FIXED (214b060, pushed); Esc settings menu
+- Cause (one bug): PS D258EBE3 builds the 80x45 sun-tile table, w = max of the 2x2 shadow-mask
+  alphas (06AA0000.w) + 64 when the four differ exactly (penumbra flag), x not-all-sky. Tile VS
+  variants pick by w >= tiledPenumbraOffsetValue (64). Native PCF differs from the Xbox by ~1/255,
+  which flipped the flag (frame_9938: 697 tiles flagged on the emulator, not natively), and those
+  tiles took the cheap uniform variant = 16x16 blocks. Reflection maps (cube 065B2000 -> paraboloid
+  069C2000) match the emulator. Shadow-mode pair: native_dump/frame_9938 + logs/emu_dump/frame_9939.
+- Fix: gtav/src/native/shaders/ps_D258EBE32001470C_tiles.hlsl (census6 output, flag always set),
+  embedded at build time; --gtav_native_tile_penumbra_all (default true, live from the menu).
+  Owner: "shadows and reflections both look good, fps feels good".
+- Esc menu (native window): gtav/src/native/menu.cpp (Dear ImGui from librexruntime.so), drawn by
+  Backend::DrawMenu (shaders/native_menu.hlsl, vertices by device address). Presets Best image /
+  Max performance, fps limit, VSync (live), FPS counter, per-pixel sun shadows, background pipeline
+  compiles. Saved to build/gtav/gtav_settings.ini, applied over the command line at start.
+  Test hooks: touch build/gtav/logs/menu_toggle (= Esc), echo name=value > logs/menu_set.
+- Menu freeze fixed in the SDK: the SDK's ImGuiDrawer switches the process-wide GImGui on the UI
+  thread for every mouse event; with the menu on the render thread both swapped contexts and the
+  render thread hung (log signature "renderer state 1"). thirdparty/imgui_rex_config.h makes the
+  context thread_local (IMGUI_USER_CONFIG on the imgui target). In rexglue-sdk-gtav-linux.patch;
+  the Windows patch (rexglue-sdk-gtav-windows.patch, already different) still needs it.
+- Not yet measured: the fps cost of the per-pixel tiles (toggle it in the menu outdoors).
+
+## NEXT SESSION (owner, 10-28 late night): flashing / flicker while driving fast
+- Owner: when driving fast the screen flickers, "big things in the sky appearing", maybe loading
+  artifacts. Last major visual glitch they see; goal is to get rid of the flashing.
+- Tools already there: --gtav_native_flicker_catch=true detects one-frame glitches (a frame unlike
+  both neighbours), saves them to logs/flicker and logs them; F10 screenshots; F9 dumps (shadow mode
+  pairs with the emulator, keep dump_rt_count <= 700, one F9).
+- Leads to check first: (1) draws skipped while pipelines/shaders compile ("frame N lost draws" log
+  lines; menu toggle "Compile new effects in the background" off -> does the flashing stop?);
+  (2) streamed LOD/terrain meshes drawn with stale or half-streamed vertex data (sampled-hash buffer
+  cache, --gtav_native_exact_cache=true A/B); (3) stale resolves (ResolveCurrent) or textures
+  evicted/recycled while streaming; (4) does the emulator renderer (GTAV_NATIVE=off or shadow) show it?

@@ -13,6 +13,8 @@
 #include <cstdint>
 #include <memory>
 
+struct ImDrawData;
+
 namespace gtav::native {
 
 struct FramePacket;
@@ -63,6 +65,9 @@ class Backend {
   // Draws `value` as an on-screen counter with its top-left corner at (x, y).
   void DrawCounter(plume::RenderCommandList* list, uint32_t value, int32_t x, int32_t y, uint32_t scale,
                    plume::RenderFormat target_format);
+
+  // The settings menu's ImGui draw lists over the bound framebuffer (menu.cpp).
+  void DrawMenu(plume::RenderCommandList* list, const ImDrawData* data, plume::RenderFormat target_format);
 
   struct Impl;
 
