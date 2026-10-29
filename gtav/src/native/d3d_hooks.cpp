@@ -180,11 +180,12 @@ REX_HOOK_RAW(sub_8380BCD8) {
   // The register shadow is read after the call: Clear first applies pending render-target state
   // (surface pitch/bases). Read before, a clear of the 640-pitch shadow cascades at EDRAM 000 hit
   // the 1280-pitch scene depth there, and the far-plane fog meshes then covered the whole screen.
-  uint32_t device = ctx.r3.u32, flags = ctx.r6.u32, color = ctx.r7.u32, stencil = ctx.r9.u32;
+  uint32_t device = ctx.r3.u32, count = ctx.r4.u32, rects = ctx.r5.u32, flags = ctx.r6.u32, color = ctx.r7.u32,
+           stencil = ctx.r9.u32;
   float z = float(ctx.f1.f64);  // Z takes r8's slot
   OnClearBegin(device);
   __imp__sub_8380BCD8(ctx, base);
-  OnClear(device, flags, color, z, stencil);
+  OnClear(device, flags, color, z, stencil, rects ? count : 0, rects);
 }
 
 // D3DDevice_Resolve(dev, flags, src rect, dest texture, dest point, level, slice, clear color (r10),

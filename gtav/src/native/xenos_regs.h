@@ -57,6 +57,10 @@ enum : uint32_t {
   RB_COLOR1_INFO = 0x2003,
   RB_COLOR2_INFO = 0x2004,
   RB_COLOR3_INFO = 0x2005,
+  // D3D keeps PA_SC_WINDOW_SCISSOR_TL/BR (0x2081/0x2082) as dwords 17/18 of its 0x2000 block
+  // (written by the viewport/scissor helper sub_83806BE0), so they read as 0x2011/0x2012 here.
+  D3D_WINDOW_SCISSOR_TL = 0x2011,
+  D3D_WINDOW_SCISSOR_BR = 0x2012,
   RB_COLOR_MASK = 0x2104,
   RB_BLEND_RED = 0x2105,
   RB_STENCILREFMASK_BF = 0x210C,

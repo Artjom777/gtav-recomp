@@ -132,3 +132,32 @@ for audio). Water is done; see "Fixed 10-28" below.
 - A weird semi-transparent box around the in-game cell phone. Older note: "phone black box on
   host-RT path (fine with --render_target_path_vulkan=fsi)" was the emulator path; check what the
   native renderer does with the phone's render target / its alpha (F9 dump with the phone up).
+
+## DONE 10-29 morning: cell phone box fixed (not yet committed; owner to play-test)
+- The phone pass saves the scene behind the phone (resolve 920,376-1280,720 -> 05ADA000), clears
+  2D0 there, draws the phone as 8888, then puts the scene back and blends the phone over it with
+  full-screen rects. On the Xbox those are clipped: Clear gets a D3DRECT (920,376-1280,720) and the
+  draws a window scissor. Natively both were ignored, so the clear wiped all of 2D0 (the full-screen
+  put-back hid that with stale texels) and the phone's edge filter blended the scene copy left in
+  the phone layer over a band around it = the semi-transparent box.
+- Fix: d3d_hooks.cpp passes Clear's rects (r4 count, r5 rects) -> ClearCommand.rects; backend Clear
+  clears only those rects; draws and clears use the guest window scissor
+  (--gtav_native_scissor, default on). D3D keeps PA_SC_WINDOW_SCISSOR_TL/BR as dwords 17/18 of its
+  0x2000 register block (sub_83806BE0 writes them), read as regs::D3D_WINDOW_SCISSOR_TL/BR.
+- Inside the box the game's own UVs put the scene back one texel off (u = x/W + 1/W, D3D9 pixel
+  centres); left as is (same maths on hardware), invisible.
+- Dump additions: "rect scissor ... verts" lines for small rect lists, scissor + "clear rect" on clears.
+- Hidden phone capture: scratchpad phone_run.sh style = play.sh hidden + --input_script with D-pad up
+  (buttons 0001) every 2 s, touch logs/dump_request ~30 s later. Pressed right after spawn, the phone
+  doesn't open.
+- Owner play-tested 10-29 09:15: "that works, the game is looking good".
+
+## NEXT SESSION (owner, 10-29): performance pass, goal >= 100 fps on this laptop
+- Big planned ("ultra thinking") session: make the native renderer as fast as possible.
+- Baseline (logs/play_phonefix.log, beach, ~3,400 draws/frame): CPU record ~30 ms/frame =
+  setup 11 + textures 6.5 (810 full texture hashes, 12 MB, 3 ms) + streams 4.5 + bind+draw 4.3 +
+  consts 3 + pipeline 0.5. Earlier boot tests: ~57-68 fps.
+- Costs added for correctness, to re-examine without regressing: fence-time vertex/index copies,
+  pipeline wait (40 ms), command processor lag (6 ms), per-pixel sun tiles, texture hashing.
+- After each change: visual A/B (flicker while driving, phone, shadows, water) plus the
+  "record ms per frame" log lines.

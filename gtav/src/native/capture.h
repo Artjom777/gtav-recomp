@@ -32,7 +32,8 @@ void OnBeginIndexedVertices(uint32_t device, uint32_t primitive, int32_t base_ve
 void OnClearBegin(uint32_t device);
 void ProbeDrawBefore(uint32_t device);  // diagnostic: registers the D3D draw call flushes
 void ProbeDrawAfter(uint32_t device);  // before the D3D call (inline vertices still pending)
-void OnClear(uint32_t device, uint32_t flags, uint32_t color, float z, uint32_t stencil);
+void OnClear(uint32_t device, uint32_t flags, uint32_t color, float z, uint32_t stencil, uint32_t rect_count,
+             uint32_t rects);
 void OnResolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t dest_texture, uint32_t dest_point,
                uint32_t clear_color, float clear_z, uint32_t level, uint32_t face);
 

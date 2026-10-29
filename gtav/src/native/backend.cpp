@@ -65,6 +65,8 @@ REXCVAR_DEFINE_INT32(gtav_native_dump_frame, 0, "GTAV",
                      "Dump every resolve of this guest frame to logs/native_dump/ as PNG");
 REXCVAR_DEFINE_INT32(gtav_native_dump_frames, 1, "GTAV",
                      "Frame dumps: one request (F9) dumps this many consecutive frames (~350 MB each)");
+REXCVAR_DEFINE_BOOL(gtav_native_scissor, true, "GTAV",
+                    "Apply the guest's scissor rectangle to draws (off: draws cover the whole target)");
 REXCVAR_DEFINE_BOOL(gtav_native_tile_penumbra_all, true, "GTAV",
                     "Deferred sun lighting: every 16x16 tile takes the per-pixel penumbra variant "
                     "(shaders/ps_D258EBE32001470C_tiles.hlsl); false uses the game's classification (blocky)");
@@ -2539,6 +2541,23 @@ struct Backend::Impl {
           regs::Read(r, regs::RB_BLENDCONTROL0), regs::Read(r, regs::RB_BLENDCONTROL1),
           regs::Read(r, regs::RB_BLENDCONTROL1 + 1), regs::Read(r, regs::RB_BLENDCONTROL1 + 2), regs::Read(r, regs::RB_COLORCONTROL),
           regs::ReadFloat(r, regs::RB_ALPHA_REF), texture_log);
+    if (dumping && d.primitive == 8 && d.count <= 6) {
+      // Screen-space rects: the raw vertices (big-endian floats) and the pixel-centre convention.
+      const uint8_t* g = d.is_inline ? f.At(d.inline_vertices)
+                                     : mem->TranslatePhysical(d.streams[0].address + d.streams[0].offset);
+      uint32_t words = d.is_inline ? std::min(d.inline_size / 4, 24u) : 24u;
+      std::string v;
+      for (uint32_t i = 0; i < words; i++) {
+        uint32_t u = be32(g + 4 * i);
+        v += fmt::format(" {:g}", std::bit_cast<float>(u));
+      }
+      dump_log += fmt::format("  rect scissor {:08X} {:08X} vtx_cntl={:X} vport scale {:g},{:g} offset {:g},{:g} verts{}\n",
+                              regs::Read(r, regs::D3D_WINDOW_SCISSOR_TL), regs::Read(r, regs::D3D_WINDOW_SCISSOR_BR),
+                              regs::Read(r, regs::PA_SU_VTX_CNTL), regs::ReadFloat(r, regs::PA_CL_VPORT_XSCALE),
+                              regs::ReadFloat(r, regs::PA_CL_VPORT_YSCALE),
+                              regs::ReadFloat(r, regs::PA_CL_VPORT_XOFFSET),
+                              regs::ReadFloat(r, regs::PA_CL_VPORT_YOFFSET), v);
+    }
     if (dumping) {
       dump_draws.push_back(d.primitive);
       dump_draws.push_back(d.count);
@@ -2591,6 +2610,7 @@ struct Backend::Impl {
     uint32_t w = count ? color[0]->width : depth->width, h = count ? color[0]->height : depth->height;
     uint32_t nvp = std::max(count, 1u);
     RenderRect scissor(0, 0, int32_t(w), int32_t(h));
+    if (REXCVAR_GET(gtav_native_scissor)) scissor = GuestScissor(r, w, h);
     if (ds.viewports != nvp || std::memcmp(&ds.vp, &vp, sizeof(vp)) != 0 ||
         std::memcmp(&ds.scissor, &scissor, sizeof(scissor)) != 0) {
       RenderViewport vps[4] = {vp, vp, vp, vp};
@@ -2719,14 +2739,29 @@ struct Backend::Impl {
     }
   }
 
+  // The guest's window scissor (e.g. the phone pass restores and composites only the phone's
+  // corner of the screen with full-screen rects; unclipped they blended stale texels around it).
+  RenderRect GuestScissor(const uint8_t* r, uint32_t w, uint32_t h) const {
+    uint32_t tl = regs::Read(r, regs::D3D_WINDOW_SCISSOR_TL), br = regs::Read(r, regs::D3D_WINDOW_SCISSOR_BR);
+    uint32_t scale = redirect2x ? 2 : 1;
+    int32_t x0 = int32_t(std::min((tl & 0x3FFF) * scale, w)), y0 = int32_t(std::min(((tl >> 16) & 0x3FFF) * scale, h));
+    int32_t x1 = int32_t(std::min((br & 0x3FFF) * scale, w)), y1 = int32_t(std::min(((br >> 16) & 0x3FFF) * scale, h));
+    if (x1 <= x0 || y1 <= y0) return RenderRect(0, 0, int32_t(w), int32_t(h));  // unset: no clipping
+    return RenderRect(x0, y0, x1, y1);
+  }
+
   void Clear(RenderCommandList* list, const FramePacket& f, const ClearCommand& c) {
     InvalidateDrawState();
     const uint8_t* r = f.At(c.regs);
     if (dumping)
-      dump_log += fmt::format("clear flags={:X} color={:08X} z={} stencil={} rt0={:03X}/{} depth={:03X} mode={}\n",
+      dump_log += fmt::format("clear flags={:X} color={:08X} z={} stencil={} rt0={:03X}/{} depth={:03X} mode={} scissor {:08X} {:08X}\n",
                               c.flags, c.color, c.z, c.stencil, regs::Color(r, 0).base,
                               uint32_t(regs::Color(r, 0).format), regs::Depth(r).base,
-                              regs::Read(r, regs::RB_MODECONTROL) & 7);
+                              regs::Read(r, regs::RB_MODECONTROL) & 7, regs::Read(r, regs::D3D_WINDOW_SCISSOR_TL),
+                              regs::Read(r, regs::D3D_WINDOW_SCISSOR_BR));
+    if (dumping)
+      for (uint32_t i = 0; i < c.rect_count; i++)
+        dump_log += fmt::format("  clear rect {},{}-{},{}\n", c.rects[i][0], c.rects[i][1], c.rects[i][2], c.rects[i][3]);
     // XDK D3DCLEAR flags: bits 0-3 = render targets 0-3, 0x10 = Z buffer, 0x20 = stencil.
     bool color = (c.flags & 0xF) != 0, z = (c.flags & 0x10) != 0, stencil = (c.flags & 0x20) != 0;
     RenderTarget* targets[4] = {};
@@ -2739,9 +2774,38 @@ struct Backend::Impl {
     BindTargets(list, targets, count, depth);
     RenderColor col(((c.color >> 16) & 0xFF) / 255.0f, ((c.color >> 8) & 0xFF) / 255.0f, (c.color & 0xFF) / 255.0f,
                     (c.color >> 24) / 255.0f);
+    // Clears cover the rects passed to D3D Clear (all of the target without any), clipped by the
+    // guest scissor like draws: the phone pass clears 2D0 only in the phone's corner, and the
+    // scene around it must survive.
+    uint32_t cw = count ? targets[0]->width : depth->width, ch = count ? targets[0]->height : depth->height;
+    RenderRect clip(0, 0, int32_t(cw), int32_t(ch));
+    if (REXCVAR_GET(gtav_native_scissor)) clip = GuestScissor(r, cw, ch);
+    int32_t scale = redirect2x ? 2 : 1;
+    std::vector<RenderRect> wanted;
+    if (c.rect_count == 0) wanted.push_back(clip);
+    for (uint32_t i = 0; i < c.rect_count; i++)
+      wanted.emplace_back(std::max(c.rects[i][0] * scale, clip.left), std::max(c.rects[i][1] * scale, clip.top),
+                          std::min(c.rects[i][2] * scale, clip.right), std::min(c.rects[i][3] * scale, clip.bottom));
+    bool partial = c.rect_count > 0 || clip.left > 0 || clip.top > 0 || clip.right < int32_t(cw) ||
+                   clip.bottom < int32_t(ch);
+    std::vector<RenderRect> rects;
+    // Returns the clear rects for target t (nullptr: all of it); false when nothing is left.
+    auto rects_for = [&](const RenderTarget* t, const RenderRect** out, uint32_t* n) {
+      *out = nullptr, *n = 0;
+      if (!partial) return true;
+      rects.clear();
+      for (const auto& w : wanted) {
+        RenderRect q(w.left, w.top, std::min(w.right, int32_t(t->width)), std::min(w.bottom, int32_t(t->height)));
+        if (q.right > q.left && q.bottom > q.top) rects.push_back(q);
+      }
+      *out = rects.data(), *n = uint32_t(rects.size());
+      return !rects.empty();
+    };
+    const RenderRect* rc;
+    uint32_t rn;
     for (uint32_t i = 0; i < count; i++)
-      if (c.flags & (1u << i)) list->clearColor(i, col);
-    if (depth) list->clearDepthStencil(z, stencil, c.z, c.stencil & 0xFF);
+      if ((c.flags & (1u << i)) && rects_for(targets[i], &rc, &rn)) list->clearColor(i, col, rc, rn);
+    if (depth && rects_for(depth, &rc, &rn)) list->clearDepthStencil(z, stencil, c.z, c.stencil & 0xFF, rc, rn);
     // The same EDRAM under another color format is another host target here, and D3D sets the new
     // surface's format only at the next draw, so the registers can still name the previous one: the
     // phone pass clears 2D0 while it reads 7e3 and then draws 8888, which kept the stale 8888
@@ -2756,7 +2820,7 @@ struct Backend::Impl {
           continue;
         RenderTarget* alias = &t;
         BindTargets(list, &alias, 1, nullptr);
-        list->clearColor(0, col);
+        if (rects_for(alias, &rc, &rn)) list->clearColor(0, col, rc, rn);
       }
     }
     // G-buffer RT2 (600) leftover alpha: the G-buffer clear (target 0 at 180) leaves RT2 alone, and

@@ -109,6 +109,11 @@ struct ClearCommand {
   uint32_t flags = 0, color = 0, stencil = 0;
   float z = 1.0f;
   uint32_t regs = 0;  // arena offset of the register shadow (which RT is bound)
+  // D3DRECTs passed to Clear (x1, y1, x2, y2); none: the whole viewport. The phone pass clears
+  // only its corner of the screen this way.
+  static constexpr uint32_t kMaxRects = 8;
+  uint32_t rect_count = 0;
+  int32_t rects[kMaxRects][4] = {};
 };
 
 struct ResolveCommand {

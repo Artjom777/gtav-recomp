@@ -742,7 +742,8 @@ void OnClearBegin(uint32_t device) {
   g_clear_depth_before = xenos_regs::Read(shadow, xenos_regs::RB_DEPTH_INFO);
 }
 
-void OnClear(uint32_t device, uint32_t flags, uint32_t color, float z, uint32_t stencil) {
+void OnClear(uint32_t device, uint32_t flags, uint32_t color, float z, uint32_t stencil, uint32_t rect_count,
+             uint32_t rects) {
   if (!Active()) return;
   {
     const uint8_t* shadow = Guest(device) + kRegShadowBegin;
@@ -755,6 +756,19 @@ void OnClear(uint32_t device, uint32_t flags, uint32_t color, float z, uint32_t 
     }
   }
   ClearCommand c{flags, color, stencil, z, g_packet.Push(Guest(device) + kRegShadowBegin, kRegShadowSize)};
+  if (rect_count && rects) {
+    // More rects than fit: clear their bounding box.
+    const uint8_t* p = Guest(rects);
+    c.rect_count = std::min(rect_count, ClearCommand::kMaxRects);
+    for (uint32_t i = 0; i < rect_count; i++) {
+      uint32_t slot = std::min(i, ClearCommand::kMaxRects - 1);
+      for (int k = 0; k < 4; k++) {
+        int32_t v = int32_t(be32(p + 16 * i + 4 * k));
+        c.rects[slot][k] = i < ClearCommand::kMaxRects ? v
+                           : k < 2 ? std::min(c.rects[slot][k], v) : std::max(c.rects[slot][k], v);
+      }
+    }
+  }
   g_packet.commands.push_back({CommandKind::kClear, uint32_t(g_packet.clears.size()), WritePointer(device)});
   g_packet.clears.push_back(c);
 }
