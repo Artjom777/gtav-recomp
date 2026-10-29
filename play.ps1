@@ -11,7 +11,7 @@ $a = @("--game_data_root=E:\gtav-rex\game\disc2_files", "--user_data_root=E:/gta
   "--update_data_root=E:/gtav-rex/game/update", "--gpu_plugin=xenos", "--headless=true", "--log_level=info",
   "--log_max_file_size_mb=1024", "--log_max_files=2", "--log_file=$logs/$Log.log", "--input_backend=xinput",
   "--gtav_native=$Mode", "--gtav_native_spirv_dir=$build\spirv", "--gtav_fps_limit=$Fps")
-if ($Mode -eq "on") { $a += @("--gpu_skip_rendering=true", "--vsync=false", "--gtav_native_vsync=false") }
+if ($Mode -eq "on") { $a += @("--gpu_skip_rendering=true", "--gpu_skip_rendering_lag_ms=6", "--vsync=false", "--gtav_native_vsync=false") }
 if ($Counter) { $a += "--gtav_native_fps" }
 if ($Extra) { $a += $Extra }
 # Read the exe and DLLs once so they are in the file cache: the first launch after a build paged

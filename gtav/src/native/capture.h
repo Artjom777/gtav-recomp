@@ -56,5 +56,7 @@ struct FramePacket;
 void ApplyFenceCopies(FramePacket& f);
 // Render thread, after recording frame `frame` (its guest memory has been read).
 void FenceCopiesRecorded(uint64_t frame);
+// Command processor thread: releases the GPU fence values held back (before its swap).
+void FenceFlush();
 
 }  // namespace gtav::native

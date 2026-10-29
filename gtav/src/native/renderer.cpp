@@ -84,6 +84,7 @@ class Renderer {
   }
 
   void WaitForGuestSwap() {
+    FenceFlush();  // the swap is where the real GPU would have caught up at the latest
     uint64_t index;
     {
       std::lock_guard lock(swap_mutex_);

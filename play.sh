@@ -18,7 +18,7 @@ cd "$BUILD" || exit 1
 export LD_LIBRARY_PATH="$BUILD${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 mode=${GTAV_NATIVE:-on}
 set -- --gtav_native=$mode --gtav_fps_limit=${GTAV_FPS:-0} "$@"
-[ "$mode" = on ] && set -- --gpu_skip_rendering=true --vsync=false --gtav_native_vsync=false "$@"
+[ "$mode" = on ] && set -- --gpu_skip_rendering=true --gpu_skip_rendering_lag_ms=6 --vsync=false --gtav_native_vsync=false "$@"
 exec ./gtav \
   --game_data_root="$E/game/disc2_files" \
   --user_data_root="$E/userdata" \

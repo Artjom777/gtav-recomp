@@ -44,6 +44,9 @@ REXCVAR_DECLARE(std::string, gtav_native);
 REXCVAR_DEFINE_BOOL(gtav_native_snapshot_draws, false, "GTAV",
                     "Copy every draw's vertex and index data at the D3D call instead of reading guest "
                     "memory when the frame is recorded");
+REXCVAR_DEFINE_INT32(gtav_native_fence_lag, 0, "GTAV",
+                     "Kicks the game's GPU fence is held back (the real GPU runs behind the CPU; released "
+                     "when the command processor idles and at every swap)");
 REXCVAR_DEFINE_BOOL(gtav_native_fence_wait, false, "GTAV",
                     "The command processor waits at a GPU fence until the renderer recorded the draws before "
                     "it (textures too) when their frame is complete, instead of copying their vertex data");
@@ -1030,13 +1033,56 @@ uint64_t GuestFrame() { return g_frame.load(std::memory_order_relaxed); }
 #else
 #define GTAV_HOOK_EXPORT __attribute__((visibility("default")))  // exported by the link options
 #endif
-// Called by the SDK's command processor (gpu_skip_rendering) before every EVENT_WRITE_SHD.
-extern "C" GTAV_HOOK_EXPORT void rex_skip_rendering_fence(uint32_t address, uint32_t value) {
-  uint32_t fence = gtav::native::g_fence_address.load(std::memory_order_relaxed);
-  static uint32_t logged = 0;
-  if (fence && logged < 4) {
-    logged++;
-    REXLOG_INFO("[native] GPU event write {:08X} = {:08X} (game fence at {:08X})", address, value, fence);
+// Called by the SDK's command processor (gpu_skip_rendering) before every EVENT_WRITE_SHD; returns
+// the value to write. The game's fence (value N at every kick, sub_8380D8A8) is held back by
+// --gtav_native_fence_lag kicks: the real GPU runs about a frame behind the CPU, and the game
+// fills some vertex buffers after the kick that carries their draw; this command processor runs
+// right behind the CPU, so a copy at the real fence caught them half-filled (foliage flicker).
+// Held-back values are released once the command processor idles (the game waits for them) and
+// at every swap.
+namespace gtav::native {
+static std::mutex g_fence_mutex;
+static uint32_t g_fence_latest = 0, g_fence_written = 0, g_fence_endian = 0;
+static bool g_fence_any = false;
+
+static void StoreFence(uint32_t address, uint32_t value, uint32_t endian) {
+  switch (endian) {  // xenos::GpuSwap, then the command processor's host-order store
+    case 1: value = ((value & 0x00FF00FFu) << 8) | ((value >> 8) & 0x00FF00FFu); break;
+    case 2: value = __builtin_bswap32(value); break;
+    case 3: value = (value << 16) | (value >> 16); break;
   }
-  if (fence && (address & 0x1FFFFFFF) == (fence & 0x1FFFFFFF)) gtav::native::FenceReached(value);
+  std::memcpy(REX_KERNEL_MEMORY()->TranslatePhysical(address), &value, 4);
 }
+
+// Releases every held-back fence (command processor thread: idle, or before its swap).
+void FenceFlush() {
+  std::lock_guard lock(g_fence_mutex);
+  uint32_t address = g_fence_address.load(std::memory_order_relaxed);
+  if (!g_fence_any || !address || g_fence_written == g_fence_latest) return;
+  g_fence_written = g_fence_latest;
+  FenceReached(g_fence_written);
+  StoreFence(address & 0x1FFFFFFF, g_fence_written, g_fence_endian);
+}
+}  // namespace gtav::native
+
+#ifdef _WIN32
+#define GTAV_HOOK_EXPORT __declspec(dllexport)
+#else
+#define GTAV_HOOK_EXPORT __attribute__((visibility("default")))  // exported by the link options
+#endif
+extern "C" GTAV_HOOK_EXPORT uint32_t rex_skip_rendering_fence(uint32_t address, uint32_t value, uint32_t endian) {
+  using namespace gtav::native;
+  uint32_t fence = g_fence_address.load(std::memory_order_relaxed);
+  if (!fence || (address & 0x1FFFFFFF) != (fence & 0x1FFFFFFF)) return value;
+  std::lock_guard lock(g_fence_mutex);
+  g_fence_latest = value;
+  g_fence_endian = endian;
+  uint32_t lag = uint32_t(std::max(0, REXCVAR_GET(gtav_native_fence_lag))) * 2;  // the kick adds 2
+  uint32_t target = value - lag;
+  if (!g_fence_any || int32_t(target - g_fence_written) > 0) g_fence_written = target;
+  g_fence_any = true;
+  FenceReached(g_fence_written);
+  return g_fence_written;
+}
+
+extern "C" GTAV_HOOK_EXPORT void rex_skip_rendering_idle() { gtav::native::FenceFlush(); }

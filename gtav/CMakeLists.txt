@@ -44,7 +44,8 @@ else()
     add_executable(gtav ${GTAV_SOURCES})
     # The SDK's Vulkan command processor finds rex_skip_rendering_swap with dlsym.
     target_link_options(gtav PRIVATE -Wl,--export-dynamic-symbol=rex_skip_rendering_swap
-                        -Wl,--export-dynamic-symbol=rex_skip_rendering_fence)
+                        -Wl,--export-dynamic-symbol=rex_skip_rendering_fence
+                        -Wl,--export-dynamic-symbol=rex_skip_rendering_idle)
 endif()
 
 rexglue_setup_target(gtav)
