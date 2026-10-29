@@ -21,7 +21,8 @@ until grep -qE '\[native\] frame [0-9]+: [0-9]{3,} draws' "$L" 2>/dev/null; do
 done
 echo "in game after $(( $(date +%s) - S )) s"
 sleep 10
-cp "$ROOT/tools/native/input_run_around.txt" "$GO"
+# BENCH_INPUT=none: stand still at the spawn point (steadier scenes for A/B runs).
+[ "${BENCH_INPUT:-run}" = none ] || cp "$ROOT/tools/native/input_run_around.txt" "$GO"
 sleep 5
 # Per-thread CPU (utime + stime ticks) over the window.
 snap() { for t in /proc/$PID/task/*; do

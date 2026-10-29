@@ -215,3 +215,56 @@ GTAV_WAIT_HOOK(8380C8F0)
 GTAV_WAIT_HOOK(8380C988)
 GTAV_WAIT_HOOK(838204D8)
 GTAV_WAIT_HOOK(83820A90)
+
+// --gtav_wait_profile: a timeline of the audio engine's passes (sub_831CD850), sound command
+// submissions (sub_831B83A0) and the waits for them (sub_831B83F0), logged once (400 events).
+namespace {
+struct TimelineEvent {
+  double ms;
+  const char* what;
+  std::string thread;
+};
+std::mutex g_timeline_mutex;
+std::vector<TimelineEvent> g_timeline;
+Clock::time_point g_timeline_start;
+int g_timeline_state = 0;  // 0 waiting to start, 1 recording, 2 logged
+
+void Event(const char* what) {
+  if (!REXCVAR_GET(gtav_wait_profile)) return;
+  auto now = Clock::now();
+  std::lock_guard lock(g_timeline_mutex);
+  if (g_timeline_state == 0) {
+    static auto first = now;
+    if (now - first < std::chrono::seconds(40)) return;  // well into the game
+    g_timeline_state = 1;
+    g_timeline_start = now;
+  }
+  if (g_timeline_state != 1) return;
+  g_timeline.push_back({std::chrono::duration<double, std::milli>(now - g_timeline_start).count(), what, Table().name});
+  if (g_timeline.size() < 400) return;
+  std::string out;
+  for (auto& e : g_timeline) out += fmt::format("\n  {:9.3f} {:16} {}", e.ms, e.thread, e.what);
+  REXLOG_INFO("[waits] timeline:{}", out);
+  g_timeline_state = 2;
+}
+}  // namespace
+
+REX_EXTERN(__imp__sub_831CD850);
+REX_HOOK_RAW(sub_831CD850) {
+  Event("pass start");
+  __imp__sub_831CD850(ctx, base);
+  Event("pass end");
+}
+
+REX_EXTERN(__imp__sub_831B83A0);
+REX_HOOK_RAW(sub_831B83A0) {
+  Event("submit");
+  __imp__sub_831B83A0(ctx, base);
+}
+
+REX_EXTERN(__imp__sub_831B83F0);
+REX_HOOK_RAW(sub_831B83F0) {
+  Event("wait begin");
+  __imp__sub_831B83F0(ctx, base);
+  Event("wait end");
+}

@@ -2302,6 +2302,7 @@ struct Backend::Impl {
         int32_t exp_adjust = int32_t(words[3] << 13) >> 26;  // dword_3 bits 13-18
         // c = clamp x/y/z, b = border colour, m = mag/min/mip filter, a = aniso, l = mip levels min-max,
         // lb = LOD bias (x32).
+        if (dumping)  // read only by frame dumps
         texture_log += fmt::format(
             " s{}:{}{:08X}/f{}d{}sw{:03X}sg{:02X}e{}c{}{}{}b{}m{}{}{}a{}l{}-{}lb{}/{}x{}", slot, kind, base,
             words[1] & 0x3F, dim, (words[3] >> 1) & 0xFFF, (words[0] >> 2) & 0xFF, exp_adjust, (words[0] >> 10) & 7,
