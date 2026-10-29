@@ -1,5 +1,25 @@
 # Next session: audio glitches, headless (written 2026-10-28 evening)
 
+## RESULT (10-28 night, headless): loud mono bursts FIXED - codegen vexptefp out of range
+- Cause: the vexptefp builder (rexglue-sdk src/codegen/builders/vector.cpp) built 2^n by writing
+  n+127 into the exponent bits with no range handling: 2^-200 came out as -7e16, 2^-inf as NaN.
+  The game's audio computes pow(x, y) = vexptefp(y * vlogefp(x)) for per-speaker gains; for a
+  speaker lane that should be silent (x ~ 0) that gave a huge gain, clamped to the maximum, so a
+  sound played at full level on the speakers it should have been silent on (FR/BL/BR identical,
+  instant, while the real lane ramped in). Fix: 0 below -126 (non-Java flush), +inf from 128,
+  NaN passes. 63 call sites regenerated (`rexglue codegen gtav_manifest.toml --ignore-stamp`).
+- A/B with the same scripted gameplay: before 7 burst events (max -3.0 dBFS, 4 speakers equal),
+  after 0 (max -14.5 dBFS). Runs: logs/aboot2_* (before), logs/aboot3_* (after).
+- The "16 kHz whine" was an analysis artifact: the endpoint here is 6 ch, so --audio_dump_raw is
+  6 ch interleaved; reading it as stereo makes a period-3 pattern (48k/3 = 16 kHz). Real mix: no
+  16 kHz line. audio_marks.py now reads the channel count from the log.
+- New tools: `tools/native/audio_boot_capture.sh NAME [SECS]` (hidden muted boot, mix + XMA dumps;
+  GTAV_INPUT_SCRIPT=tools/native/input_run_around.txt plays a scripted pad once in the world),
+  `tools/native/audio_bursts.py logs/NAME.log`. SDK: --input_script (scripted pad for user 0,
+  also reports a pad as connected), --xma_dump_raw frames carry steady-clock ms, the mix dump logs
+  "audio dump starts at steady ms N".
+- Still open: owner play-test; Wasted screen delay (maybe related, untested).
+
 Owner's instruction: work on the audio glitches **headlessly** (hidden, unattended runs are fine
 for audio). Water is done; see "Fixed 10-28" below.
 
@@ -45,3 +65,11 @@ for audio). Water is done; see "Fixed 10-28" below.
 - Blocky reflections / top-band shadow blocks (EDRAM ownership model), streaky terrain
   (parallax loop A497EF58) - see NEXT_SESSION_2026-10-28.md 3/4. Re-check both after the
   polygon-offset fix.
+
+## NEXT SESSION (owner, 10-28 night): blocky reflections on cars and such
+- Audio fix is committed; owner is play-testing it.
+- Start from NEXT_SESSION_2026-10-28.md section 3: the remaining tile errors look like EDRAM
+  leftovers of other surfaces; the proper fix is modelling EDRAM ownership like Xenia's render
+  target cache (TileAlias / MsaaAlias are the hand-coded cases so far). Car reflections come from
+  the reflection probe / cube resolves; re-check them after the 95617bd polygon-offset fix. Get an
+  F9 dump at a car with blocky reflections and compare with the emulator (shadow mode).

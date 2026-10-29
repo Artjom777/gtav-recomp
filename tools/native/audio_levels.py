@@ -1,6 +1,8 @@
 """Loudness report of a --audio_dump_raw capture (float32, interleaved, 48 kHz).
 
 usage: python audio_levels.py DUMP.raw [channels=2]
+The dump has the device's channel count: 6 when the log says "submitting 6 ch" (this laptop's
+speakers). Reading a 6-channel dump as stereo invents a 16 kHz (48k/3) "whine".
 Prints one screen: overall level, clipped samples, the loudest/quietest stretches and every
 sudden jump of more than 12 dB between neighbouring 100 ms windows.
 """

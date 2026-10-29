@@ -22,9 +22,12 @@ def when(line):
     return datetime.strptime(m.group(1).decode(), '%Y-%m-%d %H:%M:%S.%f').timestamp() if m else None
 
 
-first_audio, marks = None, []
+first_audio, marks, chans = None, [], 2
 with open(log, 'rb') as f:
     for line in f:
+        m = re.search(rb'submitting (\d) ch', line)
+        if m:  # the dump has the device's channel count (6 on a 5.1 endpoint)
+            chans = int(m.group(1))
         if first_audio is None and b'[apu]' in line and b'frames were silence' in line:
             first_audio = when(line)
         elif b'[native] F10:' in line:
@@ -33,8 +36,8 @@ if first_audio is None:
     sys.exit('no "audio: ... frames" line in the log')
 t0 = first_audio - 10.0
 x = np.fromfile(raw, dtype='<f4')
-x = x[: len(x) // 2 * 2].reshape(-1, 2)
-print(f'{raw}: {len(x) / RATE:.1f} s; {len(marks)} F10 marks')
+x = x[: len(x) // chans * chans].reshape(-1, chans)
+print(f'{raw}: {len(x) / RATE:.1f} s, {chans} ch; {len(marks)} F10 marks')
 win = RATE // 10
 for n, m in enumerate(marks):
     a, b = int((m - t0 - before) * RATE), int((m - t0 + after) * RATE)
