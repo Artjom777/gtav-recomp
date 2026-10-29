@@ -1822,7 +1822,7 @@ struct Backend::Impl {
     return regs::Surface(r).msaa;
   }
 
-  uint64_t PipelineKey(const DrawCommand& d, const vertex_layout::HostLayout& vl, RenderTarget* const color[4],
+  uint64_t PipelineKey(const DrawCommand& d, uint64_t layout_hash, RenderTarget* const color[4],
                        uint32_t count, RenderTarget* depth, const uint8_t* r, RenderPrimitiveTopology topology,
                        uint32_t spec, uint32_t diag) {
     struct {
@@ -1848,13 +1848,38 @@ struct Backend::Impl {
     k.stencil[1] = regs::Read(r, regs::RB_STENCILREFMASK_BF);
     k.mode = regs::Read(r, regs::PA_SU_SC_MODE_CNTL);
     k.alpha_to_mask = (regs::Read(r, regs::RB_COLORCONTROL) >> 4) & 1;
-    uint64_t h = Hash(&k, sizeof(k));
+    return Hash(&k, sizeof(k), layout_hash);
+  }
+  static uint64_t LayoutHash(const vertex_layout::HostLayout& vl) {
+    uint64_t h = 0;
     for (uint32_t i = 0; i < vl.element_count; i++) {
       const auto& e = vl.elements[i];
       uint32_t ek[4] = {e.location, uint32_t(e.format), e.slotIndex, e.alignedByteOffset};
       h = Hash(ek, sizeof(ek), h);
     }
     return Hash(vl.host_stride, sizeof(vl.host_stride), h);
+  }
+
+  // The host layout of the previous draw's declaration and its hashes: consecutive draws mostly
+  // share a declaration, and building + hashing it per draw was a good part of "streams".
+  struct LayoutMemo {
+    uint32_t count = ~0u;
+    VertexElement elements[kMaxVertexElements];
+    vertex_layout::HostLayout vl;
+    uint64_t layout_hash = 0;
+    uint64_t stream_hash[kMaxStreams] = {};
+  } layout_memo;
+  const LayoutMemo& Layout(const DrawCommand& d) {
+    auto& m = layout_memo;
+    if (m.count == d.element_count && std::memcmp(m.elements, d.elements, sizeof(VertexElement) * d.element_count) == 0)
+      return m;
+    m.count = d.element_count;
+    std::memcpy(m.elements, d.elements, sizeof(VertexElement) * d.element_count);
+    vertex_layout::Build(d, &m.vl);
+    m.layout_hash = LayoutHash(m.vl);
+    for (uint32_t s = 0; s < kMaxStreams; s++)
+      m.stream_hash[s] = Hash(m.vl.elements, sizeof(RenderInputElement) * m.vl.element_count, s);
+    return m;
   }
 
   RenderPipeline* Pipeline(uint64_t key, RenderShader* vs, RenderShader* ps, const vertex_layout::HostLayout& vl,
@@ -2238,7 +2263,8 @@ struct Backend::Impl {
       sc[2 * 32 + slot] = kNullCube;
       sc[96 + slot] = blit_sampler;
       float exp_scale = 1.0f;  // s<slot>_ExpScale at 640: the fetch constant's 2^exp_adjust
-      if ((words[0] & 3) == 2) exp_scale = std::ldexp(1.0f, int32_t(words[3] << 13) >> 26);
+      // 2^exp_adjust (-32..31) built from its bits: std::ldexp is a libm call per slot.
+      if ((words[0] & 3) == 2) exp_scale = std::bit_cast<float>(uint32_t((int32_t(words[3] << 13) >> 26) + 127) << 23);
       std::memcpy(&sc[160 + slot], &exp_scale, 4);
       if ((words[0] & 3) != 2) continue;
       uint32_t dim;
@@ -2388,8 +2414,8 @@ struct Backend::Impl {
     uint32_t spec = (regs::Read(r, regs::RB_COLORCONTROL) & 8) ? 2u : 0u;
 
     // Vertex streams.
-    vertex_layout::HostLayout vl;
-    vertex_layout::Build(d, &vl);
+    const LayoutMemo& decl = Layout(d);
+    const vertex_layout::HostLayout& vl = decl.vl;
     auto* mem = REX_KERNEL_MEMORY();
     RenderVertexBufferView views[kMaxStreams + 1];
     RenderInputSlot slots[kMaxStreams + 1];
@@ -2410,7 +2436,7 @@ struct Backend::Impl {
       const uint8_t* guest = inline_data ? f.At(d.inline_vertices)
                              : snapped   ? f.At(d.snap_stream[s])
                                          : mem->TranslatePhysical(sb.address + sb.offset);
-      uint64_t key = Hash(&sb, sizeof(sb), Hash(vl.elements, sizeof(RenderInputElement) * vl.element_count, s));
+      uint64_t key = Hash(&sb, sizeof(sb), decl.stream_hash[s]);
       auto convert = [&](uint8_t* out) {
         for (uint32_t n = 0; n < vl.element_count; n++) {
           if (vl.elements[n].slotIndex != s) continue;
@@ -2519,7 +2545,7 @@ struct Backend::Impl {
 
     uint32_t diag = count ? DiagFor(d.vs_hash, d.ps_hash) : kDiagOff;
     if (diag == kDiagFlat || diag == kDiagFlatDepthAlways) ps = diag_flat_ps.get();
-    uint64_t pkey = PipelineKey(d, vl, color, count, depth, r, topo.topology, spec, diag);
+    uint64_t pkey = PipelineKey(d, decl.layout_hash, color, count, depth, r, topo.topology, spec, diag);
     RenderPipeline* pipeline =
         Pipeline(pkey, vs, ps, vl, color, count, depth, r, topo.topology, spec, d.primitive == 8, diag);
     if (!pipeline) {
