@@ -38,6 +38,7 @@
 #include <cstring>
 #include <fstream>
 #include <mutex>
+#include <thread>
 #include <string>
 
 REXCVAR_DECLARE(std::string, gtav_native);
@@ -53,6 +54,9 @@ REXCVAR_DEFINE_BOOL(gtav_native_fence_wait, false, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_native_fence_copy, true, "GTAV",
                     "Copy a draw's vertex and index data when the GPU fence after it is reached before the "
                     "frame was recorded (the game may reuse that memory from then on)");
+REXCVAR_DEFINE_BOOL(gtav_native_check_draw_data, false, "GTAV",
+                    "Hash every draw's vertex and index data at capture and again at record time, and log how "
+                    "many draws the game rewrote in between (diagnostic; costs ~40% of both threads)");
 REXCVAR_DEFINE_BOOL(gtav_native_dump_on_collapse, false, "GTAV",
                     "Diagnostic: dump the first frame with a collapsed tree leaf draw (tree orbs)");
 REXCVAR_DEFINE_BOOL(gtav_native_pm4_scan, false, "GTAV",
@@ -419,6 +423,7 @@ static std::deque<PendingCopy> g_pending_copies;
 static std::map<std::pair<uint64_t, uint32_t>, FenceCopy> g_fence_copies;  // (frame, draw)
 static uint64_t g_copy_floor = 0;           // frames below this were recorded
 static uint64_t g_recording = ~0ull;        // frame being recorded
+static std::atomic<uint32_t> g_recorded_draws{0};  // of g_recording: draws that read their data
 static std::atomic<uint32_t> g_fence_address{0};  // guest physical, where the GPU writes the fence
 static constexpr uint32_t kDevFence = 11036;      // next fence value (InsertFence 8380E440)
 static constexpr uint32_t kDevFenceDone = 11024;  // -> where the GPU writes the completed fence
@@ -439,6 +444,30 @@ static void FenceReached(uint32_t value) {
     // GPU is not done before the renderer. Waiting also covers textures, which are never copied.
     // Never for the frame the game is still building: it may itself wait on this fence (loading
     // screens poll queries), and the renderer cannot record that frame before its Swap.
+    // Being recorded: a draw reads its guest data (vertices, indices, textures) when it is recorded,
+    // so only a draw the renderer has not reached yet must wait, and only until it is reached.
+    // (Waiting for the whole frame stalled the GPU, and with it the game, for ~10 ms a time.)
+    if (p.frame == g_recording && !REXCVAR_GET(gtav_native_fence_wait)) {
+      if (g_recorded_draws.load(std::memory_order_acquire) > p.draw) {
+        g_pending_copies.pop_front();
+        continue;
+      }
+      uint64_t frame = p.frame;
+      uint32_t draw = p.draw;
+      auto start = std::chrono::steady_clock::now();
+      g_copy_stats.waits++;
+      bool reached = false;
+      while (!(reached = g_recording != frame || g_recorded_draws.load(std::memory_order_acquire) > draw)) {
+        if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(100)) break;
+        lock.unlock();
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+        lock.lock();
+      }
+      if (!reached) g_copy_stats.wait_timeouts++;
+      g_copy_stats.wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+      if (!reached) break;
+      continue;  // re-evaluate the front: it may have been recorded and popped meanwhile
+    }
     if (p.frame == g_recording ||
         (REXCVAR_GET(gtav_native_fence_wait) && p.frame < g_frame.load(std::memory_order_relaxed))) {
       uint64_t frame = p.frame;
@@ -475,6 +504,7 @@ static void FenceReached(uint32_t value) {
 void ApplyFenceCopies(FramePacket& f) {
   std::lock_guard lock(g_copy_mutex);
   g_recording = f.index;
+  g_recorded_draws.store(0, std::memory_order_release);
   for (auto it = g_fence_copies.begin(); it != g_fence_copies.end() && it->first.first <= f.index;
        it = g_fence_copies.erase(it)) {
     if (it->first.first != f.index || it->first.second >= f.draws.size()) continue;
@@ -489,6 +519,8 @@ void ApplyFenceCopies(FramePacket& f) {
     d.snap_index_size = c.d.snap_index_size;
   }
 }
+
+void DrawsRecorded(uint32_t count) { g_recorded_draws.store(count, std::memory_order_release); }
 
 void FenceCopiesRecorded(uint64_t frame) {
   {
@@ -547,11 +579,29 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
       xenos_regs::Write(shadow, xenos_regs::RB_MODECONTROL, (mode & ~7u) | 4);
     }
   }
-  d.fetch = g_packet.Push(dev + d3d::kDevFetchConstants, kFetchSize);
+  // Consecutive draws mostly repeat the previous draw's constants and fetch constants: share its
+  // block instead (the replay then skips the byte swap and texture lookups by offset). Compared
+  // before copying: pushing 10 KB a draw and taking it back cost ~8% of the game thread.
+  const DrawCommand* prev = g_packet.draws.empty() ? nullptr : &g_packet.draws.back();
+  // Blocks keep their full size (the renderer reads them by offset), but only the `used` bytes the
+  // shaders read are copied and compared.
+  auto push_or_share = [](const uint8_t* src, uint32_t used, uint32_t size, const uint32_t* previous) {
+    if (previous && std::memcmp(src, g_packet.At(*previous), used) == 0) return *previous;
+    uint32_t at = uint32_t(g_packet.arena.size());
+    std::memcpy(g_packet.arena.Grow(size), src, used);
+    return at;
+  };
+  d.vs_const_count = uint16_t(ShaderConstantCount(vertex_shader));
+  d.ps_const_count = uint16_t(pixel_shader ? ShaderConstantCount(pixel_shader) : 0);
+  d.fetch = push_or_share(dev + d3d::kDevFetchConstants, kFetchSize, kFetchSize, prev ? &prev->fetch : nullptr);
   FlushInlineConstants();
-  d.vs_consts = g_packet.Push(dev + d3d::kDevVsConstants, kAluSize);
-  d.ps_consts = g_packet.Push(dev + d3d::kDevPsConstants, kAluSize);
-  if (g_inline_consts.any) {
+  const bool inline_consts = g_inline_consts.any;
+  if (inline_consts) d.vs_const_count = d.ps_const_count = 256;  // patched below
+  d.vs_consts = push_or_share(dev + d3d::kDevVsConstants, d.vs_const_count * 16u, kAluSize,
+                              prev && !inline_consts ? &prev->vs_consts : nullptr);
+  d.ps_consts = push_or_share(dev + d3d::kDevPsConstants, d.ps_const_count * 16u, kAluSize,
+                              prev && !inline_consts ? &prev->ps_consts : nullptr);
+  if (inline_consts) {
     for (uint32_t bank = 0; bank < 2; bank++) {
       uint8_t* dst = g_packet.arena.data() + (bank ? d.ps_consts : d.vs_consts);
       for (uint32_t i = 0; i < 256; i++)
@@ -563,18 +613,15 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
   // requests a frame dump once that lasts (to compare with the emulator in shadow mode).
   if (REXCVAR_GET(gtav_native_dump_on_collapse) && d.vs_hash == 0xAF15EF63BB4B093Full)
     (be32(g_packet.At(d.vs_consts) + 232 * 16 + 8) == 0 ? g_collapse.frame_bad : g_collapse.frame_good) = true;
-  // Consecutive draws mostly repeat the previous draw's constants and fetch constants: share its
-  // block instead (the replay then skips the byte swap and texture lookups by offset).
-  if (!g_packet.draws.empty()) {
-    const DrawCommand& prev = g_packet.draws.back();
+  // Inline constants patch the pushed copies: those are compared after patching.
+  if (prev && inline_consts) {
     auto share = [](uint32_t& offset, uint32_t previous, uint32_t size) {
       if (offset == previous || std::memcmp(g_packet.At(offset), g_packet.At(previous), size) != 0) return;
       if (offset + size == g_packet.arena.size()) g_packet.arena.Shrink(size);
       offset = previous;
     };
-    share(d.ps_consts, prev.ps_consts, kAluSize);  // last pushed first, so the arena can shrink
-    share(d.vs_consts, prev.vs_consts, kAluSize);
-    share(d.fetch, prev.fetch, kFetchSize);
+    share(d.ps_consts, prev->ps_consts, kAluSize);  // last pushed first, so the arena can shrink
+    share(d.vs_consts, prev->vs_consts, kAluSize);
   }
   // The device's own field, as DrawIndexedVertices reads it: SetIndices (83806E70) is not the
   // only writer, so the hooked value can be stale.
@@ -610,7 +657,8 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
   }
   for (int i = 0; i < 4; i++) d.render_targets[i] = be32(dev + d3d::kDevRenderTargets + 4 * i);
   d.depth_stencil = be32(dev + d3d::kDevDepthStencil);
-  d.data_hash = DrawDataHash(d, [](uint32_t a) { return REX_KERNEL_MEMORY()->TranslatePhysical(a); });
+  if (REXCVAR_GET(gtav_native_check_draw_data))
+    d.data_hash = DrawDataHash(d, [](uint32_t a) { return REX_KERNEL_MEMORY()->TranslatePhysical(a); });
   if (REXCVAR_GET(gtav_native_snapshot_draws) && !d.is_inline) {
     SnapshotDrawData(d, [](const uint8_t* data, uint32_t size) { return g_packet.Push(data, size); });
   } else if (!d.is_inline && REXCVAR_GET(gtav_native_fence_copy)) {

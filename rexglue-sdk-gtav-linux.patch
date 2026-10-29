@@ -418,11 +418,135 @@ index cbdd7f7..6b9067c 100644
    ctx.println("\t}}");
    return true;
  }
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index 9ac8d15..ddb5709 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -50,6 +50,8 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+ #endif
+ 
+ #if REX_PLATFORM_LINUX
++#include <linux/futex.h>
++#include <sys/syscall.h>
+ // SIGEV_THREAD_ID in timer_create(...) is a Linux extension
+ #define REX_HAS_SIGEV_THREAD_ID 1
+ #ifdef __GLIBC__
+@@ -267,6 +269,23 @@ static sem_t* RexCreateAnonymousSemaphore() {
+ }
+ #endif  // __APPLE__
+ 
++// Waits on several handles had no way to sleep until one of them changes, so they polled with
++// 1 ms sleeps: a guest thread waiting for any of a few events woke up to ~1 ms late, every time
++// (GTA V's game threads do this every frame). Every signal now bumps this word and wakes the
++// multi-waiters through a futex; they recheck at once. The 1 ms poll stays as the upper bound,
++// so a signal path that does not notify is never worse than before.
++#if REX_PLATFORM_LINUX
++static std::atomic<uint32_t> multi_wait_epoch_{0};
++static std::atomic<int32_t> multi_waiters_{0};
++static inline void NotifyMultiWaiters() {
++  multi_wait_epoch_.fetch_add(1, std::memory_order_seq_cst);
++  if (multi_waiters_.load(std::memory_order_seq_cst) > 0)
++    syscall(SYS_futex, &multi_wait_epoch_, FUTEX_WAKE_PRIVATE, INT32_MAX, nullptr, nullptr, 0);
++}
++#else
++static inline void NotifyMultiWaiters() {}
++#endif
++
+ class PosixConditionBase {
+  public:
+   PosixConditionBase() {
+@@ -336,6 +355,10 @@ class PosixConditionBase {
+                         : start_time + timeout;
+ 
+     while (true) {
++#if REX_PLATFORM_LINUX
++      // Read before the handles are checked: a signal after the check changes it.
++      uint32_t seen_epoch = multi_wait_epoch_.load(std::memory_order_seq_cst);
++#endif
+       size_t first_signaled = std::numeric_limits<size_t>::max();
+       bool condition_met = false;
+       bool all_locked = true;
+@@ -411,6 +434,19 @@ class PosixConditionBase {
+         return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
+       }
+ 
++#if REX_PLATFORM_LINUX
++      {
++        auto remaining = end_time - now;
++        auto wait = timeout == std::chrono::milliseconds::max()
++                        ? std::chrono::nanoseconds(std::chrono::milliseconds(1))
++                        : std::min<std::chrono::nanoseconds>(remaining, std::chrono::milliseconds(1));
++        timespec ts{0, long(wait.count())};
++        multi_waiters_.fetch_add(1, std::memory_order_seq_cst);
++        if (multi_wait_epoch_.load(std::memory_order_seq_cst) == seen_epoch)
++          syscall(SYS_futex, &multi_wait_epoch_, FUTEX_WAIT_PRIVATE, seen_epoch, &ts, nullptr, 0);
++        multi_waiters_.fetch_sub(1, std::memory_order_seq_cst);
++      }
++#else
+       if (timeout == std::chrono::milliseconds::max()) {
+         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+       } else {
+@@ -418,6 +454,7 @@ class PosixConditionBase {
+         auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
+         std::this_thread::sleep_for(sleep_time);
+       }
++#endif
+     }
+   }
+ 
+@@ -450,6 +487,7 @@ class PosixCondition<Event> : public PosixConditionBase {
+     auto lock = std::unique_lock<std::mutex>(mutex_);
+     signal_ = true;
+     cond_.notify_all();
++    NotifyMultiWaiters();
+     return true;
+   }
+ 
+@@ -487,6 +525,7 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
+     }
+     count_ += release_count;
+     cond_.notify_all();
++    NotifyMultiWaiters();
+     return true;
+   }
+ 
+@@ -519,6 +558,7 @@ class PosixCondition<Mutant> : public PosixConditionBase {
+       // Free to be acquired by another thread
+       if (count_ == 0) {
+         cond_.notify_all();
++        NotifyMultiWaiters();
+       }
+       return true;
+     }
+@@ -551,6 +591,7 @@ class PosixCondition<Timer> : public PosixConditionBase {
+     std::lock_guard<std::mutex> lock(mutex_);
+     signal_ = true;
+     cond_.notify_all();
++    NotifyMultiWaiters();
+     return true;
+   }
+ 
+@@ -979,6 +1020,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+       exit_code_ = exit_code;
+       signaled_ = true;
+       cond_.notify_all();
++      NotifyMultiWaiters();
+     }
+     if (is_current_thread) {
+       pthread_exit(reinterpret_cast<void*>(exit_code));
+@@ -1449,6 +1491,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+     thread->handle_.exit_code_ = 0;
+     thread->handle_.signaled_ = true;
+     thread->handle_.cond_.notify_all();
++    NotifyMultiWaiters();
+   }
+ 
+   current_thread_ = nullptr;
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index a744375..e8c5be7 100644
+index a744375..c7ce1c4 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
-@@ -10,11 +10,20 @@
+@@ -10,11 +10,21 @@
   */
  
  #include <algorithm>
@@ -430,6 +554,7 @@ index a744375..e8c5be7 100644
  #include <cinttypes>
 +#include <mutex>
 +#include <deque>
++#include <vector>
  #include <cmath>
  #include <cstring>
  #include <string_view>
@@ -443,7 +568,7 @@ index a744375..e8c5be7 100644
  #include <fmt/format.h>
  
  #include <rex/cvar.h>
-@@ -80,6 +89,41 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
+@@ -80,6 +90,54 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
                      "pipelines are being prepared.")
      .lifecycle(rex::cvar::Lifecycle::kHotReload);
  
@@ -471,6 +596,19 @@ index a744375..e8c5be7 100644
 +#endif
 +}
 +
++// Number of guest threads blocked on a GPU fence right now (the title's D3D fence-wait hook), or
++// null. While a thread waits, the lag below only delays the game: kicks are let through one by
++// one until it is released.
++using SkipRenderingGpuWaitersHook = int (*)();
++static SkipRenderingGpuWaitersHook ResolveSkipRenderingGpuWaitersHook() {
++#ifdef _WIN32
++  return reinterpret_cast<SkipRenderingGpuWaitersHook>(
++      GetProcAddress(GetModuleHandleW(nullptr), "rex_skip_rendering_gpu_waiters"));
++#else
++  return reinterpret_cast<SkipRenderingGpuWaitersHook>(dlsym(RTLD_DEFAULT, "rex_skip_rendering_gpu_waiters"));
++#endif
++}
++
 +// gtav native renderer (gpu_skip_rendering): this command processor runs right behind the CPU,
 +// while the real GPU trails it by up to a frame. The game fills some vertex buffers after the
 +// kick that carries their draw and recycles memory once the GPU's fences, counters and read
@@ -485,7 +623,7 @@ index a744375..e8c5be7 100644
  namespace rex::graphics {
  
  using namespace rex::graphics::xenos;
-@@ -210,7 +254,19 @@ void CommandProcessor::WorkerThreadMain() {
+@@ -210,7 +268,25 @@ void CommandProcessor::WorkerThreadMain() {
        fn();
      }
  
@@ -494,9 +632,15 @@ index a744375..e8c5be7 100644
 +    auto lagged_write_ptr = [this]() -> uint32_t {
 +      int32_t lag = REXCVAR_GET(gpu_skip_rendering_lag_ms);
 +      if (lag <= 0) return write_ptr_index_.load();
++      static const SkipRenderingGpuWaitersHook gpu_waiters = ResolveSkipRenderingGpuWaitersHook();
 +      std::lock_guard lock(g_kick_mutex);
 +      auto ready = std::chrono::steady_clock::now() - std::chrono::milliseconds(lag);
 +      while (!g_kicks.empty() && g_kicks.front().second <= ready) {
++        lagged_ptr_ = g_kicks.front().first;
++        g_kicks.pop_front();
++      }
++      // The game is blocked on a fence: the next kick now (one per pass, up to that fence).
++      if (!g_kicks.empty() && read_ptr_index_ == lagged_ptr_ && gpu_waiters && gpu_waiters() > 0) {
 +        lagged_ptr_ = g_kicks.front().first;
 +        g_kicks.pop_front();
 +      }
@@ -506,7 +650,7 @@ index a744375..e8c5be7 100644
      if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
        SCOPE_profile_cpu_i("gpu", "rex::graphics::CommandProcessor::Stall");
        // We've run out of commands to execute.
-@@ -218,17 +274,26 @@ void CommandProcessor::WorkerThreadMain() {
+@@ -218,17 +294,26 @@ void CommandProcessor::WorkerThreadMain() {
        // event is too high.
        PrepareForWait();
        uint32_t loop_count = 0;
@@ -535,7 +679,7 @@ index a744375..e8c5be7 100644
        } while (worker_running_ && pending_fns_.empty() &&
                 (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
        ReturnFromWait();
-@@ -313,6 +378,11 @@ void CommandProcessor::ShutdownContext() {}
+@@ -313,6 +398,11 @@ void CommandProcessor::ShutdownContext() {}
  
  void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
    read_ptr_index_ = 0;
@@ -547,7 +691,7 @@ index a744375..e8c5be7 100644
    primary_buffer_ptr_ = ptr;
    primary_buffer_size_ = uint32_t(1) << (size_log2 + 3);
  }
-@@ -328,6 +398,10 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_s
+@@ -328,6 +418,10 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_s
  }
  
  void CommandProcessor::UpdateWritePointer(uint32_t value) {
@@ -558,7 +702,24 @@ index a744375..e8c5be7 100644
    write_ptr_index_ = value;
    write_ptr_index_event_->Set();
  }
-@@ -1213,6 +1287,8 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
+@@ -355,7 +449,15 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+ 
+   // Volatile for the WAIT_REG_MEM loop.
+   const_cast<volatile uint32_t&>(regs.values[index]) = value;
+-  if (!regs.GetRegisterInfo(index)) {
++  // GetRegisterInfo is a switch over every register with a function-local static per case: once
++  // per register write it was a quarter of the command processor's time. Known registers are
++  // looked up once instead.
++  static const std::vector<bool> known_registers = [&regs] {
++    std::vector<bool> known(RegisterFile::kRegisterCount);
++    for (uint32_t i = 0; i < RegisterFile::kRegisterCount; ++i) known[i] = regs.GetRegisterInfo(i) != nullptr;
++    return known;
++  }();
++  if (!known_registers[index]) {
+     REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
+   }
+ 
+@@ -1213,6 +1315,8 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
    }
    auto endianness = static_cast<xenos::Endian>(address & 0x3);
    address &= ~0x3;
@@ -735,6 +896,37 @@ index 19874a5..1c2dada 100644
      }
    }
  
+diff --git a/src/graphics/pipeline/shader/shader.cpp b/src/graphics/pipeline/shader/shader.cpp
+index a53a222..15efa64 100644
+--- a/src/graphics/pipeline/shader/shader.cpp
++++ b/src/graphics/pipeline/shader/shader.cpp
+@@ -159,3 +159,26 @@ Shader::Translation* Shader::CreateTranslationInstance(uint64_t modification) {
+ }
+ 
+ }  // namespace rex::graphics
++
++// Title-side renderers (gpu_skip_rendering) upload a shader's float constants themselves: how many
++// of the 256 registers of its bank (c0 up to the highest one it reads) the shader can read, from
++// the same ucode analysis that packs constants for the emulator's renderers. 256 when the shader
++// indexes constants dynamically. ucode_dwords is the raw (big-endian) microcode.
++#if defined(_WIN32)
++#define REX_SHADER_EXPORT __declspec(dllexport)
++#else
++#define REX_SHADER_EXPORT __attribute__((visibility("default")))
++#endif
++extern "C" REX_SHADER_EXPORT uint32_t rex_shader_float_constant_count(bool pixel, const uint32_t* ucode_dwords,
++                                                                       uint32_t dword_count) {
++  using namespace rex::graphics;
++  if (!ucode_dwords || !dword_count) return 256;
++  Shader shader(pixel ? xenos::ShaderType::kPixel : xenos::ShaderType::kVertex, 0, ucode_dwords, dword_count);
++  rex::string::StringBuffer disasm;
++  shader.AnalyzeUcode(disasm);
++  const auto& map = shader.constant_register_map();
++  if (map.float_dynamic_addressing) return 256;
++  for (int word = 3; word >= 0; --word)
++    if (map.float_bitmap[word]) return uint32_t(word * 64 + 64 - __builtin_clzll(map.float_bitmap[word]));
++  return 0;
++}
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
 index 001f36b..48c679c 100644
 --- a/src/graphics/vulkan/command_processor.cpp

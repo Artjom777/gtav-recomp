@@ -211,6 +211,24 @@ uint64_t HashGuestTexture(const uint32_t words[6], bool sampled) {
   return hash_range(info.memory.mip_address, info.memory.mip_size, h);
 }
 
+bool GuestTextureRanges(const uint32_t words[6], uint32_t ranges[4]) {
+  xenos::xe_gpu_texture_fetch_t fetch = {};
+  fetch.dword_0 = words[0];
+  fetch.dword_1 = words[1];
+  fetch.dword_2 = words[2];
+  fetch.dword_3 = words[3];
+  fetch.dword_4 = words[4];
+  fetch.dword_5 = words[5];
+  if (fetch.type != xenos::FetchConstantType::kTexture || fetch.base_address == 0) return false;
+  const auto* pre = rex::graphics::FormatInfo::Get(uint32_t(fetch.format));
+  if (!pre || !pre->block_width || !pre->block_height || !pre->bytes_per_block()) return false;
+  rex::graphics::TextureInfo info;
+  if (!rex::graphics::TextureInfo::Prepare(fetch, &info)) return false;
+  ranges[0] = info.memory.base_address, ranges[1] = info.memory.base_size;
+  ranges[2] = info.memory.mip_address, ranges[3] = info.memory.mip_address ? info.memory.mip_size : 0;
+  return ranges[0] && ranges[1];
+}
+
 // Volume textures: base level, slice after slice. Tiled 3D textures use 32x32x4-block tiles
 // (texture_util::GetTiledOffset3D); small and rare, so offsets are computed per block.
 bool Decode3D(const rex::graphics::TextureInfo& info, const HostFormat& host, uint32_t swizzle,

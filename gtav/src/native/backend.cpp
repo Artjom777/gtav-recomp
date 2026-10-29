@@ -5,6 +5,7 @@
 #include "capture.h"
 #include "frame.h"
 #include "textures.h"
+#include "write_watch.h"
 #include "vertex_layout.h"
 #include "xenos_regs.h"
 #include "paths.h"
@@ -67,6 +68,9 @@ REXCVAR_DEFINE_INT32(gtav_native_dump_frames, 1, "GTAV",
                      "Frame dumps: one request (F9) dumps this many consecutive frames (~350 MB each)");
 REXCVAR_DEFINE_BOOL(gtav_native_scissor, true, "GTAV",
                     "Apply the guest's scissor rectangle to draws (off: draws cover the whole target)");
+REXCVAR_DEFINE_BOOL(gtav_native_write_watch_verify, false, "GTAV",
+                    "Native renderer: also hash textures and buffers the write watch says are unchanged, and "
+                    "log how many had changed (diagnostic)");
 REXCVAR_DEFINE_BOOL(gtav_native_tile_penumbra_all, true, "GTAV",
                     "Deferred sun lighting: every 16x16 tile takes the per-pixel penumbra variant "
                     "(shaders/ps_D258EBE32001470C_tiles.hlsl); false uses the game's classification (blocky)");
@@ -520,6 +524,17 @@ struct ResolvedTexture {
       subresource_targets;  // key: face << 8 | level
 };
 
+// Write-watch state of a cached guest resource (write_watch.h): unchanged while the pages it was
+// read from were not written since.
+struct WatchState {
+  uint64_t epoch = 0;       // write_watch::Watch() when the guest bytes were last hashed; 0 = none
+  uint32_t ranges[4] = {};  // guest {address, size} x2 (texture base level and mips)
+  bool Clean() const {
+    return epoch && ranges[1] && write_watch::Clean(ranges[0], ranges[1], epoch) &&
+           (!ranges[3] || write_watch::Clean(ranges[2], ranges[3], epoch));
+  }
+};
+
 struct CachedTexture {
   std::unique_ptr<RenderTexture> texture;
   std::unique_ptr<RenderTextureView> view;
@@ -531,6 +546,9 @@ struct CachedTexture {
   uint64_t sampled_hash = 0;  // HashGuestTexture(sampled) at the last full check
   uint64_t sample_frame = ~0ull;  // frame of the last sampled check
   uint64_t used_frame = 0;  // last frame a draw bound it (EvictTextures)
+  // Write watch (write_watch.h): unchanged since the last full check while its pages are clean.
+  WatchState watch;
+  uint64_t full_frame = 0;  // last full hash of the guest bytes
   bool failed = false;
   bool all_zero = false;  // decoded texels all zero (guest data not streamed in yet?)
 };
@@ -541,6 +559,7 @@ struct CachedBuffer {
   uint64_t checked_frame = ~0ull;
   uint64_t sampled = 0;              // SampledHash at the last full check
   uint64_t full_frame = ~0ull;       // frame of the last full hash
+  WatchState watch;
 };
 
 // 16 runs of 256 bytes spread over a buffer: catches rewrites of large guest buffers at ~4 KB per
@@ -1465,17 +1484,32 @@ struct Backend::Impl {
     std::memcpy(dst, convert_scratch.data(), size_t(size));
   }
 
-  const RenderBuffer* GuestBuffer(uint64_t key, const uint8_t* guest, uint64_t guest_size, uint64_t host_size,
-                                  const std::function<void(uint8_t*)>& convert) {
+  template <class F>
+  const RenderBuffer* GuestBuffer(uint64_t key, uint32_t physical, const uint8_t* guest, uint64_t guest_size,
+                                  uint64_t host_size, const F& convert) {
     auto& b = buffers[key];
     if (b.buffer && b.checked_frame == frame) return b.buffer.get();
-    // Large buffers: a sampled hash every frame and a full one every 8 frames.
+    const bool watching = write_watch::Enabled() && !REXCVAR_GET(gtav_native_exact_cache);
+    if (b.buffer && watching && b.size == host_size && b.watch.ranges[0] == physical &&
+        b.watch.ranges[1] == guest_size && frame - b.full_frame < 64 && b.watch.Clean()) {  // unchanged
+      tstats_watched_buffers++;
+      if (REXCVAR_GET(gtav_native_write_watch_verify) && Hash(guest, guest_size) != b.content)
+        (write_watch::Pending(physical, uint32_t(guest_size)) ? watch_late : watch_missed)++;
+      b.checked_frame = frame;
+      return b.buffer.get();
+    }
+    // Large buffers: a sampled hash every frame and a full one every 8 frames. (It leaves the
+    // watch epoch alone: only a full hash makes the copy current.)
     constexpr uint64_t kSmallBuffer = 64 << 10;
     if (b.buffer && guest_size > kSmallBuffer && b.size == host_size && frame - b.full_frame < 8 &&
         !REXCVAR_GET(gtav_native_exact_cache) &&
         SampledHash(guest, guest_size) == b.sampled) {
       b.checked_frame = frame;
       return b.buffer.get();
+    }
+    if (watching) {  // before reading: a write from now on is seen
+      b.watch.ranges[0] = physical, b.watch.ranges[1] = uint32_t(guest_size);
+      b.watch.epoch = write_watch::Watch(physical, uint32_t(guest_size));
     }
     uint64_t content = Hash(guest, guest_size);
     b.full_frame = frame;
@@ -1526,7 +1560,21 @@ struct Backend::Impl {
     // get a full hash, larger ones a sampled hash (and a full one every 30 frames).
     constexpr uint64_t kSmallTexture = 64 << 10;
     if (t.texture && (t.checked_frame == frame || t.sample_frame == frame)) return t.descriptor;
-    if (t.texture && t.bytes > kSmallTexture && frame - t.checked_frame < 30 && !REXCVAR_GET(gtav_native_exact_cache)) {
+    const bool watching = write_watch::Enabled() && !REXCVAR_GET(gtav_native_exact_cache);
+    // Watched copies still get a full check every 64 frames: writes the watch cannot see (the
+    // SDK writing guest memory through its raw physical view) were seen about once in 3 million
+    // lookups (--gtav_native_write_watch_verify).
+    if (t.texture && watching && frame - t.full_frame < 64 && t.watch.Clean()) {  // no guest write since
+      tprof.watched++;
+      if (REXCVAR_GET(gtav_native_write_watch_verify) && HashGuestTexture(words) != t.raw_hash)
+        (write_watch::Pending(t.watch.ranges[0], t.watch.ranges[1]) ||
+                 (t.watch.ranges[3] && write_watch::Pending(t.watch.ranges[2], t.watch.ranges[3]))
+             ? watch_late : watch_missed)++;
+      t.checked_frame = frame;
+      return t.descriptor;
+    }
+    if (t.texture && t.bytes > kSmallTexture && frame - t.checked_frame < 30 &&
+        !REXCVAR_GET(gtav_native_exact_cache)) {
       ScopedMs st{tprof.sampled_ms};
       tprof.sampled++;
       if (HashGuestTexture(words, true) == t.sampled_hash) {
@@ -1535,6 +1583,12 @@ struct Backend::Impl {
       }
     }
     // Recheck: hash the raw guest bytes and only decode when they changed.
+    if (watching) {  // before reading: a write from now on is seen
+      if (!t.watch.ranges[1] && !GuestTextureRanges(words, t.watch.ranges)) t.watch.ranges[1] = 0;
+      t.watch.epoch = t.watch.ranges[1] ? write_watch::Watch(t.watch.ranges[0], t.watch.ranges[1]) : 0;
+      if (t.watch.epoch && t.watch.ranges[3] && !write_watch::Watch(t.watch.ranges[2], t.watch.ranges[3]))
+        t.watch.epoch = 0;
+    }
     uint64_t raw;
     {
       ScopedMs ft{tprof.full_ms};
@@ -1542,6 +1596,7 @@ struct Backend::Impl {
       tprof.full_bytes += t.bytes;
       raw = HashGuestTexture(words);
     }
+    t.full_frame = frame;
     t.sampled_hash = HashGuestTexture(words, true);
     t.sample_frame = frame;
     if (t.texture && raw && raw == t.raw_hash) {
@@ -1950,7 +2005,7 @@ struct Backend::Impl {
   };
   DrawProfile prof, prof_sum;
   struct TextureProfile {
-    uint64_t lookups = 0, cached_blocks = 0, resolved = 0, sampled = 0, full = 0, full_bytes = 0;
+    uint64_t lookups = 0, cached_blocks = 0, resolved = 0, sampled = 0, full = 0, full_bytes = 0, watched = 0;
     double full_ms = 0, sampled_ms = 0, descriptor_ms = 0, sampler_ms = 0, current_ms = 0, resolved_ms = 0;
   } tprof;
   // Draw state already in the command list: binding the same layout, descriptor sets, pipeline,
@@ -2024,29 +2079,46 @@ struct Backend::Impl {
   uint32_t slot_generation = 1;
   uint64_t slot_memo_hits = 0;
   uint32_t prof_frames = 0;
+  uint64_t tstats_watched_buffers = 0, watch_missed = 0, watch_late = 0;
 
   // The guest's ALU constants are big-endian: byte-swapped 16 bytes at a time into upload memory.
   // The capture shares a block between consecutive draws with equal constants (same offset).
   struct LastConstants {
-    uint32_t offset = 0;
+    uint32_t offset = 0, bytes = 0;
     UploadAllocation gpu{};
     bool valid = false;
   };
   LastConstants last_vs, last_ps;
 
+  // Only the registers the shaders read (`count`) are swapped: the rest of the block is undefined.
   __attribute__((target("ssse3"))) UploadAllocation ConstantUpload(const uint8_t* src, uint32_t offset,
-                                                                   LastConstants& last) {
-    if (last.valid && last.offset == offset) return last.gpu;
+                                                                   uint32_t count, LastConstants& last) {
+    uint32_t bytes = std::min<uint32_t>(count, 256) * 16;
+    if (last.valid && last.offset == offset && last.bytes >= bytes) return last.gpu;
     auto a = upload.Allocate(kAluSize);
     const __m128i swap = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
-    for (uint32_t i = 0; i < kAluSize; i += 16) {
+    for (uint32_t i = 0; i < bytes; i += 16) {
       __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i));
       _mm_storeu_si128(reinterpret_cast<__m128i*>(a.cpu + i), _mm_shuffle_epi8(v, swap));
     }
     last.offset = offset;
+    last.bytes = bytes;
     last.gpu = a;
     last.valid = true;
     return a;
+  }
+
+  // Big-endian 16- or 32-bit indices to host order, 16 bytes at a time.
+  __attribute__((target("ssse3"))) static void SwapIndices(uint8_t* out, const uint8_t* in, uint32_t bytes,
+                                                           uint32_t unit) {
+    const __m128i swap = unit == 4 ? _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12)
+                                   : _mm_setr_epi8(1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14);
+    uint32_t i = 0;
+    for (; i + 16 <= bytes; i += 16)
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(out + i),
+                       _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(in + i)), swap));
+    for (; i + unit <= bytes; i += unit)
+      for (uint32_t b = 0; b < unit; b++) out[i + b] = in[i + unit - 1 - b];
   }
 
   void Draw(RenderCommandList* list, const FramePacket& f, const DrawCommand& d) {
@@ -2074,7 +2146,9 @@ struct Backend::Impl {
     const uint8_t* r = f.At(d.regs);
     // Did the game rewrite this draw's vertex/index memory since the D3D call? (logged with the
     // record-time profile every 300 frames)
-    if (DrawDataHash(d, [](uint32_t a) { return REX_KERNEL_MEMORY()->TranslatePhysical(a); }) != d.data_hash) {
+    // Only draws hashed at capture (--gtav_native_check_draw_data).
+    if (d.data_hash &&
+        DrawDataHash(d, [](uint32_t a) { return REX_KERNEL_MEMORY()->TranslatePhysical(a); }) != d.data_hash) {
       data_changed_draws++;
       if (d.snap_vertices) {
         data_changed_snapped++;  // drawn from a copy (fence copy, --gtav_native_snapshot_draws)
@@ -2084,7 +2158,7 @@ struct Backend::Impl {
       }
     }
     if (d.snap_vertices) data_snapped_draws++;
-    data_checked_draws++;
+    data_checked_draws += d.data_hash != 0;
     // GTAV_NATIVE_SKIP_PS / GTAV_NATIVE_SKIP_VS=hash,hash: bring-up diagnostic that drops draws using
     // these pixel / vertex shaders (bisecting the lighting pass).
     static const std::string skip_ps = std::getenv("GTAV_NATIVE_SKIP_PS") ? std::getenv("GTAV_NATIVE_SKIP_PS") : "";
@@ -2128,7 +2202,9 @@ struct Backend::Impl {
     // bytes match (memcmp of 4 KB is ~20x cheaper than swapping and writing it again).
     const uint8_t* vsrc = f.At(d.vs_consts);
     const uint8_t* psrc = f.At(d.ps_consts);
-    UploadAllocation vsc = ConstantUpload(vsrc, d.vs_consts, last_vs), psc = ConstantUpload(psrc, d.ps_consts, last_ps);
+    // (Dumps read every register: they get the whole block.)
+    UploadAllocation vsc = ConstantUpload(vsrc, d.vs_consts, dumping ? 256 : d.vs_const_count, last_vs),
+                     psc = ConstantUpload(psrc, d.ps_consts, dumping ? 256 : d.ps_const_count, last_ps);
     // Shared constants are built here and copied into upload memory once: that memory is
     // write-combined, and reading it back (or scattering 4-byte writes) cost ~100 ms a frame.
     alignas(16) uint8_t shared_cpu[kSharedConstantsSize] = {};
@@ -2375,7 +2451,8 @@ struct Backend::Impl {
         ref = RenderBufferReference(a.buffer, a.offset);
       } else {
         ref = RenderBufferReference(
-            GuestBuffer(key, guest, uint64_t(vertices) * stride, uint64_t(vertices) * host_stride, convert));
+            GuestBuffer(key, sb.address + sb.offset, guest, uint64_t(vertices) * stride,
+                        uint64_t(vertices) * host_stride, convert));
       }
       views[slot_count] = RenderVertexBufferView(ref, uint32_t(vertices) * host_stride);
       slots[slot_count++] = RenderInputSlot(s, host_stride);
@@ -2675,10 +2752,7 @@ struct Backend::Impl {
       }
       const uint8_t* guest = index_data;
       uint32_t unit = d.index32 ? 4 : 2;
-      auto swap = [&](uint8_t* out) {
-        for (uint32_t i = 0; i + unit <= index_bytes; i += unit)
-          for (uint32_t b = 0; b < unit; b++) out[i + b] = guest[i + unit - 1 - b];
-      };
+      auto swap = [&](uint8_t* out) { SwapIndices(out, guest, index_bytes, unit); };
       RenderBufferReference ib_ref;
       if (inline_indices) {  // CPU-written per draw: per-frame upload memory, never cached
         auto a = upload.Allocate(index_bytes, 16);
@@ -2686,7 +2760,7 @@ struct Backend::Impl {
         ib_ref = RenderBufferReference(a.buffer, a.offset);
       } else {
         uint64_t key = Hash(&d.index_address, 4, d.index_size ^ (uint64_t(unit) << 40));
-        ib_ref = RenderBufferReference(GuestBuffer(key, guest, d.index_size, d.index_size, swap));
+        ib_ref = RenderBufferReference(GuestBuffer(key, d.index_address, guest, d.index_size, d.index_size, swap));
       }
       RenderIndexBufferView view(ib_ref, index_bytes, d.index32 ? RenderFormat::R32_UINT : RenderFormat::R16_UINT);
       BindIndexBuffer(list, view);
@@ -3404,6 +3478,7 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   s.tile_split = 0;
   s.tile_resolves.clear();
   s.tile_alias_done.clear();
+  write_watch::Harvest();  // before this frame's texture and buffer lookups
   s.last_vs.valid = s.last_ps.valid = false;  // upload memory is per frame
   s.fetch_cache.valid = false;
   s.slot_generation++;
@@ -3433,7 +3508,10 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   }
   for (const auto& c : f.commands) {
     switch (c.kind) {
-      case CommandKind::kDraw: s.Draw(list, f, f.draws[c.index]); break;
+      case CommandKind::kDraw:
+        s.Draw(list, f, f.draws[c.index]);
+        DrawsRecorded(c.index + 1);
+        break;
       case CommandKind::kClear: s.Clear(list, f, f.clears[c.index]); break;
       case CommandKind::kResolve: s.Resolve(list, f, f.resolves[c.index]); break;
       case CommandKind::kQuery: s.Query(list, f.queries[c.index]); break;
@@ -3448,9 +3526,10 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
       double n = s.prof_frames;
       std::string ex;
       for (uint64_t h : s.data_changed_examples) ex += fmt::format(" {:016X}", h);
-      REXLOG_INFO("[native] draw data rewritten after capture: {} of {} draws, {} of them drawn from the capture "
-                  "copy ({} draws copied; others ps{})",
-                  s.data_changed_draws, s.data_checked_draws, s.data_changed_snapped, s.data_snapped_draws, ex);
+      if (s.data_checked_draws)
+        REXLOG_INFO("[native] draw data rewritten after capture: {} of {} draws, {} of them drawn from the capture "
+                    "copy ({} draws copied; others ps{})",
+                    s.data_changed_draws, s.data_checked_draws, s.data_changed_snapped, s.data_snapped_draws, ex);
       s.data_changed_draws = s.data_checked_draws = s.data_changed_snapped = s.data_snapped_draws = 0;
       s.data_changed_examples.clear();
       REXLOG_INFO("[native] record ms per frame: setup {:.2f} consts {:.2f} textures {:.2f} streams {:.2f} "
@@ -3463,6 +3542,18 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
                   t.full_bytes / n / 1048576.0, t.full_ms / n);
       REXLOG_INFO("[native]   texture ms per frame: slots {:.2f}, {:.0f} slots from the memo",
                   t.descriptor_ms / n, s.slot_memo_hits / n);
+      if (write_watch::Enabled()) {
+        auto ws = write_watch::TakeStats();
+        REXLOG_INFO("[native]   write watch per frame: {:.0f} textures and {:.0f} buffers unchanged without a hash, "
+                    "{:.0f} pages written ({:.2f} ms to collect){}",
+                    t.watched / n, s.tstats_watched_buffers / n, ws.pages / n, ws.ms / n,
+                    REXCVAR_GET(gtav_native_write_watch_verify)
+                        ? fmt::format(", {} changes missed, {} written after the harvest (verify)", s.watch_missed,
+                                      s.watch_late)
+                        : std::string());
+        s.watch_missed = s.watch_late = 0;
+        s.tstats_watched_buffers = 0;
+      }
       s.slot_memo_hits = 0;
       t = {};
       a = {};
@@ -3546,7 +3637,10 @@ void Backend::FrameComplete(uint32_t slot) {
     auto* mem = REX_KERNEL_MEMORY();
     const uint8_t* data = static_cast<const uint8_t*>(p.writeback_buffer->map());
     for (const auto& w : p.writebacks)
-      if (uint8_t* guest = mem->TranslatePhysical(w.address)) std::memcpy(guest, data + w.offset, w.size);
+      if (uint8_t* guest = mem->TranslatePhysical(w.address)) {
+        std::memcpy(guest, data + w.offset, w.size);
+        write_watch::Touch(w.address, w.size);  // a physical-view write: no fault to see it
+      }
     p.writeback_buffer->unmap();
     p.writebacks.clear();
   }

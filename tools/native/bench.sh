@@ -1,0 +1,45 @@
+#!/bin/sh
+# Unattended performance run: hidden native window, muted, uncapped. Boots into the world, plays
+# tools/native/input_run_around.txt, then measures SECS seconds: per-thread CPU use (which thread
+# is the bottleneck), the [native] timing lines, and (BENCH_PERF=1, needs
+# kernel.perf_event_paranoid <= 1) a perf profile in logs/NAME.perf.
+# usage: tools/native/bench.sh NAME [SECS] [game flags...]
+NAME=$1; SECS=${2:-30}; shift 2 2>/dev/null
+ROOT="$HOME/gtav-linux"
+L="$ROOT/logs/$NAME.log"
+if pgrep -x gtav >/dev/null; then echo "game already running: not starting"; exit 1; fi
+GO="$ROOT/logs/${NAME}_input.txt"
+rm -f "$L" "$GO"
+"$ROOT/play.sh" "$NAME" --gtav_native_fps --gtav_native_stats=true --gtav_native_hidden=true --audio_mute=true \
+  --input_script="$GO" "$@" >"$ROOT/logs/$NAME.stdout" 2>&1 &
+PID=$!
+S=$(date +%s)
+until grep -qE '\[native\] frame [0-9]+: [0-9]{3,} draws' "$L" 2>/dev/null; do
+  sleep 5
+  if ! kill -0 $PID 2>/dev/null; then echo "game exited before reaching the world"; exit 3; fi
+  if [ $(( $(date +%s) - S )) -gt 420 ]; then echo "no in-game frame after 420 s (boot hang?)"; kill -9 $PID; exit 2; fi
+done
+echo "in game after $(( $(date +%s) - S )) s"
+sleep 10
+cp "$ROOT/tools/native/input_run_around.txt" "$GO"
+sleep 5
+# Per-thread CPU (utime + stime ticks) over the window.
+snap() { for t in /proc/$PID/task/*; do
+  # comm may hold spaces and parentheses ("Main XThread (F..."): count fields after the last ')'.
+  printf '%s %s ' "${t##*/}" "$(tr ' ' '_' <"$t/comm")"; sed 's/.*) //' "$t/stat" | awk '{print $12 + $13}'; done; }
+snap >"$ROOT/logs/${NAME}_cpu0.txt"
+LINE0=$(wc -l <"$L")
+if [ "${BENCH_PERF:-0}" = 1 ]; then
+  perf record -F 499 ${BENCH_PERF_ARGS:--g} -p $PID -o "$ROOT/logs/$NAME.perf" -- sleep "$SECS" >/dev/null 2>&1
+else
+  sleep "$SECS"
+fi
+snap >"$ROOT/logs/${NAME}_cpu1.txt"
+kill -9 $PID 2>/dev/null
+sleep 2
+HZ=$(getconf CLK_TCK)
+echo "== CPU per thread over $SECS s (% of one core, top 12)"
+awk -v hz=$HZ -v s=$SECS 'NR == FNR { a[$1] = $3; next } ($1 in a) { printf "%6.1f%%  %s (%s)\n", ($3 - a[$1]) * 100 / hz / s, $2, $1 }' \
+  "$ROOT/logs/${NAME}_cpu0.txt" "$ROOT/logs/${NAME}_cpu1.txt" | sort -rn | head -12
+echo "== timing lines in the window"
+tail -n +"$LINE0" "$L" | grep -E '\[native\] (fps=|record ms|presented|  avg acquire|  textures per|command processor waited|fence copies)' | tail -14

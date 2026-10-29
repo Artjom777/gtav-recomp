@@ -26,6 +26,8 @@ set(GTAV_SOURCES
     src/crash_handler.cpp
     src/cutscene_audio_fix.cpp
     src/frame_limit.cpp
+    src/wait_profile.cpp
+    src/gpu_fence_wait.cpp
     src/native/stats.cpp
     src/native/capture.cpp
     src/native/d3d_probe.cpp
@@ -35,6 +37,7 @@ set(GTAV_SOURCES
     src/native/menu.cpp
     src/native/backend.cpp
     src/native/textures.cpp
+    src/native/write_watch.cpp
     src/native/shader_compiler.cpp
 )
 
@@ -45,10 +48,27 @@ else()
     # The SDK's Vulkan command processor finds rex_skip_rendering_swap with dlsym.
     target_link_options(gtav PRIVATE -Wl,--export-dynamic-symbol=rex_skip_rendering_swap
                         -Wl,--export-dynamic-symbol=rex_skip_rendering_fence
-                        -Wl,--export-dynamic-symbol=rex_skip_rendering_idle)
+                        -Wl,--export-dynamic-symbol=rex_skip_rendering_idle
+                        -Wl,--export-dynamic-symbol=rex_skip_rendering_gpu_waiters)
 endif()
 
 rexglue_setup_target(gtav)
+
+# The SDK builds recompiled code with -mcmodel=large ("large executable support"): every call
+# between the ~100 MB of game functions then goes through a 64-bit address in a register
+# (movabs + indirect call), and the game makes calls constantly (__savegprlr/__restgprlr in most
+# functions). The code is far below 2 GB, so the default model (direct calls) works. x86-64-v3
+# (Haswell / Excavator and newer) adds MOVBE (a big-endian guest load or store is one
+# instruction), BMI2 and AVX2. GTAV_X86_64_V3=OFF builds for any x86-64 with SSE4.1.
+if(UNIX AND NOT APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    option(GTAV_X86_64_V3 "Build the game code for x86-64-v3 CPUs (MOVBE, BMI2, AVX2)" ON)
+    foreach(_gtav_target gtav gtav_recomp)
+        target_compile_options(${_gtav_target} PRIVATE -mcmodel=small)
+        if(GTAV_X86_64_V3)
+            target_compile_options(${_gtav_target} PRIVATE -march=x86-64-v3)
+        endif()
+    endforeach()
+endif()
 
 # Native renderer: Plume (Vulkan, SDL3 surface). SDL3 itself comes from librexruntime, which
 # exports it, so only the headers are needed here.

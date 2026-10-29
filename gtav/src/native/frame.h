@@ -53,6 +53,9 @@ struct DrawCommand {
   uint64_t vs_hash = 0, ps_hash = 0;
   uint64_t ps_ucode_hash = 0;  // Xenia's key, for comparisons with the emulator
   uint32_t regs = 0, fetch = 0, vs_consts = 0, ps_consts = 0;  // arena offsets
+  // Float constant registers the shaders read: only these are copied (blocks are kAluSize, the rest
+  // undefined).
+  uint16_t vs_const_count = 256, ps_const_count = 256;
   uint32_t element_count = 0;
   VertexElement elements[kMaxVertexElements];
   StreamBinding streams[kMaxStreams];

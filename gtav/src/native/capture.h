@@ -57,6 +57,9 @@ struct FramePacket;
 void ApplyFenceCopies(FramePacket& f);
 // Render thread, after recording frame `frame` (its guest memory has been read).
 void FenceCopiesRecorded(uint64_t frame);
+
+// Render thread: draws [0, count) of the frame being recorded have read their guest data.
+void DrawsRecorded(uint32_t count);
 // Command processor thread: releases the GPU fence values held back (before its swap).
 void FenceFlush();
 
