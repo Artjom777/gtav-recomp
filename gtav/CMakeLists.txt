@@ -70,6 +70,23 @@ if(UNIX AND NOT APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     endforeach()
 endif()
 
+# Profile-guided optimization of the recompiled game code (clang): GTAV_PGO=GENERATE builds an
+# instrumented game (writes LLVM_PROFILE_FILE when it exits normally or on the profile flush); merge
+# the .profraw files with llvm-profdata into GTAV_PGO_PROFILE and build with GTAV_PGO=USE.
+set(GTAV_PGO "OFF" CACHE STRING "Profile-guided optimization of the game code: OFF | GENERATE | USE")
+set(GTAV_PGO_PROFILE "" CACHE FILEPATH "Merged .profdata for GTAV_PGO=USE")
+if(GTAV_PGO STREQUAL "GENERATE")
+    target_compile_options(gtav_recomp PRIVATE -fprofile-instr-generate)
+    target_link_options(gtav PRIVATE -fprofile-instr-generate)
+    target_sources(gtav PRIVATE src/pgo_dump.cpp)
+elseif(GTAV_PGO STREQUAL "USE")
+    if(NOT EXISTS "${GTAV_PGO_PROFILE}")
+        message(FATAL_ERROR "GTAV_PGO=USE needs GTAV_PGO_PROFILE (a merged .profdata)")
+    endif()
+    target_compile_options(gtav_recomp PRIVATE "-fprofile-instr-use=${GTAV_PGO_PROFILE}"
+                           -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date)
+endif()
+
 # Native renderer: Plume (Vulkan, SDL3 surface). SDL3 itself comes from librexruntime, which
 # exports it, so only the headers are needed here.
 # Windows: rexruntime.dll exports none of its static SDL3, so the native window is Win32 (Plume's
