@@ -111,3 +111,24 @@ for audio). Water is done; see "Fixed 10-28" below.
   (2) streamed LOD/terrain meshes drawn with stale or half-streamed vertex data (sampled-hash buffer
   cache, --gtav_native_exact_cache=true A/B); (3) stale resolves (ResolveCurrent) or textures
   evicted/recycled while streaming; (4) does the emulator renderer (GTAV_NATIVE=off or shadow) show it?
+
+## DONE 10-29 ~00:50: driving flicker fixed (owner: "i dont see any flickering"), pushed e4aac2f
+- Sky slabs / stray meshes: the command processor wrote mid-frame GPU fences (kick sub_8380D8A8
+  writes dev+11036 to *(dev+11024) = phys 1F5C0040, then +2) before the renderer recorded the
+  frame; the game recycled the memory. SDK hook rex_skip_rendering_fence (EVENT_WRITE_SHD) +
+  fence-time vertex/index copies in capture.cpp (--gtav_native_fence_copy); the command processor
+  waits while that frame is being recorded.
+- Car vanishing: background pipeline compiles skipped draws; they now wait up to
+  --gtav_native_pipeline_wait_ms (40) per frame.
+- Foliage flicker: the command processor ran right behind the CPU, so copies caught buffers the
+  game fills after the kick. SDK --gpu_skip_rendering_lag_ms (play.sh / play.ps1 pass 6).
+- Dead ends: copying at the D3D call (flicker lock on cars), --gtav_native_fence_wait (deadlocks
+  loading, costs fps), holding back only the fence value (the game uses other progress signals).
+- Tools: F8 = last 90 frames + counters (--gtav_native_replay=true, logs/replay/<frame>/);
+  --gtav_native_flicker_catch saves before/glitch/after PPM + per-draw lists (first 40).
+- Not yet: Windows SDK patch lacks the new hooks; perf (owner: later).
+
+## NEXT SESSION (owner, 10-29): cell phone transparency
+- A weird semi-transparent box around the in-game cell phone. Older note: "phone black box on
+  host-RT path (fine with --render_target_path_vulkan=fsi)" was the emulator path; check what the
+  native renderer does with the phone's render target / its alpha (F9 dump with the phone up).
