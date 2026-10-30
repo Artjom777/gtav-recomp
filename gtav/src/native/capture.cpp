@@ -60,6 +60,10 @@ REXCVAR_DEFINE_INT32(gtav_native_fence_lag, 0, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_native_fence_wait, GTAV_FENCE_WAIT_DEFAULT, "GTAV",
                     "The command processor waits at a GPU fence until the renderer recorded the draws before "
                     "it (textures too) when their frame is complete, instead of copying their vertex data");
+REXCVAR_DEFINE_BOOL(gtav_native_fence_wait_draw, false, "GTAV",
+                    "Experiment, with --gtav_native_fence_wait: wait only until the draw before the fence is "
+                    "recorded, not its whole frame (the command processor then reaches the fences of the frame "
+                    "still being built and copies ~3x more draw data: no gain measured, Mac swapping)");
 REXCVAR_DEFINE_BOOL(gtav_native_fence_copy, true, "GTAV",
                     "Copy a draw's vertex and index data when the GPU fence after it is reached before the "
                     "frame was recorded (the game may reuse that memory from then on)");
@@ -474,6 +478,38 @@ static void FenceReached(uint32_t value) {
       g_copy_stats.wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
       if (!reached) break;
       continue;  // re-evaluate the front: it may have been recorded and popped meanwhile
+    }
+    if (REXCVAR_GET(gtav_native_fence_wait) && REXCVAR_GET(gtav_native_fence_wait_draw) &&
+        p.frame < g_frame.load(std::memory_order_relaxed)) {
+      // Until this draw is recorded (it read its vertices, indices and textures then), not until
+      // its whole frame is: the later draws' fences hold the game off their memory meanwhile.
+      // (Waiting for the whole frame cost the game ~8 ms a frame in the open world.)
+      uint64_t frame = p.frame;
+      uint32_t draw = p.draw;
+      auto start = std::chrono::steady_clock::now();
+      g_copy_stats.waits++;
+      auto recorded = [&] {
+        return g_recording == frame && g_recorded_draws.load(std::memory_order_acquire) > draw;
+      };
+      bool reached = false;
+      while (!(reached = g_copy_floor > frame || recorded())) {
+        if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(100)) break;
+        if (g_recording == frame) {
+          lock.unlock();
+          std::this_thread::sleep_for(std::chrono::microseconds(50));
+          lock.lock();
+        } else {
+          g_copy_cv.wait_for(lock, std::chrono::milliseconds(1));  // until its recording starts
+        }
+      }
+      g_copy_stats.wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+      if (!reached) {
+        g_copy_stats.wait_timeouts++;
+        if (frame != g_recording) goto copy;  // (the game waits on its own frame): copy
+        break;
+      }
+      if (recorded()) g_pending_copies.pop_front();
+      continue;  // a finished frame's entries are popped at the top
     }
     if (p.frame == g_recording ||
         (REXCVAR_GET(gtav_native_fence_wait) && p.frame < g_frame.load(std::memory_order_relaxed))) {

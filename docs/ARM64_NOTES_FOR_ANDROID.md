@@ -54,10 +54,18 @@ Tried and not kept:
 - Render targets per frame in flight (frames overlap on the GPU): `gtav_native_slot_targets`
   (false) — no change, doubles target memory.
 - In-pass resolves (input attachment + image store inside the source pass, pass kept open):
-  `GTAV_NATIVE_FETCH_RESOLVE=1` + `gtav_native_fetch_resolves`; storage use only for small
-  destinations (`gtav_native_storage_max_texels`, 640x360) because STORAGE costs the texture its
-  lossless compression (~1 ms). Net ~-1 ms GPU, **but the phone screen renders black** in that
-  mode. Off by default; worth fixing on Android where passes cost more.
+  **now on by default on macOS** (2026-10-30 evening; `GTAV_NATIVE_FETCH_RESOLVE=0` turns them off).
+  Storage use only for small destinations (`gtav_native_storage_max_texels`, 640x360) because
+  STORAGE costs the texture its lossless compression (~1 ms). The black phone screen / blown-out
+  sky / black top tile came from passes with **more than one draw** before the resolve: there the
+  framebuffer read returned black although the draws had rendered (a green `clearColor` just before
+  the read was seen, so fetch itself works; no pass restart in between). Not understood (MoltenVK /
+  Apple raster order?). `gtav_native_fetch_max_draws` (default 1) keeps in-pass resolves to
+  one-draw passes: ~43 of ~46 a frame (the post-processing chains), correct by eye in five scenes.
+  Live A/B in a heavy scene: 35.9 -> 37.9 fps, GPU -1.5 ms. Diagnostics: `gtav_native_fetch_range`
+  (lo:hi of the frame's candidates, bisecting), `gtav_native_fetch_debug` (1 magenta, 2 source+red,
+  3 alpha 1, 4 green clear before the read), `gtav_native_seqdiag=1` with GTAV_NATIVE_PASS_STATS
+  (the next frame's command sequence with pass starts and each in-pass resolve's attachments).
 - Compute resolves (earlier session): fewer passes but STORAGE made it slower.
 
 ## 4. CPU (render thread) on arm64
@@ -74,6 +82,16 @@ rect-list expansion ~10%, fence-copy pushes ~11% (memory pressure: see 5).
   before the SDK's handler (its "stale protection" recovery would swallow our faults) and must
   cover host syscalls writing guest memory (HostPathFile `pread` -> EFAULT); not done yet.
 - Per-draw timing (`prof.Mark`, 6 clock reads a draw) now runs on every 8th frame only.
+- Hash worker threads (`gtav_native_hash_threads`, now 3 by default on macOS): the frame's small
+  textures/buffers are hashed on workers before recording: record -2.4 ms a frame (live A/B).
+- Plume ends the render pass for every occlusion query begin/end (`beginOcclusionQuery`): a few
+  invisible extra passes a frame (~6 queries). Keeping queries inside the pass needs the query to
+  end before the pass does (Vulkan rule); not done.
+- The game waits on the renderer at GPU fences (`gtav_native_fence_wait`, macOS): ~7.7 ms of
+  waiting per frame in heavy views, i.e. the game and the renderer partly serialize. Waiting per
+  draw instead of per frame (`gtav_native_fence_wait_draw`, off) let the command processor reach
+  the fences of the frame still being built, which are copied: ~3x the copied bytes and no gain
+  (measured while the Mac was swapping hard; worth re-measuring after a reboot).
 
 ## 5. Memory (the 8 GB Mac swapped; phones have less)
 

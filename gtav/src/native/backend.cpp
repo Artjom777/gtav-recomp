@@ -57,7 +57,13 @@ REXCVAR_DEFINE_BOOL(gtav_native_exact_cache, false, "GTAV",
                     "(no sampled-hash shortcut for large ones)");
 // Off by default: the hash is taken at the start of the frame, so data the game rewrites before
 // the draw is recorded keeps last frame's upload for one frame (foliage popping, owner 10-29).
-REXCVAR_DEFINE_INT32(gtav_native_hash_threads, 0, "GTAV",
+// macOS (no write watch): 3 workers took ~2.4 ms a frame off recording in the open world.
+#ifdef __APPLE__
+#define GTAV_HASH_THREADS_DEFAULT 3
+#else
+#define GTAV_HASH_THREADS_DEFAULT 0
+#endif
+REXCVAR_DEFINE_INT32(gtav_native_hash_threads, GTAV_HASH_THREADS_DEFAULT, "GTAV",
                      "Worker threads that hash the frame's small textures and buffers before it is recorded "
                      "when there is no write watch (0: hash on the render thread)");
 REXCVAR_DEFINE_INT32(gtav_native_dump_rt_count, 150, "GTAV",
@@ -97,7 +103,16 @@ REXCVAR_DEFINE_BOOL(gtav_native_resolve_discard, true, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_native_defer_clears, true, "GTAV",
                     "Native renderer: apply resolve clears in the target's next render pass instead of a pass of their own");
 REXCVAR_DEFINE_BOOL(gtav_native_fetch_resolves, true, "GTAV",
-                    "Native renderer: in-pass colour resolves when available (GTAV_NATIVE_FETCH_RESOLVE=1)");
+                    "Native renderer: in-pass colour resolves when available (macOS; GTAV_NATIVE_FETCH_RESOLVE=0 at start: off)");
+REXCVAR_DEFINE_INT32(gtav_native_fetch_debug, 0, "GTAV",
+                     "Diagnostic: in-pass resolves store 1 magenta, 2 source + red, 3 source with alpha 1, 4 a green clear");
+REXCVAR_DEFINE_INT32(gtav_native_seqdiag, 0, "GTAV",
+                     "Diagnostic (GTAV_NATIVE_PASS_STATS): log the command sequence of the next frame when set to 1");
+REXCVAR_DEFINE_INT32(gtav_native_fetch_max_draws, 1, "GTAV",
+                     "Native renderer: in-pass resolves only when the source's pass has at most this many draws "
+                     "(after more, framebuffer fetch on MoltenVK read black: phone screen, half-res sky pass)");
+REXCVAR_DEFINE_STRING(gtav_native_fetch_range, "", "GTAV",
+                      "Diagnostic: in-pass resolves only for this frame's candidates lo:hi (ordinal, hi exclusive)");
 REXCVAR_DEFINE_INT32(gtav_native_storage_max_texels, 640 * 360, "GTAV",
                      "Native renderer: in-pass/compute resolves only into destinations up to this many texels");
 REXCVAR_DEFINE_BOOL(gtav_native_compute_resolves, false, "GTAV",
@@ -125,6 +140,7 @@ REXCVAR_DEFINE_BOOL(gtav_native_tile_penumbra_all, true, "GTAV",
 
 namespace plume {
 extern bool g_colorInputAttachments;  // plume-gtav.patch
+extern uint32_t g_statRenderPasses;   // plume-gtav.patch
 }
 
 namespace gtav::native {
@@ -1935,7 +1951,9 @@ struct Backend::Impl {
   std::map<std::string, uint32_t> pass_reasons;
   void PassBegin(const char* why) {
     if (pass_stats) pass_reasons[why]++;
+    if (seqdiag) seq_passes += fmt::format("  [pass: {}]\n", why);
   }
+  std::string seq_passes;
   bool seqdiag = false;
   std::string seq_note;
 
@@ -2101,7 +2119,7 @@ struct Backend::Impl {
       REXLOG_INFO("[native] compute colour resolves: {}", compute_resolves ? "on" : "unavailable");
     }
     // In-pass colour resolves (tile GPUs): see native_resolve_fetch.frag and FetchResolve.
-    if (!rect_gs && plume::g_colorInputAttachments && std::getenv("GTAV_NATIVE_FETCH_RESOLVE")) {
+    if (!rect_gs && plume::g_colorInputAttachments) {
       RenderDescriptorSetBuilder input, dest;
       input.begin();
       input.addInputAttachment(0);
@@ -2598,6 +2616,7 @@ struct Backend::Impl {
     }
     list->setFramebuffer(fb.get());
     bound_fb = fb.get();
+    pass_draws = 0;
     for (uint32_t i = 0; i < 4; i++) bound_color[i] = i < count ? color[i] : nullptr;
     bound_depth = depth;
     for (uint32_t i = 0; i < count && !pending_clears.empty(); i++) {
@@ -4484,7 +4503,7 @@ struct Backend::Impl {
   // and stores into the resolve texture, instead of a copy pass of its own (each pass is a Metal
   // encoder plus tile loads/stores: ~70 resolves a frame cost ~9 ms on the M1).
   static constexpr uint32_t kFetchDests = 4096;
-  bool fetch_resolves = false;      // available (GTAV_NATIVE_FETCH_RESOLVE at start)
+  bool fetch_resolves = false;      // available (macOS, unless GTAV_NATIVE_FETCH_RESOLVE=0 at start)
   bool use_fetch_resolves = true;   // --gtav_native_fetch_resolves (live)
   std::unique_ptr<RenderShader> fetch_vs, fetch_ps[4];
   std::unique_ptr<RenderDescriptorSet> fetch_dest_set;  // storage views of the resolve textures
@@ -4522,8 +4541,23 @@ struct Backend::Impl {
         if (bound_color[i] == src) k = int(i);
       }
     if (k < 0) return false;
+    if (pass_draws > uint32_t(std::max(0, REXCVAR_GET(gtav_native_fetch_max_draws)))) return false;
+    {
+      const uint32_t ordinal = fetch_candidates++;
+      const std::string& range = REXCVAR_GET(gtav_native_fetch_range);
+      if (!range.empty()) {
+        uint32_t lo = 0, hi = ~0u;
+        if (std::sscanf(range.c_str(), "%u:%u", &lo, &hi) < 1 || ordinal < lo || ordinal >= hi) return false;
+      }
+    }
     float scale = (IsFixed16(src->format) ? 32.0f : 1.0f) / (IsFixed16(dst_format) ? 32.0f : 1.0f);
     uint32_t mode = IsFixed10(uint32_t(regs::Color(r, source).format)) && src->float_data ? 1 : 0;
+    const int32_t fetch_debug = REXCVAR_GET(gtav_native_fetch_debug);
+    if (fetch_debug >= 1 && fetch_debug <= 3) mode = 1 + uint32_t(fetch_debug);
+    if (fetch_debug == 4) {  // diagnostic: green in the source under the copy (framebuffer fetch must see it)
+      RenderRect g{int32_t(x1), int32_t(y1), int32_t(x2), int32_t(y2)};
+      list->clearColor(uint32_t(k), RenderColor(0, 1, 0, 1), &g, 1);
+    }
     auto& input = fetch_input_sets[src->texture.get()];
     if (!input) {
       RenderDescriptorSetBuilder b;  // (a builder's desc points into itself: not copyable)
@@ -4580,7 +4614,10 @@ struct Backend::Impl {
     RenderRect scs[4] = {sc, sc, sc, sc};
     list->setViewports(vps, std::max(n, 1u));
     list->setScissors(scs, std::max(n, 1u));
+    const uint32_t passes_before = plume::g_statRenderPasses;
     list->drawInstanced(3, 1, 0, 0);
+    fetch_restarted = plume::g_statRenderPasses != passes_before;
+    if (fetch_restarted) stat_fetch_restarted++;
     // The pass goes on (the guest often draws on into the source): the barrier that makes the
     // stores visible comes with the texture's first use (Transition from GENERAL to SHADER_READ).
     layouts[dst.texture.get()] = RenderTextureLayout::GENERAL;
@@ -4589,6 +4626,10 @@ struct Backend::Impl {
     return true;
   }
   uint32_t stat_fetch_resolves = 0;
+  uint32_t fetch_candidates = 0;  // per frame, for --gtav_native_fetch_range
+  uint32_t pass_draws = 0;        // draws since BindTargets started the bound pass
+  bool fetch_restarted = false;   // the last in-pass resolve began a new Vulkan render pass
+  uint32_t stat_fetch_restarted = 0;
 
   // Colour resolve as a compute dispatch (see native_resolve_compute.comp): no render pass of its
   // own, and it sits next to the resolve's guest memory writeback dispatch.
@@ -4825,6 +4866,15 @@ struct Backend::Impl {
     bool in_pass = false;
     if (shader_copy && !depth_resolve && FetchResolve(list, r, src, int(source), dst, dst_format, x1, y1, x2, y2, px, py)) {
       in_pass = true;  // copied inside the source's render pass, which goes on
+      if (seqdiag) {
+        seq_note += fmt::format(" [in-pass #{}{} after {} draws, pass:", fetch_candidates - 1,
+                                fetch_restarted ? " RESTARTED" : "", pass_draws);
+        for (auto* c : bound_color)
+          seq_note += c ? fmt::format(" {}{}x{}f{}{}", c == src ? "*" : "", c->width, c->height, uint32_t(c->format),
+                                      c->msaa ? " msaa" : "")
+                        : std::string(" -");
+        seq_note += bound_depth ? fmt::format(" depth {}x{}]", bound_depth->width, bound_depth->height) : "]";
+      }
     } else if (shader_copy && !depth_resolve && compute_resolves && !dumping && dst.storage_index != ~0u &&
                dst.mips == 1 && dst.layers == 1 && rc.dest_level == 0 && rc.dest_face == 0) {
       float scale = (IsFixed16(src->format) ? 32.0f : 1.0f) / (IsFixed16(dst_format) ? 32.0f : 1.0f);
@@ -4969,6 +5019,7 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   s.take_notes = REXCVAR_GET(gtav_native_flicker_catch);
   s.t_shader = s.t_pipeline = s.t_texture = s.t_resolve = 0;
   s.tile_split = 0;
+  s.fetch_candidates = 0;
   s.tile_resolves.clear();
   s.tile_alias_done.clear();
   write_watch::Harvest();  // before this frame's texture and buffer lookups
@@ -5001,7 +5052,8 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
     s.dump_raw_f36.clear();
     s.snapshot_budget = 3;
   }
-  s.seqdiag = s.pass_stats && f.index && f.index % 3000 == 0;
+  s.seqdiag = s.pass_stats && f.index && (f.index % 3000 == 0 || REXCVAR_GET(gtav_native_seqdiag));
+  if (REXCVAR_GET(gtav_native_seqdiag)) rex::cvar::SetFlagByName("gtav_native_seqdiag", "0");
   std::string seq;
   uint32_t seq_draws = 0;
   auto flush_draws = [&] {
@@ -5012,8 +5064,12 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
     switch (c.kind) {
       case CommandKind::kDraw:
         s.Draw(list, f, f.draws[c.index]);
+        s.pass_draws++;
         DrawsRecorded(c.index + 1);
-        if (s.seqdiag) seq_draws++;
+        if (s.seqdiag) {
+          if (!s.seq_passes.empty()) flush_draws(), seq += s.seq_passes, s.seq_passes.clear();
+          seq_draws++;
+        }
         break;
       case CommandKind::kClear:
         s.Clear(list, f, f.clears[c.index]);
@@ -5022,7 +5078,7 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
       case CommandKind::kResolve:
         s.seq_note.clear();
         s.Resolve(list, f, f.resolves[c.index]);
-        if (s.seqdiag) flush_draws(), seq += "  " + s.seq_note + "\n";
+        if (s.seqdiag) flush_draws(), seq += s.seq_passes + "  " + s.seq_note + "\n", s.seq_passes.clear();
         break;
       case CommandKind::kQuery: s.Query(list, f.queries[c.index]); break;
     }
@@ -5061,7 +5117,10 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
       s.rect_hits = s.rect_misses = 0;
       for (auto& c : s.conv_bytes) c = 0;
       for (auto& c : s.conv_draws) c = 0;
-      if (s.fetch_resolves) REXLOG_INFO("[native]   in-pass resolves per frame: {:.1f}", s.stat_fetch_resolves / n);
+      if (s.fetch_resolves)
+        REXLOG_INFO("[native]   in-pass resolves per frame: {:.1f} ({:.1f} began a new Vulkan pass)",
+                    s.stat_fetch_resolves / n, s.stat_fetch_restarted / n);
+      s.stat_fetch_restarted = 0;
       if (s.compute_resolves) REXLOG_INFO("[native]   compute resolves per frame: {:.1f}", s.stat_compute_resolves / n);
       s.stat_compute_resolves = 0;
       {
