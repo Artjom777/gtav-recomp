@@ -35,9 +35,14 @@ perf pass and how portable each piece is, section 4 = macOS); `docs/HANDOFF_WIND
 
 ## 1. Set up the tree
 
+**Update 10-30:** use `main` (the Windows and Linux clean-room releases are merged there). Carry the
+platform branches in `gtav/fs/gtav_pch.h` over to the Mac: the E0 physical view is 4 KB higher
+(REX_PHYS_HOST_OFFSET 0x1000) only on Windows and Apple arm64. Using the wrong offset made the
+Linux release hang about 20 s into boot (fence wait). See `docs/RELEASE_CLEANROOM.md`.
+
 ```sh
 git clone https://github.com/andrewnakas/gtav-recomp ~/gtav-recomp && cd ~/gtav-recomp
-git checkout windows-native
+git checkout main          # everything is on main since 10-30 (windows-native is older)
 git config user.name andrewnakas
 git config user.email 7544678+andrewnakas@users.noreply.github.com   # maintainer's request
 # third-party pins (see HANDOFF_WINDOWS_MAC.md):
