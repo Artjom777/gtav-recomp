@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -153,6 +154,8 @@ struct Command {
 
 // Append-only bytes without std::vector's zero fill: a frame pushes tens of MB of register
 // shadows and constants, and packets are recycled (TakeSpare), so the capacity is kept.
+inline std::atomic<uint64_t> g_arena_grows{0}, g_arena_grow_bytes{0};  // stats: reallocations, bytes moved
+
 class ByteArena {
  public:
   uint8_t* data() { return buf_.get(); }
@@ -165,6 +168,7 @@ class ByteArena {
       size_t cap = std::max(size_ + n, cap_ ? cap_ * 2 : size_t(4) << 20);
       auto buf = std::make_unique_for_overwrite<uint8_t[]>(cap);
       if (size_) std::memcpy(buf.get(), buf_.get(), size_);
+      g_arena_grows++, g_arena_grow_bytes += size_;
       buf_ = std::move(buf);
       cap_ = cap;
     }

@@ -21,6 +21,7 @@
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <fmt/ranges.h>
 
 #include <algorithm>
 #include <atomic>
@@ -31,6 +32,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <set>
 #include <unordered_map>
 #include <memory>
@@ -38,12 +40,22 @@
 #include <string>
 #include <thread>
 #include <vector>
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#endif
 
 REXCVAR_DEFINE_STRING(gtav_native, "off", "GTAV", "Native renderer: off | shadow | on");
 REXCVAR_DEFINE_BOOL(gtav_native_vsync, true, "GTAV", "Native renderer: wait for vertical sync when presenting");
+REXCVAR_DEFINE_BOOL(gtav_native_exact_barriers, true, "GTAV",
+                    "Native renderer: no TOP_OF_PIPE / BOTTOM_OF_PIPE next to other barrier stages (MoltenVK waits less)");
+REXCVAR_DEFINE_STRING(gtav_native_ab, "", "GTAV",
+                      "Native renderer benchmark: name=a|b flips cvar name between a and b every 60 frames, logs averages");
 REXCVAR_DEFINE_BOOL(gtav_native_flicker_catch, false, "GTAV",
                     "Native renderer: detect one-frame glitches (a frame unlike both neighbours), save them to "
                     "logs/flicker and log them");
+REXCVAR_DEFINE_INT32(gtav_native_flicker_min_blocks, 6, "GTAV",
+                     "Native renderer: --gtav_native_flicker_catch saves (up to 40) only glitches covering at "
+                     "least this many 32-px blocks; smaller ones (often thin poles while driving) are only logged");
 REXCVAR_DEFINE_BOOL(gtav_native_replay, false, "GTAV",
                     "Native renderer: keep the last 90 presented frames; F8 writes them to logs/replay");
 REXCVAR_DEFINE_BOOL(gtav_native_fps, false, "GTAV", "Native renderer: on-screen frames-per-second counter");
@@ -58,10 +70,26 @@ namespace plume {
 std::unique_ptr<RenderInterface> CreateVulkanInterface();  // SDL3 build: window comes later
 void SetVulkanPipelineCacheData(std::vector<uint8_t> data);  // plume-gtav.patch
 std::vector<uint8_t> GetVulkanPipelineCacheData(RenderDevice* device);
+extern uint32_t g_statRenderPasses, g_statBarriers;  // plume-gtav.patch
+extern bool g_exactBarrierStages;
+extern bool g_colorInputAttachments;
 }
 
 namespace gtav::native {
 namespace {
+
+#ifdef __APPLE__
+// MoltenVK compiles shaders with Metal fast math by default, which assumes no inf/NaN. The
+// recompiled shaders rely on IEEE results (the radar's clamp(rsqrt(0)) * 0 = 0 became NaN: only
+// the map's edges were drawn). Set before any Vulkan instance exists; an explicit setting wins.
+const int g_mvk_precise_math = setenv("MVK_CONFIG_FAST_MATH_ENABLED", "0", 0);
+// New pipelines arrive in bursts of hundreds when an area or cutscene loads; Metal compiles them
+// with more threads this way (fewer frames shown from the hold, see gtav_native_hold_lost_frames).
+const int g_mvk_concurrent_compile = setenv("MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRENT_COMPILATION", "1", 0);
+// Render passes declare their colour attachments as input attachments: the backend's in-pass
+// resolves read them by framebuffer fetch (FetchResolve). Before any Plume resource exists.
+const bool g_plume_input_attachments = (plume::g_colorInputAttachments = std::getenv("GTAV_NATIVE_FETCH_RESOLVE") != nullptr);
+#endif
 
 // Frames queued for the render thread before Submit blocks the guest (like a full GPU ring). No
 // frame is ever dropped: the game renders some textures once (static shadow-map caches, ...) and
@@ -347,8 +375,9 @@ class Renderer {
               [](void*, SDL_Event* e) {
                 if (e->type == SDL_EVENT_KEY_DOWN && !e->key.repeat) {
                   if (e->key.scancode == SDL_SCANCODE_F8) key_replay_ = true;
-                  if (e->key.scancode == SDL_SCANCODE_F9) key_dump_ = true;
-                  if (e->key.scancode == SDL_SCANCODE_F10) key_shot_ = true;
+                  if (e->key.scancode == SDL_SCANCODE_F9 || e->key.scancode == SDL_SCANCODE_N) key_dump_ = true;
+                  // M as well: no fn key needed on Mac laptops, and no pad button uses it (mnk_mode).
+                  if (e->key.scancode == SDL_SCANCODE_F10 || e->key.scancode == SDL_SCANCODE_M) key_shot_ = true;
                   if (e->key.scancode == SDL_SCANCODE_F11) CycleDiagMode();
                   if (e->key.scancode == SDL_SCANCODE_ESCAPE) menu::OnEscape();
                 }
@@ -400,8 +429,10 @@ class Renderer {
     REXLOG_INFO("[native] init: swap chain {}x{}", swapchain_->getWidth(), swapchain_->getHeight());
     for (uint32_t i = 0; i < Backend::kFramesInFlight; i++) {
       lists_[i] = queue_cmd_->createCommandList();
+      present_lists_[i] = queue_cmd_->createCommandList();
       fences_[i] = device_->createCommandFence();
       acquires_[i] = device_->createCommandSemaphore();
+      gpu_times_[i] = device_->createQueryPool(2);
     }
     CreateFramebuffers();
     REXLOG_INFO("[native] init: framebuffers created, backend init");
@@ -477,6 +508,20 @@ class Renderer {
     if (!in_flight_[slot]) return;
     queue_cmd_->waitForCommandFence(fences_[slot].get());
     in_flight_[slot] = false;
+    if (gpu_times_[slot] && gpu_timed_[slot]) {
+      // GPU time of the slot's frame (first to last command of its main list) and the GPU idle
+      // gap since the previous frame ended.
+      gpu_times_[slot]->queryResults();
+      const uint64_t* t = gpu_times_[slot]->getResults();
+      if (t[1] > t[0] && t[1] - t[0] < 1000000000ull) {
+        timing_.gpu_frame_sum += (t[1] - t[0]) / 1e6;
+        if (last_gpu_end_ && t[0] > last_gpu_end_ && t[0] - last_gpu_end_ < 1000000000ull)
+          timing_.gpu_gap_sum += (t[0] - last_gpu_end_) / 1e6;
+        timing_.gpu_frames++;
+        last_gpu_end_ = t[1];
+        if (ab_slot_phase_[slot] >= 0) ab_[ab_slot_phase_[slot]].gpu += (t[1] - t[0]) / 1e6, ab_[ab_slot_phase_[slot]].gpu_n++;
+      }
+    }
     if (backend_ok_) backend_.FrameComplete(slot);
     FlickerAnalyze(slot);
   }
@@ -555,11 +600,13 @@ class Renderer {
           }
       if (odd >= 6) {
         flick_count_++;
+        const bool save = odd >= uint32_t(std::max(1, REXCVAR_GET(gtav_native_flicker_min_blocks))) && flick_saved_ < 40;
+        if (save) flick_saved_++;
         REXLOG_INFO("[native] flicker #{}: guest frame {} differs from both neighbours in {} of {} 32-px "
                     "blocks (box {},{}-{},{} of 160x90){}",
                     flick_count_, flick_hist_index_[1], odd, kBw * kBh, x0, y0, x1, y1,
-                    flick_count_ <= 40 ? "; frames saved to logs/flicker" : "");
-        if (flick_count_ <= 40) {
+                    save ? "; frames saved to logs/flicker" : "");
+        if (save) {
           std::error_code ec;
           std::string dir = LogPath("flicker");
           std::filesystem::create_directories(dir, ec);
@@ -582,7 +629,8 @@ class Renderer {
                                  k++, n.vs, n.ps, n.rt0, n.depth, n.vb, n.vb_size, n.stride, n.ib, n.start, n.count,
                                  n.prim, n.base_vertex, n.tex[0], n.tex[1], n.tex[2], n.tex[3],
                                  n.copied ? " COPY" : "", n.rewritten ? " REWRITTEN" : "", n.skipped ? " SKIPPED" : "",
-                                 n.uploads ? fmt::format(" UPLOADS {}", n.uploads) : "");
+                                 n.uploads ? fmt::format(" UPLOADS {}", n.uploads) : "")
+                  << fmt::format("     vsc {:.6g}\n", fmt::join(n.vsc, " "));
           };
           notes(flick_hist_notes_[0], flick_hist_index_[0], "a_before");
           notes(flick_hist_notes_[1], flick_hist_index_[1], "b_glitch");
@@ -632,7 +680,61 @@ class Renderer {
     replay_.clear();
   }
 
+  // Queue submissions and presents on a thread of their own: MoltenVK encodes the whole Metal
+  // command buffer inside vkQueueSubmit (~3.5 ms per 1,000 draws on the M1), which then overlaps
+  // the recording of the next frame instead of following it. Jobs run in order; the swap chain's
+  // acquire (render thread) and present (here) are serialized by present_mutex_.
+  class Submitter {
+   public:
+    void Push(std::function<void()> job) {
+      std::lock_guard lock(mutex_);
+      if (!started_) {
+        started_ = true;
+        std::thread([this] { Run(); }).detach();
+      }
+      jobs_.push_back(std::move(job));
+      cv_.notify_all();
+    }
+    void Drain() {
+      std::unique_lock lock(mutex_);
+      cv_.wait(lock, [this] { return jobs_.empty() && !busy_; });
+    }
+
+    std::atomic<uint64_t> busy_us{0};  // time spent in jobs (MoltenVK encode + present), for the stats line
+
+   private:
+    void Run() {
+#if defined(__APPLE__)
+      pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);  // keep it on the performance cores
+#endif
+      for (;;) {
+        std::function<void()> job;
+        {
+          std::unique_lock lock(mutex_);
+          cv_.wait(lock, [this] { return !jobs_.empty(); });
+          job = std::move(jobs_.front());
+          jobs_.pop_front();
+          busy_ = true;
+        }
+        auto t0 = std::chrono::steady_clock::now();
+        job();
+        busy_us += uint64_t(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+        {
+          std::lock_guard lock(mutex_);
+          busy_ = false;
+        }
+        cv_.notify_all();
+      }
+    }
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::deque<std::function<void()>> jobs_;
+    bool started_ = false, busy_ = false;
+  } submitter_;
+  std::mutex present_mutex_;
+
   void RetireAll() {
+    submitter_.Drain();
     for (uint32_t i = 0; i < Backend::kFramesInFlight; i++) Retire((slot_ + i) % Backend::kFramesInFlight);
   }
 
@@ -641,10 +743,12 @@ class Renderer {
   void Present(const FramePacket& frame) {
     if (vsync_ != REXCVAR_GET(gtav_native_vsync)) {  // switched from the menu
       vsync_ = REXCVAR_GET(gtav_native_vsync);
+      submitter_.Drain();
+      std::lock_guard lock(present_mutex_);
       swapchain_->setVsyncEnabled(vsync_);
     }
     if (swapchain_->needsResize()) {
-      RetireAll();
+      RetireAll();  // also drains the submit thread
       swapchain_->resize();
       CreateFramebuffers();
     }
@@ -653,14 +757,14 @@ class Renderer {
     auto wait_start = std::chrono::steady_clock::now();
     Retire(slot);
     auto wait_end = std::chrono::steady_clock::now();
-    uint32_t image = 0;
-    if (!swapchain_->acquireTexture(acquires_[slot].get(), &image)) return;
-    auto acquire_end = std::chrono::steady_clock::now();
-    plume::RenderTexture* target = swapchain_->getTexture(image);
-    swap_target_ = target;
-    swap_image_ = image;
     list_ = lists_[slot].get();
     list_->begin();
+    plume::g_exactBarrierStages = REXCVAR_GET(gtav_native_exact_barriers);
+    gpu_timed_[slot] = bool(gpu_times_[slot]);
+    if (gpu_timed_[slot]) {
+      list_->resetQueryPool(gpu_times_[slot].get(), 0, 2);
+      list_->writeTimestamp(gpu_times_[slot].get(), 0);
+    }
     if (backend_ok_) backend_.BeginFrame(slot);
     // logs/dump_request (any content): same as F9, for scripted captures without keyboard focus.
     // The control files are polled on a background thread: a metadata lookup on the game's disk
@@ -743,7 +847,45 @@ class Renderer {
     uint32_t front_descriptor = 0;
     auto record_start = std::chrono::steady_clock::now();
     plume::RenderTexture* front = backend_ok_ ? backend_.Execute(frame, list_, &front_descriptor) : nullptr;
+    // The frame's rendering goes to the GPU now, in a command buffer of its own; only the copy
+    // into the window waits for a drawable. As one submission, the whole frame waited for the
+    // swap chain image (MoltenVK: ~4 ms of GPU idle per frame on the M1).
     auto record_end = std::chrono::steady_clock::now();
+    if (gpu_timed_[slot]) list_->writeTimestamp(gpu_times_[slot].get(), 1);
+    list_->end();
+    {
+      const plume::RenderCommandList* main = list_;
+      submitter_.Push([this, main] {
+        const plume::RenderCommandList* lists = main;
+        queue_cmd_->executeCommandLists(&lists, 1, nullptr, 0, nullptr, 0, nullptr);
+      });
+    }
+    auto main_submit_end = std::chrono::steady_clock::now();
+    uint32_t image = 0;
+    list_ = present_lists_[slot].get();
+    list_->begin();
+    bool acquired;
+    {
+      std::lock_guard lock(present_mutex_);
+      acquired = swapchain_->acquireTexture(acquires_[slot].get(), &image);
+    }
+    if (!acquired) {
+      list_->end();
+      if (backend_ok_) backend_.EndFrame(slot);
+      const plume::RenderCommandList* lists = list_;
+      plume::RenderCommandFence* fence = fences_[slot].get();
+      submitter_.Push([this, lists, fence] {
+        const plume::RenderCommandList* l = lists;
+        queue_cmd_->executeCommandLists(&l, 1, nullptr, 0, nullptr, 0, fence);
+      });
+      in_flight_[slot] = true;
+      slot_ = (slot + 1) % Backend::kFramesInFlight;
+      return;
+    }
+    auto acquire_end = std::chrono::steady_clock::now();
+    plume::RenderTexture* target = swapchain_->getTexture(image);
+    swap_target_ = target;
+    swap_image_ = image;
     list_->barriers(plume::RenderBarrierStage::GRAPHICS,
                     plume::RenderTextureBarrier(target, plume::RenderTextureLayout::COLOR_WRITE));
     list_->setFramebuffer(framebuffers_[image].get());
@@ -820,14 +962,23 @@ class Renderer {
     const plume::RenderCommandList* lists = list_;
     plume::RenderCommandSemaphore* wait = acquires_[slot].get();
     plume::RenderCommandSemaphore* signal = release_[image].get();
-    queue_cmd_->executeCommandLists(&lists, 1, &wait, 1, &signal, 1, fences_[slot].get());
+    plume::RenderCommandFence* fence = fences_[slot].get();
+    submitter_.Push([this, lists, wait, signal, fence, image] {
+      plume::RenderCommandSemaphore* w = wait;
+      plume::RenderCommandSemaphore* sg = signal;
+      const plume::RenderCommandList* l = lists;
+      queue_cmd_->executeCommandLists(&l, 1, &w, 1, &sg, 1, fence);
+      std::lock_guard lock(present_mutex_);
+      swapchain_->present(image, &sg, 1);
+    });
     auto submit_end = std::chrono::steady_clock::now();
-    swapchain_->present(image, &signal, 1);
-    auto present_end = std::chrono::steady_clock::now();
+    auto present_end = submit_end;
     in_flight_[slot] = true;
     slot_ = (slot + 1) % Backend::kFramesInFlight;
     auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
     timing_.Add(ms(record_end - record_start), ms(wait_end - wait_start));
+    last_record_ms_ = ms(record_end - record_start);
+    ab_slot_phase_[slot] = ab_phase_;
     // Hitch log: a present more than 25 ms after the previous one, with what this frame cost.
     double interval = last_present_.time_since_epoch().count() ? ms(present_end - last_present_) : 0;
     last_present_ = present_end;
@@ -840,7 +991,7 @@ class Renderer {
                   st.pipelines_created, st.textures, st.draws, st.shader_ms, st.pipeline_ms, st.texture_ms,
                   st.resolve_ms);
     }
-    timing_.acquire_sum += ms(acquire_end - wait_end);
+    timing_.acquire_sum += ms(acquire_end - main_submit_end);
     timing_.submit_sum += ms(submit_end - record_end);
     timing_.present_sum += ms(present_end - submit_end);
     if (shot || (backend_ok_ && backend_.Dumping())) {
@@ -952,6 +1103,9 @@ class Renderer {
   }
 
   void ThreadMain() {
+#if defined(__APPLE__)
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);  // keep it on the performance cores
+#endif
     if (!Init()) {
       {
         std::lock_guard lock(mutex_);
@@ -977,7 +1131,9 @@ class Renderer {
       render_state_ = 1;  // recording + presenting
       ApplyFenceCopies(frame);
       Validate(frame);
+      AbStep(presented);
       Present(frame);
+      AbRecord(presented);
       FenceCopiesRecorded(frame.index);
       render_state_ = 2;
       {
@@ -994,11 +1150,74 @@ class Renderer {
                     "wait for slot avg {:.2f} max {:.2f} ms",
                     presented, frame.index, dropped_.load(), timing_.record_sum / timing_.n, timing_.record_max,
                     timing_.gpu_sum / timing_.n, timing_.gpu_max);
-        REXLOG_INFO("[native]   avg acquire {:.2f} submit {:.2f} present {:.2f} idle {:.2f} ms",
+        REXLOG_INFO("[native]   avg acquire {:.2f} submit {:.2f} present {:.2f} idle {:.2f} ms; per frame {:.0f} "
+                    "render passes, {:.0f} barriers; submit thread busy {:.2f} ms; GPU frame {:.2f} ms, idle before {:.2f} ms",
                     timing_.acquire_sum / timing_.n, timing_.submit_sum / timing_.n,
-                    timing_.present_sum / timing_.n, timing_.idle_sum / timing_.n);
+                    timing_.present_sum / timing_.n, timing_.idle_sum / timing_.n,
+                    double(plume::g_statRenderPasses) / timing_.n, double(plume::g_statBarriers) / timing_.n,
+                    submitter_.busy_us.exchange(0) / 1000.0 / timing_.n,
+                    timing_.gpu_frames ? timing_.gpu_frame_sum / timing_.gpu_frames : 0.0,
+                    timing_.gpu_frames ? timing_.gpu_gap_sum / timing_.gpu_frames : 0.0);
+        plume::g_statRenderPasses = plume::g_statBarriers = 0;
         timing_ = {};
       }
+    }
+  }
+
+  // --gtav_native_ab=name=a|b: flips cvar `name` between a and b every 60 presented frames and
+  // logs per-setting averages every 1200 frames (both settings see the same scenes; the first 8
+  // frames after a flip are not counted).
+  struct AbStats {
+    double interval = 0, record = 0, gpu = 0;
+    uint32_t n = 0, gpu_n = 0;
+  };
+  AbStats ab_[2];
+  int ab_phase_ = -1;  // -1: off or warming up
+  int ab_slot_phase_[Backend::kFramesInFlight] = {-1, -1};
+  std::string ab_spec_, ab_name_, ab_values_[2];
+  std::chrono::steady_clock::time_point ab_last_;
+  uint64_t ab_frames_ = 0;
+  double last_record_ms_ = 0;
+  void AbStep(uint64_t presented) {
+    std::string spec = REXCVAR_GET(gtav_native_ab);
+    if (spec != ab_spec_) {
+      if (!ab_name_.empty()) rex::cvar::SetFlagByName(ab_name_, ab_values_[0]);
+      ab_spec_ = spec;
+      ab_name_.clear();
+      ab_[0] = ab_[1] = {};
+      ab_frames_ = 0;
+      auto eq = spec.find('='), bar = spec.find('|');
+      if (eq != std::string::npos && bar != std::string::npos && bar > eq) {
+        ab_name_ = spec.substr(0, eq);
+        ab_values_[0] = spec.substr(eq + 1, bar - eq - 1);
+        ab_values_[1] = spec.substr(bar + 1);
+        REXLOG_INFO("[native] A/B {}: {} | {}", ab_name_, ab_values_[0], ab_values_[1]);
+      }
+    }
+    ab_phase_ = -1;
+    if (ab_name_.empty()) return;
+    uint64_t k = ab_frames_++;
+    int phase = int((k / 60) & 1);
+    if (k % 60 == 0) rex::cvar::SetFlagByName(ab_name_, ab_values_[phase]);
+    if (k % 60 >= 8) ab_phase_ = phase;
+  }
+  void AbRecord(uint64_t presented) {
+    auto now = std::chrono::steady_clock::now();
+    if (ab_phase_ >= 0) {
+      auto& a = ab_[ab_phase_];
+      a.interval += std::chrono::duration<double, std::milli>(now - ab_last_).count();
+      a.record += last_record_ms_;
+      a.n++;
+    }
+    ab_last_ = now;
+    if (!ab_name_.empty() && ab_frames_ % 1200 == 0 && ab_[0].n && ab_[1].n) {
+      auto line = [](const AbStats& a) {
+        return fmt::format("{:.1f} fps (frame {:.2f} ms, record {:.2f}, GPU {:.2f})", 1000.0 * a.n / a.interval,
+                           a.interval / a.n, a.record / a.n, a.gpu_n ? a.gpu / a.gpu_n : 0.0);
+      };
+      REXLOG_INFO("[native] A/B {} = {}: {} | = {}: {}", ab_name_, ab_values_[0], line(ab_[0]), ab_values_[1],
+                  line(ab_[1]));
+      ab_[0] = ab_[1] = {};
     }
   }
 
@@ -1030,6 +1249,8 @@ class Renderer {
   bool vsync_ = true;  // the swap chain's current setting (the menu changes the cvar)
   struct Timing {  // render thread, per 300 presented frames
     double record_sum = 0, record_max = 0, gpu_sum = 0, gpu_max = 0;
+    double gpu_frame_sum = 0, gpu_gap_sum = 0;
+    uint32_t gpu_frames = 0;
     double acquire_sum = 0, submit_sum = 0, present_sum = 0, idle_sum = 0;
     uint32_t n = 0;
     void Add(double record, double gpu) {
@@ -1054,7 +1275,11 @@ class Renderer {
   std::unique_ptr<plume::RenderCommandQueue> queue_cmd_;
   std::unique_ptr<plume::RenderSwapChain> swapchain_;
   std::unique_ptr<plume::RenderCommandList> lists_[Backend::kFramesInFlight];
+  std::unique_ptr<plume::RenderCommandList> present_lists_[Backend::kFramesInFlight];  // window copy
   std::unique_ptr<plume::RenderCommandFence> fences_[Backend::kFramesInFlight];
+  std::unique_ptr<plume::RenderQueryPool> gpu_times_[Backend::kFramesInFlight];  // main list start / end
+  bool gpu_timed_[Backend::kFramesInFlight] = {};
+  uint64_t last_gpu_end_ = 0;
   std::unique_ptr<plume::RenderCommandSemaphore> acquires_[Backend::kFramesInFlight];
   bool in_flight_[Backend::kFramesInFlight] = {};
   uint32_t slot_ = 0;
@@ -1072,7 +1297,7 @@ class Renderer {
   bool flick_pending_[Backend::kFramesInFlight] = {};
   std::vector<uint8_t> flick_hist_grid_[2], flick_hist_rgb_[2];
   uint64_t flick_hist_index_[2] = {};
-  uint32_t flick_hist_n_ = 0, flick_count_ = 0;
+  uint32_t flick_hist_n_ = 0, flick_count_ = 0, flick_saved_ = 0;
   std::string flick_stats_[Backend::kFramesInFlight];
   std::vector<Backend::DrawNote> flick_notes_[Backend::kFramesInFlight], flick_hist_notes_[2];
   struct ReplayFrame {

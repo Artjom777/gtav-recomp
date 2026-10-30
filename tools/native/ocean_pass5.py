@@ -20,7 +20,7 @@ def resolves(d):
     """[(index, address, path)] of the 128x128 ocean resolves, in order."""
     out = []
     for n in sorted(os.listdir(d)):
-        m = re.match(r'(\d+)_(0C0[89][78]000)_f34_128x128_r128\.raw$', n)
+        m = re.match(r'(\d+)_(0C0[89][678]000)_f34_128x128_r128\.raw$', n)
         if m:
             out.append((int(m.group(1)), m.group(2), f'{d}/{n}'))
     return out

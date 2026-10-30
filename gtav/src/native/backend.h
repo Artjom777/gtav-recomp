@@ -67,6 +67,7 @@ class Backend {
     int32_t base_vertex;
     uint32_t tex[4];  // base addresses of the first four bound textures
     uint8_t copied, rewritten, skipped, uploads;  // data from a copy / changed since the D3D call / texture uploads
+    float vsc[48];  // vertex shader constants c0-c11 (only those the shader reads are captured)
   };
   const std::vector<DrawNote>& LastNotes() const;
 
