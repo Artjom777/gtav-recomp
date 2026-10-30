@@ -11,10 +11,28 @@
 //   data\update\update.rpf                 made here: from the TU
 //   data\user\...\545408A7\00000002\       made here: Disc 1 install partitions
 //   data\spirv\                            filled by the game: shaders translated on first use
+// Linux: gtav_fast, librexruntime.so, rexglue, tools/llvm/bin/{clang++,ld.lld}, gtav_game.so; the
+// same data/ layout.
 #include "install.h"
 
+#ifdef _WIN32
 #include <windows.h>
 #include <bcrypt.h>
+#else
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <spawn.h>
+#include <sys/resource.h>
+#include <sys/statvfs.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <cstring>
+
+extern char** environ;
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -35,7 +53,21 @@ namespace fs = std::filesystem;
 namespace loader {
 namespace {
 
+#ifdef _WIN32
 constexpr wchar_t kInstalledMarker[] = L"data\\installed.txt";
+constexpr wchar_t kGameExe[] = L"gtav_fast.exe";
+constexpr wchar_t kGameLib[] = L"gtav_game.dll";
+constexpr wchar_t kCodegenExe[] = L"rexgluerd.exe";
+constexpr wchar_t kClang[] = L"clang++.exe";
+constexpr wchar_t kObjExt[] = L".obj";
+#else
+constexpr wchar_t kInstalledMarker[] = L"data/installed.txt";
+constexpr wchar_t kGameExe[] = L"gtav_fast";
+constexpr wchar_t kGameLib[] = L"gtav_game.so";
+constexpr wchar_t kCodegenExe[] = L"rexglue";
+constexpr wchar_t kClang[] = L"clang++";
+constexpr wchar_t kObjExt[] = L".o";
+#endif
 constexpr char kInstallVersion[] = "gtav-recomp install 1";
 constexpr char kTitleId[] = "545408A7";
 constexpr char kInstallPackageDir[] = "content/0000000000000000/545408A7/00000002/";
@@ -57,6 +89,7 @@ std::wstring Gb(uint64_t bytes) {
   return buf;
 }
 
+#ifdef _WIN32
 class Sha256 {
  public:
   Sha256() {
@@ -91,6 +124,84 @@ class Sha256 {
   BCRYPT_ALG_HANDLE alg_ = nullptr;
   BCRYPT_HASH_HANDLE hash_ = nullptr;
 };
+#else
+// FIPS 180-4 SHA-256 (no crypto library on the player's machine is assumed).
+class Sha256 {
+ public:
+  void Update(const uint8_t* data, size_t size) {
+    total_ += size;
+    if (fill_) {
+      size_t n = std::min(size, sizeof(buf_) - fill_);
+      memcpy(buf_ + fill_, data, n);
+      fill_ += n;
+      data += n;
+      size -= n;
+      if (fill_ < sizeof(buf_)) return;
+      Block(buf_);
+      fill_ = 0;
+    }
+    for (; size >= 64; data += 64, size -= 64) Block(data);
+    memcpy(buf_, data, size);
+    fill_ = size;
+  }
+  std::string Hex() {
+    uint64_t bits = total_ * 8;
+    uint8_t pad[72] = {0x80};
+    size_t n = (fill_ < 56 ? 56 : 120) - fill_;
+    for (int i = 0; i < 8; ++i) pad[n + i] = uint8_t(bits >> (56 - 8 * i));
+    Update(pad, n + 8);
+    static const char* k = "0123456789abcdef";
+    std::string s;
+    for (uint32_t w : h_) {
+      for (int i = 28; i >= 0; i -= 4) s += k[(w >> i) & 15];
+    }
+    return s;
+  }
+
+ private:
+  static uint32_t Ror(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
+  void Block(const uint8_t* p) {
+    static constexpr uint32_t K[64] = {
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
+    uint32_t w[64];
+    for (int i = 0; i < 16; ++i)
+      w[i] = uint32_t(p[4 * i]) << 24 | uint32_t(p[4 * i + 1]) << 16 | uint32_t(p[4 * i + 2]) << 8 |
+             p[4 * i + 3];
+    for (int i = 16; i < 64; ++i) {
+      uint32_t s0 = Ror(w[i - 15], 7) ^ Ror(w[i - 15], 18) ^ (w[i - 15] >> 3);
+      uint32_t s1 = Ror(w[i - 2], 17) ^ Ror(w[i - 2], 19) ^ (w[i - 2] >> 10);
+      w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+    uint32_t a = h_[0], b = h_[1], c = h_[2], d = h_[3], e = h_[4], f = h_[5], g = h_[6], h = h_[7];
+    for (int i = 0; i < 64; ++i) {
+      uint32_t t1 = h + (Ror(e, 6) ^ Ror(e, 11) ^ Ror(e, 25)) + ((e & f) ^ (~e & g)) + K[i] + w[i];
+      uint32_t t2 = (Ror(a, 2) ^ Ror(a, 13) ^ Ror(a, 22)) + ((a & b) ^ (a & c) ^ (b & c));
+      h = g;
+      g = f;
+      f = e;
+      e = d + t1;
+      d = c;
+      c = b;
+      b = a;
+      a = t1 + t2;
+    }
+    h_[0] += a; h_[1] += b; h_[2] += c; h_[3] += d;
+    h_[4] += e; h_[5] += f; h_[6] += g; h_[7] += h;
+  }
+  uint32_t h_[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                    0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+  uint8_t buf_[64];
+  size_t fill_ = 0;
+  uint64_t total_ = 0;
+};
+#endif
 
 bool HashFile(const fs::path& p, std::string* hex, uint64_t* size) {
   std::wstring err;
@@ -111,6 +222,7 @@ bool HashFile(const fs::path& p, std::string* hex, uint64_t* size) {
 }
 
 // Writes a file through a .part name and renames it into place when complete.
+#ifdef _WIN32
 class OutFile {
  public:
   bool Open(const fs::path& p, std::wstring* error) {
@@ -152,6 +264,49 @@ class OutFile {
   HANDLE h_ = INVALID_HANDLE_VALUE;
   fs::path final_, part_;
 };
+#else
+class OutFile {
+ public:
+  bool Open(const fs::path& p, std::wstring* error) {
+    final_ = p;
+    part_ = p;
+    part_ += L".part";
+    std::error_code ec;
+    fs::create_directories(p.parent_path(), ec);
+    fd_ = open(part_.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd_ < 0) {
+      *error = L"Could not create " + part_.wstring() + L": " + Widen(strerror(errno));
+      return false;
+    }
+    return true;
+  }
+  bool Write(const uint8_t* data, size_t size) {
+    while (size) {
+      ssize_t done = write(fd_, data, std::min<size_t>(size, 64u << 20));
+      if (done < 0 && errno == EINTR) continue;
+      if (done <= 0) return false;
+      data += done;
+      size -= size_t(done);
+    }
+    return true;
+  }
+  bool Commit() {
+    bool ok = close(fd_) == 0;
+    fd_ = -1;
+    return ok && rename(part_.c_str(), final_.c_str()) == 0;
+  }
+  ~OutFile() {
+    if (fd_ >= 0) {
+      close(fd_);
+      unlink(part_.c_str());
+    }
+  }
+
+ private:
+  int fd_ = -1;
+  fs::path final_, part_;
+};
+#endif
 
 //-----------------------------------------------------------------------------
 // Expected files (tools\game_dll\expected.txt, written by tools/game_dll/make_expected.py)
@@ -206,9 +361,23 @@ struct ExpectedSet {
 
 std::wstring Quote(const std::wstring& s) { return L"\"" + s + L"\""; }
 
+// One argument per element; Windows joins them into a command line.
+using Args = std::vector<std::wstring>;
+
+#ifdef _WIN32
+std::wstring CommandLine(const Args& args) {
+  std::wstring cmd;
+  for (const std::wstring& a : args) {
+    if (!cmd.empty()) cmd += L" ";
+    cmd += a.empty() || a.find_first_of(L" \t\"") != std::wstring::npos ? Quote(a) : a;
+  }
+  return cmd;
+}
+
 struct Child {
   PROCESS_INFORMATION pi = {};
-  bool Start(const std::wstring& cmdline, const fs::path& cwd, const fs::path& log) {
+  bool Start(const Args& args, const fs::path& cwd, const fs::path& log) {
+    std::wstring cmdline = CommandLine(args);
     SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, TRUE};
     HANDLE out = CreateFileW(log.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_ALWAYS,
                              FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -237,6 +406,70 @@ struct Child {
     if (pi.hThread) CloseHandle(pi.hThread);
   }
 };
+#else
+std::vector<std::string> NarrowArgs(const Args& args) {
+  std::vector<std::string> out;
+  for (const std::wstring& a : args) out.push_back(Narrow(a));
+  return out;
+}
+
+std::vector<char*> Argv(std::vector<std::string>& args) {
+  std::vector<char*> argv;
+  for (std::string& a : args) argv.push_back(a.data());
+  argv.push_back(nullptr);
+  return argv;
+}
+
+struct Child {
+  pid_t pid = -1;
+  int status = -1;
+  bool Start(const Args& args, const fs::path& cwd, const fs::path& log) {
+    std::vector<std::string> narrow = NarrowArgs(args);
+    std::vector<char*> argv = Argv(narrow);
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(&fa, 1, log.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    posix_spawn_file_actions_adddup2(&fa, 1, 2);
+    posix_spawn_file_actions_addchdir_np(&fa, cwd.c_str());
+    int err = posix_spawn(&pid, argv[0], &fa, nullptr, argv.data(), environ);
+    posix_spawn_file_actions_destroy(&fa);
+    if (err != 0) {
+      pid = -1;
+      return false;
+    }
+    // The install runs in the background, like BELOW_NORMAL_PRIORITY_CLASS on Windows.
+    setpriority(PRIO_PROCESS, id_t(pid), 10);
+    return true;
+  }
+  // -1 while running. wait_ms < 0 waits until it exits.
+  int Poll(int wait_ms = 0) {
+    if (pid < 0) return status;
+    auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(wait_ms, 0));
+    for (;;) {
+      int st = 0;
+      pid_t r = waitpid(pid, &st, wait_ms < 0 ? 0 : WNOHANG);
+      if (r == pid) {
+        pid = -1;
+        status = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + (WIFSIGNALED(st) ? WTERMSIG(st) : 0);
+        return status;
+      }
+      if (r < 0 && errno != EINTR) return status = 1;
+      if (wait_ms >= 0 && std::chrono::steady_clock::now() >= until) return -1;
+      if (wait_ms >= 0) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  }
+  void Kill() {
+    if (pid > 0) kill(pid, SIGKILL);
+  }
+  ~Child() {
+    if (pid > 0) {
+      kill(pid, SIGKILL);
+      waitpid(pid, nullptr, 0);
+    }
+  }
+};
+constexpr int INFINITE = -1;
+#endif
 
 std::string Tail(const fs::path& p, size_t bytes) {
   std::ifstream f(p, std::ios::binary);
@@ -360,14 +593,28 @@ class Installer {
   }
 
   bool CheckSpace() {
+#ifdef _WIN32
     ULARGE_INTEGER free_bytes;
     if (!GetDiskFreeSpaceExW(root_.c_str(), &free_bytes, nullptr, nullptr)) return true;
+#else
+    struct statvfs sv;
+    if (statvfs(data_.c_str(), &sv) != 0) return true;
+    struct {
+      uint64_t QuadPart;
+    } free_bytes = {uint64_t(sv.f_bavail) * sv.f_frsize};
+#endif
     uint64_t need = expected_.TotalBytes() + (3ull << 30);  // + codegen and objects
-    // Files already in place count as done.
-    for (auto& [path, exp] : expected_.disc2) {
+    // Files already in place (an interrupted earlier run) count as done.
+    auto have = [&](const fs::path& p, uint64_t size) {
       std::error_code ec;
-      if (fs::file_size(data_ / L"game" / Widen(path), ec) == exp.size && !ec) need -= exp.size;
-    }
+      if (fs::file_size(p, ec) == size && !ec) need -= size;
+    };
+    for (auto& [path, exp] : expected_.disc2) have(data_ / L"game" / Widen(path), exp.size);
+    for (auto& [path, exp] : expected_.part)
+      have(data_ / L"user" / L"0000000000000000" / Widen(kTitleId) / L"00000002" / Widen(path),
+           exp.size);
+    if (auto* e = Find(expected_.tu, "default.xexp")) have(data_ / L"game" / L"default.xexp", e->size);
+    if (auto* e = Find(expected_.tu, "update.rpf")) have(data_ / L"update" / L"update.rpf", e->size);
     if (free_bytes.QuadPart < need)
       return SetError(L"Not enough free space next to the launcher: " + Gb(need) + L" needed, " +
                       Gb(free_bytes.QuadPart) + L" free.");
@@ -539,9 +786,9 @@ class Installer {
     Log(L"Running codegen");
     fs::path log = data_ / L"logs" / L"codegen.log";
     Child c;
-    std::wstring cmd = Quote((root_ / L"rexgluerd.exe").wstring()) +
-                       L" --log-level info codegen gtav_manifest.toml";
-    if (!c.Start(cmd, build, log)) return SetError(L"Could not start rexgluerd.exe");
+    Args cmd = {(root_ / kCodegenExe).wstring(), L"--log-level", L"info", L"codegen",
+                L"gtav_manifest.toml"};
+    if (!c.Start(cmd, build, log)) return SetError(L"Could not start " + std::wstring(kCodegenExe));
     size_t want = expected_.gen.size();
     for (;;) {
       int code = c.Poll(1000);
@@ -591,6 +838,24 @@ class Installer {
   //--- compile and link ------------------------------------------------------
 
   static int JobCount() {
+#ifndef _WIN32
+    // MemAvailable from /proc/meminfo, in kB.
+    int64_t avail_mb = 4096;
+    std::ifstream mi("/proc/meminfo");
+    std::string key;
+    int64_t kb;
+    while (mi >> key >> kb) {
+      if (key == "MemAvailable:") {
+        avail_mb = kb / 1024;
+        break;
+      }
+      mi.ignore(64, '\n');
+    }
+    int64_t by_ram_mb = (avail_mb - 2048) / 1024;
+    int jobs_mb = int(std::min<int64_t>(sysconf(_SC_NPROCESSORS_ONLN), by_ram_mb));
+    return std::clamp(jobs_mb, 1, 32);
+#endif
+#ifdef _WIN32
     SYSTEM_INFO si;
     GetSystemInfo(&si);
     MEMORYSTATUSEX ms = {sizeof(ms)};
@@ -599,6 +864,7 @@ class Installer {
     int64_t by_ram = (int64_t(ms.ullAvailPhys >> 20) - 2048) / 1024;
     int jobs = int(std::min<int64_t>(si.dwNumberOfProcessors, by_ram));
     return std::clamp(jobs, 1, 32);
+#endif
   }
 
   bool Compile() {
@@ -622,12 +888,20 @@ class Installer {
     sources.push_back(fsdir / L"game_dll.cpp");
     sources.push_back(fsdir / L"fs_crt.cpp");
 
-    fs::path clang = root_ / L"tools" / L"llvm" / L"bin" / L"clang++.exe";
-    std::wstring flags =
-        L" --target=x86_64-pc-windows-msvc -nostdinc++ -nostdlibinc -O2 -std=gnu++23"
-        L" -march=x86-64-v3 -msse4.1 -fno-exceptions -fno-rtti -fno-threadsafe-statics"
-        L" -fno-math-errno -w -isystem " + Quote((fsdir / L"include").wstring()) +
-        L" -I " + Quote(gen.wstring());
+    fs::path clang = root_ / L"tools" / L"llvm" / L"bin" / kClang;
+    // Keep in sync with tools/game_dll/build_game_dll.py.
+#ifdef _WIN32
+    Args flags = {L"--target=x86_64-pc-windows-msvc", L"-nostdinc++", L"-nostdlibinc", L"-O2",
+                  L"-std=gnu++23", L"-march=x86-64-v3", L"-msse4.1", L"-fno-exceptions",
+                  L"-fno-rtti", L"-fno-threadsafe-statics", L"-fno-math-errno", L"-w"};
+#else
+    Args flags = {L"--target=x86_64-linux-gnu", L"-nostdinc++", L"-nostdlibinc", L"-fPIC",
+                  L"-fno-semantic-interposition", L"-fno-stack-protector",
+                  L"-fcf-protection=none", L"-O2", L"-std=gnu++23", L"-march=x86-64-v3",
+                  L"-msse4.1", L"-fno-exceptions", L"-fno-rtti", L"-fno-threadsafe-statics",
+                  L"-fno-math-errno", L"-w"};
+#endif
+    flags.insert(flags.end(), {L"-isystem", (fsdir / L"include").wstring(), L"-I", gen.wstring()});
 
     int jobs = JobCount();
     Log(L"Compiling " + Num(sources.size()) + L" files with " + Num(jobs) + L" parallel jobs");
@@ -643,12 +917,13 @@ class Installer {
     while (finished < sources.size()) {
       while (running.size() < size_t(jobs) && next < sources.size()) {
         const fs::path& src = sources[next++];
-        fs::path o = obj / (src.filename().wstring() + L".obj");
+        fs::path o = obj / (src.filename().wstring() + kObjExt);
         objects_.push_back(o);
         Running r{std::make_unique<Child>(), obj / (src.filename().wstring() + L".log"), src};
-        std::wstring cmd = Quote(clang.wstring()) + flags + L" -c " + Quote(src.wstring()) +
-                           L" -o " + Quote(o.wstring());
-        if (!r.child->Start(cmd, gen, r.log)) return SetError(L"Could not start clang++.exe");
+        Args cmd = {clang.wstring()};
+        cmd.insert(cmd.end(), flags.begin(), flags.end());
+        cmd.insert(cmd.end(), {L"-c", src.wstring(), L"-o", o.wstring()});
+        if (!r.child->Start(cmd, gen, r.log)) return SetError(L"Could not start " + std::wstring(kClang));
         running.push_back(std::move(r));
       }
       for (size_t i = 0; i < running.size();) {
@@ -678,6 +953,37 @@ class Installer {
     return true;
   }
 
+#ifndef _WIN32
+  bool Link() {
+    ui_.Stage(L"Linking gtav_game.so...");
+    fs::path build = data_ / L"build";
+    fs::path iface = root_ / L"tools" / L"game_dll" / L"interface";
+    fs::path lld = root_ / L"tools" / L"llvm" / L"bin" / L"ld.lld";
+    fs::path rsp = build / L"link.rsp";
+    {
+      std::ofstream f(rsp);
+      for (auto& o : objects_) f << "\"" << o.string() << "\"\n";
+    }
+    fs::path out = root_ / L"gtav_game.so.new";
+    fs::path log = data_ / L"logs" / L"link.log";
+    // Keep in sync with tools/game_dll/build_game_dll.py. -Bsymbolic keeps calls between game
+    // functions direct; the hooks, bridge, kernel imports and log2f bind to gtav_fast,
+    // librexruntime.so and libm at load time (-z now: at once, so a missing one fails at start).
+    Args cmd = {lld.wstring(), L"-shared", L"-soname", L"gtav_game.so", L"-Bsymbolic", L"-z", L"now",
+                L"-z", L"relro", L"-z", L"noexecstack", L"--hash-style=gnu", L"-O1",
+                L"--version-script=" + (iface / L"gtav_game.exports").wstring(), L"-o",
+                out.wstring(), L"@" + rsp.wstring()};
+    Child c;
+    if (!c.Start(cmd, build, log)) return SetError(L"Could not start ld.lld");
+    int code = c.Poll(INFINITE);
+    if (code != 0) return SetError(L"Linking failed:\n" + Widen(Tail(log, 1500)));
+    if (rename(out.c_str(), (root_ / kGameLib).c_str()) != 0)
+      return SetError(L"Could not put gtav_game.so in place: " + Widen(strerror(errno)));
+    Log(L"Built gtav_game.so");
+    ui_.Progress(1.0);
+    return true;
+  }
+#else
   bool Link() {
     ui_.Stage(L"Linking gtav_game.dll...");
     fs::path build = data_ / L"build";
@@ -687,9 +993,9 @@ class Installer {
     for (const wchar_t* name : {L"gtav_fast", L"rexruntime", L"ucrtbase"}) {
       fs::path lib = build / (std::wstring(name) + L".lib");
       Child c;
-      std::wstring cmd = Quote(lld.wstring()) + L" /lib /machine:x64 " +
-                         Quote(L"/def:" + (iface / (std::wstring(name) + L".def")).wstring()) +
-                         L" " + Quote(L"/out:" + lib.wstring());
+      Args cmd = {lld.wstring(), L"/lib", L"/machine:x64",
+                  L"/def:" + (iface / (std::wstring(name) + L".def")).wstring(),
+                  L"/out:" + lib.wstring()};
       fs::path log = data_ / L"logs" / L"implib.log";
       if (!c.Start(cmd, build, log) || c.Poll(INFINITE) != 0)
         return SetError(L"Could not build an import library:\n" + Widen(Tail(log, 800)));
@@ -703,10 +1009,9 @@ class Installer {
     }
     fs::path out = root_ / L"gtav_game.dll.new";
     fs::path log = data_ / L"logs" / L"link.log";
-    std::wstring cmd = Quote(lld.wstring()) +
-                       L" /dll /noentry /nodefaultlib /machine:x64 /debug:none " +
-                       Quote(L"/def:" + (iface / L"gtav_game.def").wstring()) + L" " +
-                       Quote(L"/out:" + out.wstring()) + L" " + Quote(L"@" + rsp.wstring());
+    Args cmd = {lld.wstring(), L"/dll", L"/noentry", L"/nodefaultlib", L"/machine:x64",
+                L"/debug:none", L"/def:" + (iface / L"gtav_game.def").wstring(),
+                L"/out:" + out.wstring(), L"@" + rsp.wstring()};
     Child c;
     if (!c.Start(cmd, build, log)) return SetError(L"Could not start lld-link.exe");
     int code = c.Poll(INFINITE);
@@ -717,6 +1022,7 @@ class Installer {
     ui_.Progress(1.0);
     return true;
   }
+#endif
 
   fs::path root_;
   InstallInputs in_;
@@ -737,12 +1043,45 @@ class Installer {
 
 bool IsInstalled(const fs::path& root) {
   std::error_code ec;
-  if (!fs::exists(root / L"gtav_game.dll", ec)) return false;
+  if (!fs::exists(root / kGameLib, ec)) return false;
   std::ifstream f(root / kInstalledMarker);
   std::string line;
   return std::getline(f, line) && line == kInstallVersion;
 }
 
+#ifndef _WIN32
+bool Preflight(const fs::path& root, std::wstring* error) {
+  // gtav_fast and the game code are built for x86-64-v3 (AVX2, BMI2, FMA, MOVBE).
+  __builtin_cpu_init();
+  if (!__builtin_cpu_supports("avx2") || !__builtin_cpu_supports("bmi2") ||
+      !__builtin_cpu_supports("fma")) {
+    *error = L"This processor has no AVX2. The game needs an x86-64 CPU from about 2013 or later "
+             L"(Intel Haswell, AMD Excavator / Zen or newer).";
+    return false;
+  }
+  if (void* vk = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL)) {
+    dlclose(vk);
+  } else {
+    *error = L"The Vulkan loader (libvulkan.so.1) is not installed. Install your distribution's "
+             L"Vulkan package (for example libvulkan1 and mesa-vulkan-drivers, or the NVIDIA "
+             L"driver) and try again.";
+    return false;
+  }
+  for (const wchar_t* f :
+       {L"gtav_fast", L"librexruntime.so", L"librexgpu-xenos.so", L"rexglue",
+        L"tools/llvm/bin/clang++", L"tools/llvm/bin/ld.lld", L"tools/game_dll/expected.txt",
+        L"tools/game_dll/gtav_manifest.toml", L"tools/game_dll/fs/gtav_pch.h",
+        L"tools/game_dll/interface/gtav_game.exports"}) {
+    std::error_code ec;
+    if (!fs::exists(root / f, ec)) {
+      *error = std::wstring(L"The release folder is incomplete: ") + f + L" is missing. "
+               L"Unpack the whole release archive again.";
+      return false;
+    }
+  }
+  return true;
+}
+#else
 bool Preflight(const fs::path& root, std::wstring* error) {
   // gtav_fast.exe and the game code are built for x86-64-v3 (AVX2, BMI2, FMA, MOVBE).
   if (!IsProcessorFeaturePresent(PF_AVX2_INSTRUCTIONS_AVAILABLE)) {
@@ -775,13 +1114,14 @@ bool Preflight(const fs::path& root, std::wstring* error) {
   }
   return true;
 }
+#endif
 
 bool RunInstall(const fs::path& root, const InstallInputs& in, InstallUi& ui, std::wstring* error) {
   Installer inst(root, in, ui);
   return inst.Run(error);
 }
 
-bool LaunchGame(const fs::path& root, std::wstring* error) {
+bool LaunchGame(const fs::path& root, std::wstring* error, const std::vector<std::wstring>& extra) {
   fs::path data = root / L"data";
   std::error_code ec;
   fs::create_directories(data / L"spirv", ec);
@@ -793,7 +1133,7 @@ bool LaunchGame(const fs::path& root, std::wstring* error) {
   for (auto it = fs::directory_iterator(root, ec); !ec && it != fs::directory_iterator();
        it.increment(ec)) {
     auto ext = Lower(Narrow(it->path().extension().wstring()));
-    if (ext != ".dll" && it->path().filename() != L"gtav_fast.exe") continue;
+    if (ext != ".dll" && ext != ".so" && it->path().filename() != kGameExe) continue;
     std::wstring err;
     if (auto b = OpenFileBlob(it->path().wstring(), &err)) {
       for (uint64_t off = 0; off < b->size(); off += buf.size())
@@ -801,17 +1141,33 @@ bool LaunchGame(const fs::path& root, std::wstring* error) {
     }
   }
   auto arg = [](const std::wstring& name, const fs::path& p) {
-    return L" " + Quote(L"--" + name + L"=" + p.wstring());
+    return L"--" + name + L"=" + p.wstring();
   };
-  std::wstring cmd = Quote((root / L"gtav_fast.exe").wstring()) + arg(L"game_data_root", data / L"game") +
-                     arg(L"user_data_root", data / L"user") +
-                     arg(L"update_data_root", data / L"update") +
-                     arg(L"log_file", data / L"logs" / L"gtav.log") +
-                     arg(L"gtav_native_spirv_dir", data / L"spirv") +
-                     L" --gpu_plugin=xenos --headless=true --log_level=info"
-                     L" --log_max_file_size_mb=256 --log_max_files=2 --input_backend=xinput"
-                     L" --gtav_native=on --gtav_fps_limit=0 --gpu_skip_rendering=true"
-                     L" --gpu_skip_rendering_lag_ms=4 --vsync=false --gtav_native_vsync=false";
+  Args args = {(root / kGameExe).wstring(), arg(L"game_data_root", data / L"game"),
+               arg(L"user_data_root", data / L"user"), arg(L"update_data_root", data / L"update"),
+               arg(L"log_file", data / L"logs" / L"gtav.log"),
+               arg(L"gtav_native_spirv_dir", data / L"spirv"), L"--gpu_plugin=xenos",
+               L"--headless=true", L"--log_level=info", L"--log_max_file_size_mb=256",
+               L"--log_max_files=2",
+#ifdef _WIN32
+               L"--input_backend=xinput",
+#endif
+               L"--gtav_native=on", L"--gtav_fps_limit=0", L"--gpu_skip_rendering=true",
+               L"--gpu_skip_rendering_lag_ms=4", L"--vsync=false", L"--gtav_native_vsync=false"};
+  args.insert(args.end(), extra.begin(), extra.end());
+#ifndef _WIN32
+  // The launcher becomes the game: it keeps the terminal and the exit code.
+  if (chdir(root.c_str()) != 0) {
+    *error = L"Could not enter " + root.wstring();
+    return false;
+  }
+  std::vector<std::string> narrow = NarrowArgs(args);
+  std::vector<char*> argv = Argv(narrow);
+  execv(argv[0], argv.data());
+  *error = L"Could not start " + args[0] + L": " + Widen(strerror(errno));
+  return false;
+#else
+  std::wstring cmd = CommandLine(args);
   STARTUPINFOW si = {sizeof(si)};
   PROCESS_INFORMATION pi = {};
   if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, root.c_str(), &si,
@@ -822,6 +1178,7 @@ bool LaunchGame(const fs::path& root, std::wstring* error) {
   CloseHandle(pi.hThread);
   CloseHandle(pi.hProcess);
   return true;
+#endif
 }
 
 }  // namespace loader

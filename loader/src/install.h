@@ -5,6 +5,7 @@
 
 #include <filesystem>
 #include <string>
+#include <vector>
 
 namespace loader {
 
@@ -25,11 +26,14 @@ class InstallUi {
   virtual bool Ask(const std::wstring& question) = 0;  // yes/no, blocks the install thread
 };
 
-// root = the folder holding the launcher, gtav_fast.exe and tools\.
+// root = the folder holding the launcher, gtav_fast.exe and tools\ (Linux: gtav_fast, tools/).
 bool IsInstalled(const std::filesystem::path& root);
 bool RunInstall(const std::filesystem::path& root, const InstallInputs& in, InstallUi& ui,
                 std::wstring* error);
-bool LaunchGame(const std::filesystem::path& root, std::wstring* error);
+// extra: more game arguments (Linux: everything after "--" on the launcher's command line). On
+// Linux the launcher process becomes the game, so this returns only on an error.
+bool LaunchGame(const std::filesystem::path& root, std::wstring* error,
+                const std::vector<std::wstring>& extra = {});
 // Checks that can fail before anything is touched (CPU, runtime DLLs, bundled tools).
 bool Preflight(const std::filesystem::path& root, std::wstring* error);
 

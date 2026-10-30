@@ -1,7 +1,15 @@
 // gtav launcher - disc image, disc folder and STFS package readers (see sources.h).
 #include "sources.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <cerrno>
+#endif
 
 #include <algorithm>
 #include <cstring>
@@ -12,6 +20,7 @@ namespace fs = std::filesystem;
 
 namespace loader {
 
+#ifdef _WIN32
 std::wstring Widen(const std::string& s) {
   if (s.empty()) return {};
   int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), int(s.size()), nullptr, 0);
@@ -27,6 +36,49 @@ std::string Narrow(const std::wstring& w) {
   WideCharToMultiByte(CP_UTF8, 0, w.data(), int(w.size()), s.data(), n, nullptr, nullptr);
   return s;
 }
+#else
+// wchar_t is UTF-32 here. Invalid bytes become U+FFFD.
+std::wstring Widen(const std::string& s) {
+  std::wstring w;
+  for (size_t i = 0; i < s.size();) {
+    unsigned char c = static_cast<unsigned char>(s[i]);
+    int len = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 0;
+    if (!len || i + len > s.size()) {
+      w += L'\uFFFD';
+      ++i;
+      continue;
+    }
+    uint32_t cp = len == 1 ? c : c & (0x7F >> len);
+    for (int k = 1; k < len; ++k) cp = (cp << 6) | (static_cast<unsigned char>(s[i + k]) & 0x3F);
+    w += wchar_t(cp);
+    i += len;
+  }
+  return w;
+}
+
+std::string Narrow(const std::wstring& w) {
+  std::string s;
+  for (wchar_t wc : w) {
+    uint32_t cp = uint32_t(wc);
+    if (cp < 0x80) {
+      s += char(cp);
+    } else if (cp < 0x800) {
+      s += char(0xC0 | (cp >> 6));
+      s += char(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+      s += char(0xE0 | (cp >> 12));
+      s += char(0x80 | ((cp >> 6) & 0x3F));
+      s += char(0x80 | (cp & 0x3F));
+    } else {
+      s += char(0xF0 | (cp >> 18));
+      s += char(0x80 | ((cp >> 12) & 0x3F));
+      s += char(0x80 | ((cp >> 6) & 0x3F));
+      s += char(0x80 | (cp & 0x3F));
+    }
+  }
+  return s;
+}
+#endif
 
 namespace {
 
@@ -35,6 +87,7 @@ std::string Lower(std::string s) {
   return s;
 }
 
+#ifdef _WIN32
 std::wstring LastErrorText(const wchar_t* what, const std::wstring& path) {
   wchar_t buf[512] = {};
   FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr, GetLastError(),
@@ -66,6 +119,34 @@ class FileBlob : public Blob {
   HANDLE h_;
   uint64_t size_;
 };
+#else
+std::wstring LastErrorText(const wchar_t* what, const std::wstring& path) {
+  return std::wstring(what) + L" " + path + L": " + Widen(strerror(errno));
+}
+
+class FileBlob : public Blob {
+ public:
+  FileBlob(int fd, uint64_t size) : fd_(fd), size_(size) {}
+  ~FileBlob() override { close(fd_); }
+  bool ReadAt(uint64_t offset, void* dst, size_t size) override {
+    uint8_t* out = static_cast<uint8_t*>(dst);
+    while (size) {
+      ssize_t got = pread(fd_, out, std::min<size_t>(size, 64u << 20), off_t(offset));
+      if (got < 0 && errno == EINTR) continue;
+      if (got <= 0) return false;
+      out += got;
+      offset += uint64_t(got);
+      size -= size_t(got);
+    }
+    return true;
+  }
+  uint64_t size() const override { return size_; }
+
+ private:
+  int fd_;
+  uint64_t size_;
+};
+#endif
 
 // A window [base, base + size) of another blob.
 class SliceBlob : public Blob {
@@ -395,6 +476,7 @@ class Stfs : public Source {
 
 }  // namespace
 
+#ifdef _WIN32
 std::unique_ptr<Blob> OpenFileBlob(const std::wstring& path, std::wstring* error) {
   HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                          FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
@@ -406,6 +488,24 @@ std::unique_ptr<Blob> OpenFileBlob(const std::wstring& path, std::wstring* error
   GetFileSizeEx(h, &size);
   return std::make_unique<FileBlob>(h, uint64_t(size.QuadPart));
 }
+#else
+std::unique_ptr<Blob> OpenFileBlob(const std::wstring& path, std::wstring* error) {
+  int fd = open(Narrow(path).c_str(), O_RDONLY | O_CLOEXEC);
+  struct stat st = {};
+  bool ok = fd >= 0 && fstat(fd, &st) == 0;
+  if (ok && S_ISDIR(st.st_mode)) {
+    errno = EISDIR;
+    ok = false;
+  }
+  if (!ok) {
+    *error = LastErrorText(L"Could not open", path);
+    if (fd >= 0) close(fd);
+    return nullptr;
+  }
+  posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+  return std::make_unique<FileBlob>(fd, uint64_t(st.st_size));
+}
+#endif
 
 const Entry* Source::Find(const std::string& path) const {
   std::string want = Lower(path);

@@ -46,13 +46,16 @@ XenosRecomp/   $(git -C "$xr" rev-parse --short HEAD) + submodules; apply gtav-r
 plume/         $(git -C "$plume" rev-parse --short HEAD); apply gtav-recomp/plume-gtav.patch
 
 FFmpeg (rexglue-sdk/thirdparty/FFmpeg, LGPL-2.1-or-later; FFmpeg's GPL parts are not enabled
-by the SDK's build) is linked statically into rexruntimerd.dll. To use a modified FFmpeg: change
-it in rexglue-sdk/thirdparty/FFmpeg, rebuild the SDK (gtav-recomp/build_sdk.cmd on Windows), and
-put the new rexruntimerd.dll (and the other SDK DLLs it was built with) in the release folder.
-The rest of the program needs no change: gtav_fast.exe links to rexruntimerd.dll dynamically.
+by the SDK's build) is linked statically into rexruntimerd.dll (Linux: librexruntime.so). To use a
+modified FFmpeg: change it in rexglue-sdk/thirdparty/FFmpeg, rebuild the SDK
+(gtav-recomp/build_sdk.cmd on Windows; on Linux the SDK's linux-amd64 CMake preset, Release, then
+cmake --install), and put the new rexruntimerd.dll / librexruntime.so (and the other SDK libraries
+it was built with) in the release folder. The rest of the program needs no change: gtav_fast links
+to the runtime library dynamically.
 
 Building everything: gtav-recomp/docs/RELEASE_CLEANROOM.md (release layout and tools) and
-gtav-recomp/build_sdk.cmd, build_xr.cmd, build_release_exe.cmd, build_launcher.cmd (Windows).
+gtav-recomp/build_sdk.cmd, build_xr.cmd, build_release_exe.cmd, build_launcher.cmd (Windows),
+gtav-recomp/tools/release/build_release_linux.sh (Linux).
 LLVM (clang, lld) and the DirectX Shader Compiler are bundled unmodified from their official
 releases (LLVM 19.1.5: github.com/llvm/llvm-project; dxc: XenosRecomp/thirdparty/dxc-bin).
 

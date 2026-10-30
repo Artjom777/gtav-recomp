@@ -123,8 +123,9 @@ def spirv_preamble(data):
     return off
 
 
-# Generated files that are the SDK's own templates, not translated game code.
-SDK_TEMPLATE_FILES = {"gtav_pch.h"}
+# Generated files that are the SDK's own templates, not translated game code, and the release's
+# own headers that build_game_dll.py copies into the generated folder (layout_check.h, gtav_hooks.h).
+SDK_TEMPLATE_FILES = {"gtav_pch.h", "layout_check.h", "gtav_hooks.h"}
 
 
 def content_length(data, a, n):
@@ -174,7 +175,7 @@ def main():
                 index[h] = (p, o)
     keys = np.fromiter(index.keys(), dtype=np.uint64, count=len(index))
     keys.sort()
-    print(f"release: {len(files)} files, {len(keys)} windows indexed")
+    print(f"release: {len(files)} files, {len(keys)} windows indexed", flush=True)
 
     # Release windows that a control file also holds are generic: drop them from the index.
     generic = set()
@@ -192,7 +193,7 @@ def main():
         pos[pos >= len(keys)] = 0
         generic.update(hs[keys[pos] == hs].tolist() if len(keys) else [])
     keys = keys[~np.isin(keys, np.fromiter(generic, dtype=np.uint64, count=len(generic)))]
-    print(f"control: {len(generic)} release windows are generic")
+    print(f"control: {len(generic)} release windows are generic", flush=True)
 
     # Each match is grown to the full common run. Game content copied into a release file shows as
     # long runs; boilerplate shared with retail-derived files (SPIR-V extension names, the code
@@ -202,6 +203,7 @@ def main():
     cache = {}
     scanned = 0
     for src in sources:
+        print(f"  scanning {src}", flush=True)
         for p in walk(src):
             if p.name in SDK_TEMPLATE_FILES:
                 continue
@@ -213,9 +215,13 @@ def main():
             pos = np.searchsorted(keys, hs)
             pos[pos >= len(keys)] = 0
             found = np.nonzero(keys[pos] == hs)[0] if len(keys) else []
+            covered = {}  # (release file, offset delta) -> end of the run already grown
             for i in found:
                 h, o = int(hs[i]), int(offs[i])
                 rp, ro = index[h]
+                if covered.get((rp, ro - o), -1) > o:
+                    short[rp] += 1  # inside a run already measured
+                    continue
                 rd = cache.get(rp) or cache.setdefault(rp, rp.read_bytes())
                 if rd[ro:ro + W] != data[o:o + W]:
                     continue
@@ -225,6 +231,7 @@ def main():
                 n = 0
                 while a + n < len(rd) and b + n < len(data) and rd[a + n] == data[b + n]:
                     n += 1
+                covered[(rp, a - b)] = b + n
                 n = content_length(rd, a, n)
                 short[rp] = short.get(rp, 0) + 1
                 if n > longest.get(rp, (0,))[0]:

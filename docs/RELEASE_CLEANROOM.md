@@ -1,4 +1,4 @@
-# Clean-room releases (Windows done, Linux next)
+# Clean-room releases (Windows and Linux)
 
 Written 2026-10-29 after the first Windows release (tag `v0.1.0-windows`). This file says how the
 Windows release is built and checked, and what the Linux session needs to do to ship the same
@@ -97,62 +97,88 @@ lives on `main`**; `windows-native` points at the same commit and is no longer n
   (`ptrs.txt`, `handlers.txt`, `buckets.txt`, `pro1.natives`); keep those out of the release
   package.
 
-## Linux: what to build
+## How the Linux release works (built 2026-10-30)
 
-Goal: `gtav-recomp-linux-x64.tar.gz` (or an AppImage) with the same promise. Attach it to its own
-tag (`v0.1.0-linux`) or to the Windows release. Same `expected.txt`, same manifest and partition
-seed.
+Same promise and same reference data as Windows: `tools/release/expected.txt`, `gtav/gtav_manifest.toml`
+and the partition seed, now committed as `tools/game_dll/codegen.partition.json` (copied from the
+Windows release; addresses only). Package: `gtav-recomp-linux-x64.tar.gz`.
 
-1. **Game shared library instead of a DLL.**
-   - `gtav/fs/gtav_pch.h`: replace the `__declspec(dllimport)` bridge and `log2f` declarations
-     with plain `extern` (ELF resolves them at load time); keep everything else. Wrap in
-     `#ifdef _WIN32` so one header serves both.
-   - `gtav/fs/game_dll.cpp`: `__attribute__((visibility("default")))` export of
-     `gtav_game_image_config`.
-   - Compile: `clang++ --target=x86_64-linux-gnu -nostdinc++ -nostdlibinc -fPIC -O2 -std=gnu++23
-     -march=x86-64-v3 -msse4.1 -fno-exceptions -fno-rtti -fno-threadsafe-statics -fno-math-errno
-     -w -isystem fs/include -I gen` (check the shims in `fs/include` against what clang's own
-     headers pull in on Linux).
-   - Link: `ld.lld -shared --no-undefined` will fail on purpose; use `--allow-shlib-undefined`
-     and leave the hooks, bridge functions and `log2f` undefined, to be resolved against the exe
-     (link the exe with `-Wl,--export-dynamic` or a `--dynamic-list` of the hook + bridge
-     symbols, which is what `gen_interface.py` already computes) and `libm`.
-     Symbol visibility: the `.so` must export the `__imp__sub_*` functions the exe calls.
-   - `gen_interface.py`: add a Linux mode that writes `gtav_hooks.h` (same) plus a dynamic-list /
-     version script instead of `.def` and import libs. Read the object files with `llvm-nm`.
-   - `main.cpp` under `GTAV_GAME_DLL`: `dlopen("./gtav_game.so")` + `dlsym`, or link the exe
-     against the `.so` with `$ORIGIN` rpath.
-2. **Launcher.** `loader/src/install.cpp` and `sources.cpp` are mostly portable C++. Replace
-   CreateProcess (Child), BCrypt SHA-256 (a small embedded SHA-256 avoids an OpenSSL
-   dependency), LoadLibrary checks, MoveFileEx, GlobalMemoryStatusEx; the Win32 window in
-   `main.cpp` becomes a terminal UI (`gtav-setup DISC1 DISC2 TU`) and optionally zenity/kdialog
-   file pickers. Keep `--unattended` semantics for the test.
-3. **Toolchain in the package**: LLVM 19.1.5 Linux release tarball: `clang` (as `clang++`),
-   `ld.lld`, `lib/clang/19/include`, `LICENSE.TXT`. Must not require system headers or glibc dev
-   packages (the build is freestanding).
-4. **Shaders**: `shader_compiler.cpp` already has the non-Windows paths (`XenosRecomp`, `dxc`).
-   Ship `dxc` + `libdxcompiler.so` from `thirdparty/XenosRecomp/thirdparty/dxc-bin` and make
-   `Run()` set `LD_LIBRARY_PATH` (or rpath the dxc binary). Do not ship `build/spirv`.
-5. **Codegen determinism on Linux**: run the Linux `rexgluerd` on the same inputs and compare
-   with the `gen` lines of `tools/release/expected.txt`. If anything differs (line endings,
-   path text), make the Linux installer check against Linux-made gen lines, and say so here.
-6. **Packaging**: runtime `.so` files (rexruntime, rexgpu-xenos, Tracy), the exe, the codegen
-   tool, the launcher, `tools/`, `LICENSES/` (reuse `make_release.py`'s license collection),
-   `README.txt` adapted (glibc floor 2.35 from the SDK CI container; Vulkan; AVX2; controller).
-7. **Taint scan**: `taint_scan.py` is portable; write `scan_release.sh` with Linux controls
-   (`/usr/lib/x86_64-linux-gnu/libc.so.6`, `libm.so.6`, `libstdc++.so.6`, `libvulkan.so.1`, the
-   SDK `src/ include/ resources/templates`). Sources: `basefile_tu27.bin`, the TU xexp,
-   `update.rpf`, the Linux `build/spirv` and shader cache, the generated tree. Release only on
-   **PASS, 0 failing**.
-8. **End-to-end**: install from the ISOs with `--unattended` into a copy of the package, boot it
-   headless, check: hashes OK, gen match, shared library loads, in world after A presses,
-   shaders compile with 0 failures.
-9. **Corresponding source** (GPL/LGPL, below): tag the commit the Linux binaries are built from,
-   run `tools/release/make_source_archive.sh` on the Linux SDK/XenosRecomp/plume trees, upload
-   the archive next to the Linux package. If the Linux SDK tree is not exactly v0.10.0 +
-   `rexglue-sdk-gtav-linux.patch` (check: `git diff HEAD` plus the two untracked
-   `thirdparty/imgui_rex_*` files must equal the patch), commit the difference into the patch
-   first.
+Player side (`loader/`, `gtav_launcher`, a terminal program; `src/main_linux.cpp`):
+- `./gtav_launcher` starts the game when installed, otherwise runs setup; `--setup [DISC1 DISC2 TU]`
+  (paths asked for when missing, remembered in `data/launcher.ini`), `--unattended` (same contract
+  as Windows: `data/launcher.ini`, `data/logs/unattended.txt`, every question answered no),
+  `-- ARGS` passed to the game (e.g. `--vulkan_device=1`). Ctrl+C cancels; setup resumes.
+- `install.cpp` / `sources.cpp` are shared with Windows; the POSIX parts are `#ifdef`ed: pread file
+  reads, an embedded SHA-256, posix_spawn children (nice 10), statvfs, rename, UTF-8 Widen/Narrow.
+  Preflight: AVX2/BMI2/FMA, `libvulkan.so.1` loadable, package files present. Child commands are
+  argument vectors on both platforms (Windows joins them into the same quoted command line).
+- Free-space check counts every expected file already in place (disc 2, partitions, TU), so a
+  resumed install no longer asks for room for the partitions again (both platforms).
+- Codegen: `rexglue` (RUNPATH `$ORIGIN` finds `librexruntime.so` at the package root). **Linux
+  codegen is byte-identical to Windows**: all 811 `gen` lines of `expected.txt` matched a Linux
+  run (697 s single-threaded on the laptop), so one `expected.txt` serves both.
+- Compile with the bundled clang 19.1.5 (`tools/llvm/bin/clang++`), flags in `install.cpp` and
+  `tools/game_dll/build_game_dll.py`: `--target=x86_64-linux-gnu -nostdinc++ -nostdlibinc -fPIC
+  -fno-semantic-interposition -fno-stack-protector -fcf-protection=none -O2 -std=gnu++23
+  -march=x86-64-v3 -msse4.1 -fno-exceptions -fno-rtti -fno-threadsafe-statics -fno-math-errno`.
+  The `fs/include` shims are enough on Linux too.
+- Link `gtav_game.so` with the bundled `ld.lld`: `-shared -soname gtav_game.so -Bsymbolic -z now
+  --version-script=gtav_game.exports`. The version script exports only what `gtav_fast` imports
+  (2931 `__imp__sub_*` + `gtav_game_image_config`), everything else is local, and `-Bsymbolic`
+  keeps calls between game functions direct (no PLT). Hooks, the `gtavfs_*` bridge, kernel
+  imports and `log2f` stay undefined and bind at load time to `gtav_fast` (its `--dynamic-list`),
+  `librexruntime.so` and `libm`; `-z now` makes a missing one fail at start, not mid-game.
+- Play: the launcher `exec`s `gtav_fast` (same arguments as Windows minus `--input_backend=xinput`).
+  `gtav_fast` needs `gtav_game.so` (DT_NEEDED, RUNPATH `$ORIGIN`).
+
+Developer side:
+- `gtav/CMakeLists.txt` `GTAV_GAME_DLL=ON` on Linux: output `gtav_fast`; the pre-link step
+  (`gen_interface.py`, Linux mode, reads `.o` files with llvm-nm) writes `gtav_hooks.h`,
+  `gtav_fast.dynlist`, `gtav_game.exports` and a stub `gtav_game.so` (one `ud2` per export, soname
+  `gtav_game.so`) that the exe links against in place of an import library. Hook/import sets are
+  identical to the Windows `.def` files (2930 hooks, 2931 imports, 9 bridge).
+- `fs/gtav_pch.h`: `GTAVFS_IMPORT` (dllimport on Windows, nothing on Linux); `game_dll.cpp` and
+  `src/game_bridge.cpp`: `GTAVFS_EXPORT` (dllexport / default visibility).
+- **`REX_PHYS_HOST_OFFSET` is platform-dependent** (SDK `pch_h.inja`: 0x1000 for the E0 view only
+  on Windows and Apple ARM64, 0 elsewhere). The header first had the Windows value everywhere: on
+  Linux every game access above 0xE0000000 (D3D command buffers) went 4 KB off, the command
+  processor executed garbage, never reached a fence and the game hung ~20 s into boot spinning in
+  the fence wait (8380CEF8/83807DC8) with "long wait" warnings. Any other platform branch in
+  `pch_h.inja` must be carried over the same way (the Mac port: the `__APPLE__` DEFINE_REX_FUNC).
+- Bundled LLVM: the official `LLVM-19.1.5-Linux-X64.tar.xz` (`clang-19` -> `clang++`, `lld` ->
+  `ld.lld`, `lib/clang/19/include`). Its `lld` needs `libxml2.so.2` (only for lld-link manifest
+  merging) and many distributions no longer have that soname, so `tools/llvm/lib/libxml2.so.2` is
+  our own stub (`tools/release/lld_libxml2_stub.c` + `.map`: the 16 imported names, each traps);
+  lld's RUNPATH `$ORIGIN/../lib` finds it. The tarball has no top-level license: `LLVM.txt` comes
+  from the Windows release's LICENSES (same 19.1.5 license).
+- Shaders: `tools/XenosRecomp` (RUNPATH rewritten in place to `$ORIGIN/lib` by the packager),
+  `tools/dxc` (wrapper) + `tools/dxc-linux` + `tools/lib/libdxcompiler.so`; `libdxil.so` stays out
+  (as `dxil.dll` does).
+- `tools/release/make_release_linux.py OUT --llvm DIR --expected tools/release/expected.txt
+  --licenses DIR [--compat] [--tar]` (reuses `make_release.py`'s license collection; strips debug
+  info from our binaries), `tools/release/build_release_linux.sh` (native build + package),
+  `tools/release/scan_release.sh` (Linux controls: libc, libm, libstdc++, libvulkan, libz, libzstd,
+  libX11, libcrypto, SDK sources/templates, XenosRecomp sources). The Linux package ships
+  `tools/shader_common.h` and XenosRecomp embeds it; XenosRecomp also writes it at the top of every
+  HLSL file, so the dumped game HLSL in `derive/native/census2` matches it unless XenosRecomp's
+  sources are a control. `layout_check.h` and `gtav_hooks.h` are skipped as sources:
+  `build_game_dll.py` copies them from the release into the generated folder. The scan used to
+  re-grow a long common run from every window inside it (quadratic, 6+ h on this package); it now
+  skips windows already inside a measured run (~16 min).
+- **Portable build**: binaries built on the laptop (Ubuntu 26.04) need glibc 2.43 / GLIBCXX_3.4.32.
+  `tools/release/compat/build.sh` builds everything shipped in an Ubuntu 22.04 container
+  (`compat/Dockerfile`: clang 20 + GCC 13 libstdc++, the SDK CI's toolchain) into `*-compat`
+  trees with `-ffile-prefix-map` (no build paths); package it with `--compat`. Floor: glibc 2.35
+  and GLIBCXX_3.4.32 (Ubuntu 24.04, Debian 13, Fedora 39, Arch; Ubuntu 22.04 needs the toolchain
+  PPA's libstdc++). Container findings: 22.04's kernel headers lack userfaultfd async-WP and
+  PAGEMAP_SCAN (write_watch.cpp now defines the uapi values; on a kernel older than 6.7 write
+  watch switches itself off at run time); XenosRecomp must be configured with
+  `BUILD_SHARED_LIBS=OFF` or it links libfmt.so (not shipped: every shader translation would
+  fail). `make_release_linux.py` now refuses any shipped ELF that needs a library outside the
+  system allowlist + the package. Smoke test on clean `ubuntu:24.04` and `debian:12` containers
+  (every binary starts, the bundled clang/lld compile and link freestanding with no system
+  headers): Ubuntu 24.04 passes; Debian 12 fails on GLIBCXX_3.4.32 as expected.
+- Corresponding source: `make_source_archive.sh` (its `SOURCE.txt` now covers Linux too).
 
 ## Licensing and source (decided 2026-10-29)
 

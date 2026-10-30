@@ -1,4 +1,4 @@
-// gtav - freestanding prefix header for the recompiled game code (gtav_game.dll).
+// gtav - freestanding prefix header for the recompiled game code (gtav_game.dll / gtav_game.so).
 //
 // The installer runs ReXGlue codegen on the player's own default.xex + TU27 patch and compiles the
 // output on their machine with the bundled clang + lld. That compile has no Microsoft headers or
@@ -9,6 +9,8 @@
 // Everything the generated code needs from the runtime goes through a small C interface exported
 // by gtav_fast.exe (gtavfs_*, src/game_bridge.cpp). Kernel imports (__imp__Ke*, __imp__Nt*, ...)
 // are imported from the ReXGlue runtime DLL and hooked guest functions from gtav_fast.exe.
+// On Linux the same names are left undefined in gtav_game.so and the dynamic loader binds them to
+// gtav_fast and librexruntime.so at load time (no import libraries).
 //
 // Layouts and inline helpers below are taken from the ReXGlue SDK v0.10.0 headers
 // (include/rex/ppc/context.h, ppc/intrinsics.h, ppc/func.h, platform/fpscr.h, image_info.h):
@@ -31,6 +33,12 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <immintrin.h>
+
+#ifdef _WIN32
+#define GTAVFS_IMPORT __declspec(dllimport)
+#else
+#define GTAVFS_IMPORT
+#endif
 
 #define INT_MAX 2147483647
 #define INT_MIN (-INT_MAX - 1)
@@ -69,10 +77,11 @@ extern "C" void* memcpy(void*, const void*, size_t);
 extern "C" void* memset(void*, int, size_t);
 
 // sqrt is the sqrtsd instruction (the DLL is built with -fno-math-errno). log2f comes from the
-// system's ucrtbase.dll, the same implementation the SDK build calls, so results stay identical.
+// system's ucrtbase.dll (Linux: libm.so.6), the same implementation the SDK build calls, so results
+// stay identical.
 inline double sqrt(double v) noexcept { return __builtin_sqrt(v); }
 inline float sqrt(float v) noexcept { return __builtin_sqrtf(v); }
-extern "C" __declspec(dllimport) float log2f(float);
+extern "C" GTAVFS_IMPORT float log2f(float);
 
 //=============================================================================
 // SIMD: simde names used by the generated code, on native x86-64-v3 intrinsics.
@@ -240,15 +249,15 @@ struct PPCImageInfo {
 //=============================================================================
 
 extern "C" {
-__declspec(dllimport) u32 gtavfs_mmio_load(u32 addr);
-__declspec(dllimport) void gtavfs_mmio_store(u32 addr, u32 value);
-__declspec(dllimport) u64 gtavfs_query_timebase();
-__declspec(dllimport) PPCFunc* gtavfs_resolve_indirect(u32 guest_address);
-__declspec(dllimport) void gtavfs_global_lock_enter();
-__declspec(dllimport) void gtavfs_global_lock_leave();
-__declspec(dllimport) u64 gtavfs_global_lock_check();
-__declspec(dllimport) void gtavfs_trap(PPCContext* ctx, u8* base, u16 trap_type);
-[[noreturn]] __declspec(dllimport) void gtavfs_unimplemented(const char* what);
+GTAVFS_IMPORT u32 gtavfs_mmio_load(u32 addr);
+GTAVFS_IMPORT void gtavfs_mmio_store(u32 addr, u32 value);
+GTAVFS_IMPORT u64 gtavfs_query_timebase();
+GTAVFS_IMPORT PPCFunc* gtavfs_resolve_indirect(u32 guest_address);
+GTAVFS_IMPORT void gtavfs_global_lock_enter();
+GTAVFS_IMPORT void gtavfs_global_lock_leave();
+GTAVFS_IMPORT u64 gtavfs_global_lock_check();
+GTAVFS_IMPORT void gtavfs_trap(PPCContext* ctx, u8* base, u16 trap_type);
+[[noreturn]] GTAVFS_IMPORT void gtavfs_unimplemented(const char* what);
 }
 
 //=============================================================================
@@ -800,7 +809,8 @@ extern PPCFuncMapping PPCFuncMappings[];
 //
 // gtav_hooks.h lists the guest functions gtav_fast.exe replaces (GTAVFS_HOOKED_<name>). For those
 // the generated body is only __imp__<name> (exported, so the hook can call the original) and every
-// call to <name> resolves to the hook through gtav_fast.exe's import library. Every other function
+// call to <name> resolves to the hook through gtav_fast.exe's import library (Linux: the dynamic
+// loader, from gtav_fast's dynamic symbol table). Every other function
 // gets <name> as a plain alias of __imp__<name>.
 //=============================================================================
 
@@ -833,7 +843,14 @@ extern PPCFuncMapping PPCFuncMappings[];
 // Memory access
 //=============================================================================
 
+// The SDK maps the E0 physical view 4 KB higher only where the host's allocation granularity
+// needs it (pch_h.inja: REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && REX_ARCH_ARM64)); on Linux
+// every view starts at its guest address.
+#if defined(_WIN32) || (defined(__APPLE__) && defined(__aarch64__))
 #define REX_PHYS_HOST_OFFSET(addr) (((u32)(addr) >= 0xE0000000u) ? 0x1000u : 0u)
+#else
+#define REX_PHYS_HOST_OFFSET(addr) 0u
+#endif
 
 #define REX_RAW_ADDR(x) (base + (u32)(x) + REX_PHYS_HOST_OFFSET(x))
 

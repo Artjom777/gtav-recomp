@@ -23,6 +23,40 @@
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+
+// Kernel headers before Linux 6.7 (e.g. the release build's Ubuntu 22.04 container) lack async
+// write-protect and PAGEMAP_SCAN; the values are the kernel's uapi ones. On such a kernel at run
+// time UFFDIO_API fails and write watch stays off (Init logs it).
+#ifndef UFFD_FEATURE_WP_ASYNC
+#define UFFD_FEATURE_WP_HUGETLBFS_SHMEM (1 << 12)
+#define UFFD_FEATURE_WP_UNPOPULATED (1 << 13)
+#define UFFD_FEATURE_WP_ASYNC (1 << 15)
+#endif
+#ifndef PAGEMAP_SCAN
+struct page_region {
+  __u64 start;
+  __u64 end;
+  __u64 categories;
+};
+struct pm_scan_arg {
+  __u64 size;
+  __u64 flags;
+  __u64 start;
+  __u64 end;
+  __u64 walk_end;
+  __u64 vec;
+  __u64 vec_len;
+  __u64 max_pages;
+  __u64 category_inverted;
+  __u64 category_mask;
+  __u64 category_anyof_mask;
+  __u64 return_mask;
+};
+#define PAGEMAP_SCAN _IOWR('f', 16, struct pm_scan_arg)
+#define PAGE_IS_WRITTEN (1 << 1)
+#define PM_SCAN_WP_MATCHING (1 << 0)
+#define PM_SCAN_CHECK_WPASYNC (1 << 1)
+#endif
 #endif
 
 REXCVAR_DEFINE_BOOL(gtav_native_write_watch, true, "GTAV",
