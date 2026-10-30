@@ -33,7 +33,7 @@ machine). Everything here was measured on an 8 GB M1 MacBook (MoltenVK 1.4.1, na
 - **CPU target:** the Mac game build was configured with `-march=armv8-a` (SDK preset default),
   which overrides Apple clang's `apple-m1` default: plain ARMv8.0, no LSE atomics. Rebuilt with
   `-DCMAKE_C_FLAGS=-mcpu=apple-m1 -DCMAKE_CXX_FLAGS=-mcpu=apple-m1` (2026-10-30): loading ~3%
-  faster in both A/B pairs, fps slightly up (`tools/native/bin_ab.sh`). Android: build for at least
+  faster in both A/B pairs, fps slightly up (`tools/native/bin_ab.sh`). The SDK runtime the same way (mac preset now `-mcpu=apple-m1`): loading another ~11% faster (2.6-2.7 s in both pairs, `tools/native/lib_ab.sh`). Android: build for at least
   `-march=armv8.2-a` (LSE) or the phone's `-mcpu`, not the armv8-a preset.
 
 ## 3. Tile GPUs: what costs and what helped (applies to Adreno / Mali too)

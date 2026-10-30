@@ -1,3 +1,18 @@
+diff --git a/CMakePresets.json b/CMakePresets.json
+index 622b924..2193531 100644
+--- a/CMakePresets.json
++++ b/CMakePresets.json
+@@ -99,8 +99,8 @@
+             "hidden": true,
+             "inherits": "mac-base",
+             "cacheVariables": {
+-                "CMAKE_C_FLAGS": "-march=armv8-a",
+-                "CMAKE_CXX_FLAGS": "-march=armv8-a",
++                "CMAKE_C_FLAGS": "-mcpu=apple-m1",
++                "CMAKE_CXX_FLAGS": "-mcpu=apple-m1",
+                 "CMAKE_OSX_ARCHITECTURES": "arm64"
+             }
+         },
 diff --git a/include/rex/audio/sdl/sdl_audio_driver.h b/include/rex/audio/sdl/sdl_audio_driver.h
 index f8949ca..32ce942 100644
 --- a/include/rex/audio/sdl/sdl_audio_driver.h
