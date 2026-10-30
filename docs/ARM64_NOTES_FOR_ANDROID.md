@@ -103,7 +103,19 @@ rect-list expansion ~10%, fence-copy pushes ~11% (memory pressure: see 5).
 - Viz-query begin/end lines were logged at info per query (~6 per frame on the command processor
   thread): now debug.
 
-## 7. SDK / plume patches
+## 7. Merge notes (2026-10-30, onto origin/windows-native with the clean-room release work)
+
+- The sun-tile fix is now a runtime variant (`ps_D258EBE32001470C_tiles.spv`, shader_compiler.cpp
+  kVariants) made with XenosRecomp + dxc on the player's machine. The Mac has no dxc, so the
+  variant was never made and the base shader's draws were skipped: **all deferred lighting missing
+  (flat grey world)**. Fixed: `TileOverride` only applies once the variant file exists; without it
+  the game's own shader draws (blocky shadow tiles on cars, the old look). Android: no dxc on the
+  phone either — generate the variant at install time on a desktop, or port the variant to a
+  SPIR-V edit.
+- The SDK's own window starts fullscreen (`fullscreen=true`) and stays black under the native
+  renderer: headless/benchmark runs need `--fullscreen=false` (it covered the owner's screen).
+
+## 8. SDK / plume patches
 
 `rexglue-sdk-gtav-linux.patch` = origin's patch (with the Windows release work) + the Mac delta
 (SDL audio stereo fold, thread QoS, viz-query log level, small shared memory). `plume-gtav.patch`

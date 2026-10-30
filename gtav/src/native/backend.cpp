@@ -2161,8 +2161,20 @@ struct Backend::Impl {
   // ps_D258EBE32001470C_tiles.spv replaces the game's tile classification while
   // --gtav_native_tile_penumbra_all is on (switchable live from the menu: shader and pipeline keys
   // carry the choice).
+  // Only once the variant exists: where it cannot be made (no dxc on macOS) the game's own shader
+  // draws (blocky shadow tiles) instead of nothing (the whole deferred lighting went missing).
   static bool TileOverride(uint64_t ps_hash) {
-    return ps_hash == 0xD258EBE32001470Cull && REXCVAR_GET(gtav_native_tile_penumbra_all);
+    if (ps_hash != 0xD258EBE32001470Cull || !REXCVAR_GET(gtav_native_tile_penumbra_all)) return false;
+    static uint64_t checked = ~0ull;
+    static bool present = false;
+    if (checked != CompileGeneration()) {
+      checked = CompileGeneration();
+      std::string dir = REXCVAR_GET(gtav_native_spirv_dir);
+      if (dir.empty()) dir = DefaultSpirvDir();
+      std::error_code ec;
+      present = std::filesystem::exists(dir + "/ps_D258EBE32001470C_tiles.spv", ec);
+    }
+    return present;
   }
 
   RenderShader* Shader(uint64_t hash, bool pixel) {
