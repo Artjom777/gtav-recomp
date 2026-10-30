@@ -190,6 +190,10 @@ struct FramePacket {
   std::vector<ResolveCommand> resolves;
   std::vector<QueryCommand> queries;
   ByteArena arena;
+  // Draw data the command processor copied at GPU fences (capture.cpp ApplyFenceCopies): handed
+  // over whole, addressed with kFenceBit set in the offset.
+  ByteArena fence_arena;
+  static constexpr uint32_t kFenceBit = 0x80000000u;
   uint32_t front_buffer = 0;  // guest texture object passed to Swap
 
   uint32_t Push(const void* data, uint32_t size) {
@@ -206,9 +210,12 @@ struct FramePacket {
     resolves.clear();
     queries.clear();
     arena.clear();
+    fence_arena.clear();
     front_buffer = 0;
   }
-  const uint8_t* At(uint32_t offset) const { return arena.data() + offset; }
+  const uint8_t* At(uint32_t offset) const {
+    return offset & kFenceBit ? fence_arena.data() + (offset & ~kFenceBit) : arena.data() + offset;
+  }
 };
 
 }  // namespace gtav::native
