@@ -1,11 +1,13 @@
 #!/bin/sh
 # Launch the recompiled GTA V (TU27) on macOS (arm64). Same flags as play.sh.
 # Usage: play_mac.sh [logname] [extra runtime flags...]
-# Game data: GTAV_DATA (default ~/gtav-data, a case-insensitive volume; Xbox paths ignore case).
+# Game data: GTAV_DATA (default ~/gtav-ssd if present, else ~/gtav-data; must be a case-insensitive
+# volume, Xbox paths ignore case). game/ and userdata/ are read; the internal SSD loads far faster than USB.
 # GTAV_NATIVE=off (default here until the native renderer is ported) | on | shadow;
 # GTAV_FPS=0 (uncapped) | 30 | N; GTAV_LOG_LEVEL=debug for verbose logs. Keyboard plays as a pad
 # (--mnk_mode: Space = A, Backspace = B, Return = Start, WASD = left stick, arrows = right stick).
 R="$(cd "$(dirname "$0")" && pwd)"
+if [ -z "$GTAV_DATA" ] && [ -d "$HOME/gtav-ssd/game" ]; then GTAV_DATA="$HOME/gtav-ssd"; fi
 E="${GTAV_DATA:-$HOME/gtav-data}"
 BUILD="${GTAV_BUILD:-$R/build/gtav}"
 name=${1:-play}; [ $# -gt 0 ] && shift
