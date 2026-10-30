@@ -17,25 +17,21 @@ game files and anything derived from them never go into git.
 - Local `rexglue-sdk/` checkout does NOT have the Mac delta: `git -C rexglue-sdk diff` differs from
   `rexglue-sdk-gtav-linux.patch`. Reset the SDK to its pin and re-apply the patch, then rebuild and
   install the SDK (see the Setup notes in `docs/HANDOFF_WINDOWS_MAC.md`). Apply `plume-gtav.patch` again too.
-- adb: `~/android-tools/platform-tools/adb` (downloaded 10-30; not on PATH).
 - Game data: the ISOs and `gtav_mac_bundle_2026-10-29/` are on the phone in `/sdcard/Download/`;
   `scripts/xiso_adb.py` extracts the ISOs on the phone over adb.
 
-## Blockers to clear first (10-30)
+## Blockers (all cleared 10-30)
 
 1. ~~Phone not detected~~ **Fixed 10-30**: with USB tethering + debugging on, adb sees it (serial R5CX13SPC2J).
    Device: Samsung Galaxy S23 FE, SM-S711U, Snapdragon SM8450 (8 Gen 1), Adreno 730 (Vulkan),
    Android 16 (API 36), kernel 5.10 (no PAGEMAP_SCAN, so the hashing fallback applies), 4 KB pages, 7.4 GB RAM
    (keep the 4.8 GB guest mapping sparse/memfd and the footprint well under ~3 GB), 61 GB free.
    ISOs (both 8,738,846,720 bytes) and the bundle are in /sdcard/Download/.
-2. **Disk**: the SSD (`/`) has 5.8 GB free and the TOSHIBA drive has 9.6 GB. The NDK (~2.5 GB),
-   the SDK cmdline tools and platform (~1 GB), Gradle and a JDK (~1 GB) and the build tree need
-   ~10+ GB. Free space on `/` first (old /dev/shm files, `build/gtav/logs/native_dump`, flicker
-   captures, `~/.cache`). Do not put the NDK on exFAT (no exec bits/symlinks).
-3. No JDK installed (`/usr/lib/jvm` absent). Either install openjdk-17 (needs sudo, owner) or skip
-   Gradle: a code-free NativeActivity APK (`android:hasCode=false`) packs with `aapt2` and signs
-   with `apksigner`, and both of those need Java too. A portable JDK tarball in `~/android-tools`
-   avoids sudo.
+2. ~~Disk, no JDK~~ **Fixed 10-30**: the owner freed space (36 GB free on `/`). Toolchain in
+   `~/android-tools` (no sudo): `source ~/android-tools/env.sh` sets JAVA_HOME (Temurin 17.0.21),
+   ANDROID_HOME=`sdk/` with NDK r29 (29.0.14206865, clang 21), platforms;android-36, build-tools 36.0.0
+   (aapt2, apksigner, zipalign, d8), platform-tools (adb). No Gradle yet (fetch the wrapper if SDLActivity
+   needs Java; a NativeActivity APK needs none).
 
 ## Proposed milestones (confirm with the owner before starting)
 
