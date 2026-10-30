@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 namespace gtav::native {
 
@@ -11,5 +12,8 @@ void OnShaderCreated(const uint8_t* container, size_t size, uint64_t hash, bool 
 
 // Bumped whenever a new SPIR-V file landed: cached misses should be looked up again.
 uint64_t CompileGeneration();
+
+// The background compiler found or wrote <name>.spv (no disk access).
+bool ShaderOnDisk(const std::string& name);
 
 }  // namespace gtav::native

@@ -8,7 +8,16 @@ project(gtav LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-include(generated/rexglue.cmake)
+# GTAV_GAME_DLL: the release layout. The exe holds no recompiled game code; it loads gtav_game.dll,
+# which the player's installer generates from their own discs and builds with the bundled clang
+# (fs/gtav_pch.h). The exe then needs no generated sources at all.
+option(GTAV_GAME_DLL "Build gtav_fast.exe against a separately built gtav_game.dll" OFF)
+
+if(GTAV_GAME_DLL)
+    find_package(rexglue 0.10.0 REQUIRED CONFIG)
+else()
+    include(generated/rexglue.cmake)
+endif()
 
 # The SDK installs its codegen tool for Release only; the Windows SDK is a RelWithDebInfo build.
 # (On Linux the SDK is built in Release, so rex::rexglue resolves without this.)
@@ -52,7 +61,27 @@ else()
                         -Wl,--export-dynamic-symbol=rex_skip_rendering_gpu_waiters)
 endif()
 
-rexglue_setup_target(gtav)
+if(GTAV_GAME_DLL)
+    target_sources(gtav PRIVATE src/game_bridge.cpp)
+    target_compile_definitions(gtav PRIVATE GTAV_GAME_DLL=1)
+    target_include_directories(gtav PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(gtav PRIVATE rex::runtime)
+    rexglue_configure_target(gtav)
+    # Pre-link: list the hooks and the game functions the exe calls (names only), build the import
+    # library for gtav_game.dll and the export list the DLL links against (gtav_fast.def).
+    get_filename_component(GTAV_LLVM_BIN "${CMAKE_LINKER}" DIRECTORY)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    set(GTAV_INTERFACE_DIR ${CMAKE_BINARY_DIR}/game_interface)
+    add_custom_command(TARGET gtav PRE_LINK
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../tools/game_dll/gen_interface.py
+                ${GTAV_LLVM_BIN} ${CMAKE_BINARY_DIR}/CMakeFiles/gtav.dir ${GTAV_INTERFACE_DIR}
+                $<TARGET_FILE:rex::runtime>
+        VERBATIM)
+    target_link_options(gtav PRIVATE "LINKER:/DEF:${GTAV_INTERFACE_DIR}/gtav_fast.def"
+                        "LINKER:${GTAV_INTERFACE_DIR}/gtav_game.lib")
+else()
+    rexglue_setup_target(gtav)
+endif()
 
 # The SDK builds recompiled code with -mcmodel=large ("large executable support"): every call
 # between the ~100 MB of game functions then goes through a 64-bit address in a register
@@ -63,9 +92,34 @@ rexglue_setup_target(gtav)
 if(UNIX AND NOT APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     option(GTAV_X86_64_V3 "Build the game code for x86-64-v3 CPUs (MOVBE, BMI2, AVX2)" ON)
     foreach(_gtav_target gtav gtav_recomp)
+        if(NOT TARGET ${_gtav_target})
+            continue()
+        endif()
         target_compile_options(${_gtav_target} PRIVATE -mcmodel=small)
         if(GTAV_X86_64_V3)
             target_compile_options(${_gtav_target} PRIVATE -march=x86-64-v3)
+        endif()
+    endforeach()
+elseif(WIN32 AND NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    # Windows: the SDK already uses the default code model; only the CPU level is added.
+    option(GTAV_X86_64_V3 "Build the game code for x86-64-v3 CPUs (MOVBE, BMI2, AVX2)" ON)
+    if(GTAV_X86_64_V3)
+        foreach(_gtav_target gtav gtav_recomp)
+            if(TARGET ${_gtav_target})
+                target_compile_options(${_gtav_target} PRIVATE -march=x86-64-v3)
+            endif()
+        endforeach()
+    endif()
+endif()
+
+# The SDK exports REXGLUE_ENABLE_PROFILING / _PERF_COUNTERS to every non-Release build: each
+# indirect guest call then does an atomic add on one shared counter in rexruntime (~3% of every
+# game thread in a Windows profile, plus cache-line traffic between them). Off for play.
+option(GTAV_SDK_COUNTERS "Keep the SDK's guest call counters in the game code" OFF)
+if(NOT GTAV_SDK_COUNTERS)
+    foreach(_gtav_target gtav gtav_recomp)
+        if(TARGET ${_gtav_target})
+            target_compile_options(${_gtav_target} PRIVATE -UREXGLUE_ENABLE_PROFILING -UREXGLUE_ENABLE_PERF_COUNTERS)
         endif()
     endforeach()
 endif()
@@ -115,6 +169,9 @@ if(WIN32)
         ${REX_SDK_SRC}/graphics/xenos.cpp)
     target_compile_definitions(gtav PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
     target_link_libraries(gtav PRIVATE winmm)
+    # rex_shader_float_constant_bitmap and rex_skip_rendering_wake are dllexported by the GPU plugin.
+    find_library(REXGPU_XENOS NAMES rexgpu-xenosrd rexgpu-xenos PATHS ${rexglue_DIR}/../.. NO_DEFAULT_PATH REQUIRED)
+    target_link_libraries(gtav PRIVATE ${REXGPU_XENOS})
 else()
     find_library(REXGPU_XENOS rexgpu-xenos PATHS ${rexglue_DIR}/../.. NO_DEFAULT_PATH REQUIRED)
     target_link_libraries(gtav PRIVATE ${REXGPU_XENOS})
@@ -132,8 +189,6 @@ set(GTAV_BLIT_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/native_blit.hl
 set(GTAV_RECTLIST_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/native_rectlist.hlsl)
 set(GTAV_MEMORY_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/native_memory.hlsl)
 set(GTAV_MENU_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/native_menu.hlsl)
-# Replacement for one generated game shader (tile classification), see the file.
-set(GTAV_TILE_CLASSIFY_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/ps_D258EBE32001470C_tiles.hlsl)
 add_custom_command(
     OUTPUT ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h
     COMMAND ${CMAKE_COMMAND} -E make_directory ${GTAV_NATIVE_SHADER_DIR}
@@ -171,10 +226,6 @@ add_custom_command(
             -T ps_6_0 -E PSMenu -HV 2021 -spirv -Vn g_native_menu_ps
             -Fh ${GTAV_NATIVE_SHADER_DIR}/native_menu_ps.h ${GTAV_MENU_HLSL}
     COMMAND ${GTAV_DXC}
-            -T ps_6_0 -HV 2021 -all-resources-bound -spirv -fvk-use-dx-layout -Wno-ignored-attributes
-            -Qstrip_debug -Vn g_native_tile_classify_ps
-            -Fh ${GTAV_NATIVE_SHADER_DIR}/native_tile_classify_ps.h ${GTAV_TILE_CLASSIFY_HLSL}
-    COMMAND ${GTAV_DXC}
             -T ps_6_0 -E PSDiagFlat -spirv -fspv-target-env=vulkan1.1 -Vn g_native_diag_flat_ps
             -Fh ${GTAV_NATIVE_SHADER_DIR}/native_diag_flat_ps.h ${GTAV_BLIT_HLSL}
     COMMAND ${CMAKE_COMMAND} -E echo "#pragma once" > ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h
@@ -188,10 +239,9 @@ add_custom_command(
     COMMAND ${CMAKE_COMMAND} -E echo "#include \"native_depth_pack_ps.h\"" >> ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h
     COMMAND ${CMAKE_COMMAND} -E echo "#include \"native_blit_vs.h\"" >> ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h
     COMMAND ${CMAKE_COMMAND} -E echo "#include \"native_blit_ps.h\"" >> ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h
-    COMMAND ${CMAKE_COMMAND} -E echo "#include \"native_tile_classify_ps.h\"" >> ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h
     COMMAND ${CMAKE_COMMAND} -E echo "#include \"native_menu_vs.h\"" >> ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h
     COMMAND ${CMAKE_COMMAND} -E echo "#include \"native_menu_ps.h\"" >> ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h
-    DEPENDS ${GTAV_BLIT_HLSL} ${GTAV_RECTLIST_HLSL} ${GTAV_MEMORY_HLSL} ${GTAV_TILE_CLASSIFY_HLSL} ${GTAV_MENU_HLSL}
+    DEPENDS ${GTAV_BLIT_HLSL} ${GTAV_RECTLIST_HLSL} ${GTAV_MEMORY_HLSL} ${GTAV_MENU_HLSL}
     VERBATIM)
 add_custom_target(gtav_native_shaders DEPENDS ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h)
 add_dependencies(gtav gtav_native_shaders)

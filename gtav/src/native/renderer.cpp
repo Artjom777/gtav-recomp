@@ -648,7 +648,24 @@ class Renderer {
     list_->begin();
     if (backend_ok_) backend_.BeginFrame(slot);
     // logs/dump_request (any content): same as F9, for scripted captures without keyboard focus.
-    if (frame.index % 64 == 0) {
+    // The control files are polled on a background thread: a metadata lookup on the game's disk
+    // (a USB hard disk busy streaming the world) blocked this thread for 100-450 ms every 64 frames.
+    static std::atomic<bool> control_files_pending{false};
+    static const bool control_poller = [] {
+      std::thread([] {
+        const std::filesystem::path paths[] = {LogPath("dump_request"), LogPath("menu_toggle"),
+                                               LogPath("menu_set"), LogPath("diag_mode")};
+        for (;;) {
+          std::error_code ec;
+          for (const auto& p : paths)
+            if (std::filesystem::exists(p, ec)) control_files_pending = true;
+          std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+      }).detach();
+      return true;
+    }();
+    (void)control_poller;
+    if (frame.index % 64 == 0 && control_files_pending.exchange(false)) {
       std::error_code ec;
       auto request = std::filesystem::path(LogPath("dump_request"));
       if (std::filesystem::exists(request, ec)) {
@@ -869,7 +886,9 @@ class Renderer {
     }
     auto it = have_shader_.find(key);
     if (it != have_shader_.end()) return it->second;
-    bool ok = hash && std::filesystem::exists(fmt::format("{}/{}_{:016X}.spv", SpirvDir(), pixel ? "ps" : "vs", hash));
+    // Diagnostic only: answered from memory (a lookup on the busy game disk stalled this thread).
+    std::string name = fmt::format("{}_{:016X}", pixel ? "ps" : "vs", hash);
+    bool ok = hash && (Backend::SpirvListed(name + ".spv") || ShaderOnDisk(name));
     have_shader_[key] = ok;
     return ok;
   }

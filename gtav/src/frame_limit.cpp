@@ -24,6 +24,9 @@ REXCVAR_DEFINE_INT32(gtav_fps_limit, 30, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_audio_unsync, true, "GTAV",
                     "Above 30 fps: stop the audio update waiting for the next 16 ms audio frame "
                     "(otherwise the game cannot exceed 62.5 fps)");
+REXCVAR_DEFINE_BOOL(gtav_no_power_throttling, true, "GTAV",
+                    "Windows: opt out of power throttling (EcoQoS / efficiency cores, ignored timer "
+                    "resolution) while the window is hidden, minimized or in the background");
 
 namespace {
 
@@ -44,12 +47,32 @@ void Store32(uint8_t* base, uint32_t addr, int32_t value) {
 // Windows rounds every host sleep (this limiter's and the guest's) up to the 15.6 ms system tick
 // unless the process asks for 1 ms; at 60 fps that alone costs whole frames.
 const bool g_timer_resolution = [] { return timeBeginPeriod(1) == TIMERR_NOERROR; }();
+
+// Windows 11 power throttling: a process whose windows are hidden or minimized (or just not in
+// front) may get EcoQoS (efficiency cores on hybrid CPUs, lower clocks) and has its timer
+// resolution request ignored, so every guest sleep rounds up to 15.6 ms again. Opt out of both
+// (--gtav_no_power_throttling; checked every frame so an A/B can flip it in one run).
+void ApplyPowerThrottling() {
+  static int applied = -1;
+  int off = REXCVAR_GET(gtav_no_power_throttling) ? 1 : 0;
+  if (off == applied) return;
+  applied = off;
+  PROCESS_POWER_THROTTLING_STATE state = {};
+  state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+  state.ControlMask =
+      off ? PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION : 0;
+  state.StateMask = 0;  // with ControlMask 0: the system decides again
+  SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state, sizeof(state));
+}
+#else
+void ApplyPowerThrottling() {}
 #endif
 
 }  // namespace
 
 REX_EXTERN(__imp__sub_827B5878);
 REX_HOOK_RAW(sub_827B5878) {
+  ApplyPowerThrottling();
   int32_t limit = REXCVAR_GET(gtav_fps_limit);
   if (limit == 30) {
     __imp__sub_827B5878(ctx, base);

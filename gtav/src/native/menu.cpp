@@ -60,9 +60,10 @@ void SetBool(const char* name, bool value) { rex::cvar::SetFlagByName(name, valu
 // skipped for a frame or two while they compile), lets the game skip shadow work per tile and
 // lets the emulated GPU trail the game less.
 // How far the emulated GPU trails the game's kicks (ms): 6 is the tested value (foliage stopped
-// flickering while driving); 2 is ~20% faster (the game waits on GPU fences every frame).
+// flickering while driving); 2 flickered. 4 is ~10% faster on Windows (88 -> 98 fps running
+// around, 10-29) and no worse than 6 in a headless flicker-catch A/B; not yet checked driving.
 constexpr const char* kSafeGpuLag = "6";
-constexpr const char* kFastGpuLag = "2";
+constexpr const char* kFastGpuLag = "4";
 
 void ApplyPreset(bool best) {
   SetBool("gtav_native_tile_penumbra_all", best);

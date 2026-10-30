@@ -1,17 +1,19 @@
 # Play the recompiled GTA V (TU27) with the native Vulkan renderer.
-#   play.ps1 [-Log name] [-Fps 0|60|30] [-Mode on|shadow|off] [-Counter] [extra runtime flags...]
+#   play.ps1 [-Log name] [-Fps 0|60|30] [-Mode on|shadow|off] [-Counter] [-Build dir] [extra runtime flags...]
+# -Build: the folder with gtav_fast.exe (default build\; build-dll\ = the release layout with gtav_game.dll).
 # -Fps 0 = uncapped, 30 = the game's own limiter. Controller via XInput (works while the window is unfocused).
 # Runs gtav_fast.exe: the IFEO page-heap entry is keyed to gtav.exe.
 param([string]$Log = "play", [int]$Fps = 0, [string]$Mode = "on", [switch]$Counter,
+      [string]$Build = "E:\gtav-native\build",
       [Parameter(ValueFromRemainingArguments = $true)] [string[]]$Extra)
-$build = "E:\gtav-native\build"
+$build = $Build
 $logs = "E:\gtav-native\logs\boot"
 New-Item -ItemType Directory -Force $logs | Out-Null
 $a = @("--game_data_root=E:\gtav-rex\game\disc2_files", "--user_data_root=E:/gtav-rex/userdata",
   "--update_data_root=E:/gtav-rex/game/update", "--gpu_plugin=xenos", "--headless=true", "--log_level=info",
   "--log_max_file_size_mb=1024", "--log_max_files=2", "--log_file=$logs/$Log.log", "--input_backend=xinput",
   "--gtav_native=$Mode", "--gtav_native_spirv_dir=$build\spirv", "--gtav_fps_limit=$Fps")
-if ($Mode -eq "on") { $a += @("--gpu_skip_rendering=true", "--gpu_skip_rendering_lag_ms=6", "--vsync=false", "--gtav_native_vsync=false") }
+if ($Mode -eq "on") { $a += @("--gpu_skip_rendering=true", "--gpu_skip_rendering_lag_ms=4", "--vsync=false", "--gtav_native_vsync=false") }
 if ($Counter) { $a += "--gtav_native_fps" }
 if ($Extra) { $a += $Extra }
 # Read the exe and DLLs once so they are in the file cache: the first launch after a build paged

@@ -8,3 +8,7 @@ gtav/assets/
 gtav/out/
 *.log
 transfer/
+build-dll/
+build-launcher/
+dist/
+__pycache__/

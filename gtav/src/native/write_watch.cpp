@@ -166,6 +166,44 @@ bool ScanView(const View& v, uint64_t start, uint64_t end, bool protect, uint64_
   }
   return true;
 }
+#elif defined(_WIN32)
+// Windows has no userfaultfd, and GetWriteWatch does not work on the SDK's file-mapped guest views.
+// The SDK's own physical write watch does: EnablePhysicalMemoryAccessCallbacks makes the pages
+// read-only in the A0/C0/E0 views, and the first write to one faults into the SDK's exception
+// handler, which calls OnWrite and makes the page writable again (file reads into watched pages
+// are reported by the SDK before the kernel writes them). g_armed mirrors which pages are armed,
+// so Watch only takes the SDK's global lock for pages that are not. The 7F window (the first 16 MB
+// through the SDK's virtual heap) is not watched by the SDK: copies from there are never clean.
+constexpr uint32_t kUnwatchedBelow = 0x01000000;
+std::unique_ptr<std::atomic<uint64_t>[]> g_armed;
+std::atomic<uint64_t> g_faults{0};
+
+std::pair<uint32_t, uint32_t> OnWrite(void*, uint32_t physical, uint32_t length, bool) {
+  if (physical < kPhysicalSize && length) {
+    uint64_t epoch = g_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
+    uint32_t first = physical >> kPageShift;
+    uint32_t last = uint32_t(std::min<uint64_t>((uint64_t(physical) + length - 1) >> kPageShift, kPages - 1));
+    for (uint32_t p = first; p <= last; p++) {
+      g_page_epoch[p].store(epoch, std::memory_order_release);
+      g_armed[p >> 6].fetch_and(~(uint64_t(1) << (p & 63)), std::memory_order_acq_rel);
+    }
+    g_faults.fetch_add(1, std::memory_order_relaxed);
+    g_pages.fetch_add(last - first + 1, std::memory_order_relaxed);
+  }
+  return {physical, length};  // unwatch only the pages written
+}
+
+void Init() {
+  auto* mem = REX_KERNEL_MEMORY();
+  if (!mem) return;
+  g_page_epoch = std::make_unique<std::atomic<uint64_t>[]>(kPages);
+  for (uint32_t p = 0; p < kPages; p++) g_page_epoch[p].store(0, std::memory_order_relaxed);
+  g_armed = std::make_unique<std::atomic<uint64_t>[]>(kPages / 64);
+  for (uint32_t w = 0; w < kPages / 64; w++) g_armed[w].store(0, std::memory_order_relaxed);
+  mem->RegisterPhysicalMemoryInvalidationCallback(OnWrite, nullptr);
+  g_ready = true;
+  REXLOG_INFO("[native] write watch on: SDK physical write watch (page protection)");
+}
 #else
 void Init() {}
 #endif
@@ -308,6 +346,8 @@ void Harvest() {
   g_helpers.Run(epoch);
   g_harvests++;
   g_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+#elif defined(_WIN32)
+  g_harvests++;  // writes are reported as they happen (OnWrite)
 #endif
 }
 
@@ -345,8 +385,27 @@ uint64_t Watch(uint32_t physical, uint32_t size) {
       }
     }
   }
-#endif
   return g_epoch.load(std::memory_order_acquire);
+#elif defined(_WIN32)
+  if (physical < kUnwatchedBelow) return 0;
+  // The epoch is taken before arming: a write that faults after arming gets a later one.
+  uint64_t epoch = g_epoch.load(std::memory_order_acquire);
+  uint32_t first = physical >> kPageShift, last = (physical + size - 1) >> kPageShift;
+  auto* mem = REX_KERNEL_MEMORY();
+  auto armed = [](uint32_t p) { return (g_armed[p >> 6].load(std::memory_order_acquire) >> (p & 63)) & 1; };
+  for (uint32_t p = first; p <= last;) {
+    if (armed(p)) {
+      p++;
+      continue;
+    }
+    uint32_t run = p;
+    while (p <= last && !armed(p)) g_armed[p >> 6].fetch_or(uint64_t(1) << (p & 63), std::memory_order_acq_rel), p++;
+    mem->EnablePhysicalMemoryAccessCallbacks(run << kPageShift, (p - run) << kPageShift, true, false);
+  }
+  return epoch;
+#else
+  return g_epoch.load(std::memory_order_acquire);
+#endif
 }
 
 bool Pending(uint32_t physical, uint32_t size) {
@@ -365,6 +424,14 @@ bool Pending(uint32_t physical, uint32_t size) {
     ScanView(v, host + lo, host + hi, false, 0);
   }
   return g_found != 0;
+#elif defined(_WIN32)
+  if (!g_ready || !size) return false;
+  physical &= kPhysicalSize - 1;
+  uint32_t first = physical >> kPageShift;
+  uint32_t last = uint32_t(std::min<uint64_t>((uint64_t(physical) + size - 1) >> kPageShift, kPages - 1));
+  for (uint32_t p = first; p <= last; p++)
+    if (!((g_armed[p >> 6].load(std::memory_order_acquire) >> (p & 63)) & 1)) return true;
+  return false;
 #else
   return false;
 #endif
@@ -386,7 +453,11 @@ void Touch(uint32_t physical, uint32_t size) {
 }
 
 Stats TakeStats() {
+#ifdef _WIN32
+  Stats s{g_faults.exchange(0), g_pages.exchange(0), g_ms};
+#else
   Stats s{g_harvests, g_pages.exchange(0), g_ms};
+#endif
   g_harvests = 0;
   g_ms = 0;
   return s;

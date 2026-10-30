@@ -1,3 +1,35 @@
+diff --git a/include/rex/audio/sdl/sdl_audio_driver.h b/include/rex/audio/sdl/sdl_audio_driver.h
+index f8949ca..32ce942 100644
+--- a/include/rex/audio/sdl/sdl_audio_driver.h
++++ b/include/rex/audio/sdl/sdl_audio_driver.h
+@@ -11,9 +11,11 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <mutex>
+ #include <queue>
+ #include <stack>
++#include <thread>
+ 
+ #include <rex/audio/audio_driver.h>
+ #include <rex/thread.h>
+@@ -49,6 +51,15 @@ class SDLAudioDriver : public AudioDriver {
+   std::queue<float*> frames_queued_ = {};
+   std::stack<float*> frames_unused_ = {};
+   std::mutex frames_mutex_ = {};
++
++  // --audio_release_pacing: the callback banks one credit per consumed frame and this thread
++  // releases the guest semaphore once per frame period, so a device that takes several frames
++  // per callback (WASAPI shared mode: 10 ms) still sees one audio pass every 5.3 ms.
++  void PacerThread();
++  std::thread pacer_;
++  std::atomic<bool> pacer_stop_{false};
++  std::atomic<int32_t> pending_releases_{0};
++  bool pacing_ = false;
+ };
+ 
+ }  // namespace rex::audio::sdl
 diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
 index da8e432..749f0ba 100644
 --- a/include/rex/graphics/command_processor.h
@@ -84,7 +116,7 @@ index 0a43f07..a9bf21f 100644
                  uint64_t* opt_timeout);
    static X_STATUS SignalAndWait(XObject* signal_object, XObject* wait_object, uint32_t wait_reason,
 diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
-index 20a2cd8..58ab7fa 100644
+index 20a2cd8..9033d64 100644
 --- a/src/audio/sdl/sdl_audio_driver.cpp
 +++ b/src/audio/sdl/sdl_audio_driver.cpp
 @@ -11,7 +11,14 @@
@@ -102,10 +134,27 @@ index 20a2cd8..58ab7fa 100644
  
  #include <rex/assert.h>
  #include <rex/audio/conversion.h>
-@@ -25,6 +32,10 @@
+@@ -24,7 +31,27 @@
+ #include <rex/perf/counter.h>
  #include <SDL3/SDL.h>
  
++#ifdef _WIN32
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
++// WASAPI shared mode ignores the period hint and takes two guest frames per 10 ms callback.
++#define REX_AUDIO_PACING_DEFAULT true
++#else
++#define REX_AUDIO_PACING_DEFAULT false
++#endif
++
  REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
++REXCVAR_DEFINE_BOOL(audio_release_pacing, REX_AUDIO_PACING_DEFAULT, "Audio",
++                    "Hand consumed frames back to the guest one per 5.3 ms instead of in bursts per device callback");
 +REXCVAR_DEFINE_INT32(audio_device_frames, 256, "Audio",
 +                     "Audio device period in samples (0 = SDL default); one guest frame is 256");
 +REXCVAR_DEFINE_STRING(audio_dump_raw, "", "Audio",
@@ -113,7 +162,7 @@ index 20a2cd8..58ab7fa 100644
  
  namespace rex::audio::sdl {
  
-@@ -39,6 +50,12 @@ SDLAudioDriver::~SDLAudioDriver() {
+@@ -39,6 +66,12 @@ SDLAudioDriver::~SDLAudioDriver() {
  bool SDLAudioDriver::Initialize() {
    // Set audio category for proper OS audio handling
    SDL_SetHint(SDL_HINT_AUDIO_CATEGORY, "playback");
@@ -126,7 +175,69 @@ index 20a2cd8..58ab7fa 100644
  
    // Set app name for audio device identification
    SDL_SetAppMetadataProperty(SDL_PROP_APP_METADATA_NAME_STRING, "rexglue");
-@@ -158,6 +175,58 @@ void SDLAudioDriver::Shutdown() {
+@@ -106,9 +139,50 @@ bool SDLAudioDriver::Initialize() {
+     return false;
+   }
+ 
++  pacing_ = REXCVAR_GET(audio_release_pacing);
++  if (pacing_) {
++    pacer_stop_ = false;
++    pacer_ = std::thread([this] { PacerThread(); });
++  }
+   return true;
+ }
+ 
++void SDLAudioDriver::PacerThread() {
++  using Clock = std::chrono::steady_clock;
++  const auto period = std::chrono::nanoseconds(1000000000ll * channel_samples_ / frame_frequency_);
++#ifdef _WIN32
++  SetThreadDescription(GetCurrentThread(), L"Audio pacer");
++  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
++  HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
++#endif
++  auto next = Clock::now();
++  while (!pacer_stop_.load(std::memory_order_relaxed)) {
++    next += period;
++    auto now = Clock::now();
++    if (next < now - 4 * period) next = now;  // stalled (debugger, suspend): don't burst to catch up
++    if (next > now) {
++#ifdef _WIN32
++      if (timer) {
++        LARGE_INTEGER due;
++        due.QuadPart = -std::max<int64_t>(1, std::chrono::duration_cast<std::chrono::nanoseconds>(next - now).count() / 100);
++        SetWaitableTimerEx(timer, &due, 0, nullptr, nullptr, nullptr, 0);
++        WaitForSingleObject(timer, INFINITE);
++      } else
++#endif
++        std::this_thread::sleep_until(next);
++    }
++    // One frame per period; more when credits pile up (this clock slower than the device's).
++    int32_t pending = pending_releases_.load(std::memory_order_acquire);
++    if (pending <= 0) continue;
++    int32_t n = pending > 2 ? pending - 1 : 1;
++    pending_releases_.fetch_sub(n, std::memory_order_acq_rel);
++    semaphore_->Release(n, nullptr);
++  }
++#ifdef _WIN32
++  if (timer) CloseHandle(timer);
++#endif
++}
++
+ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
+   const auto input_frame = memory_->TranslateVirtual<float*>(frame_ptr);
+   float* output_frame;
+@@ -139,6 +213,10 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
+ }
+ 
+ void SDLAudioDriver::Shutdown() {
++  if (pacer_.joinable()) {
++    pacer_stop_ = true;
++    pacer_.join();
++  }
+   if (sdl_stream_) {
+     SDL_DestroyAudioStream(sdl_stream_);
+     sdl_stream_ = nullptr;
+@@ -158,6 +236,58 @@ void SDLAudioDriver::Shutdown() {
    }
  }
  
@@ -185,7 +296,7 @@ index 20a2cd8..58ab7fa 100644
  void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int additional_amount,
                                   [[maybe_unused]] int total_amount) {
    SCOPE_profile_cpu_f("apu");
-@@ -178,15 +247,26 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+@@ -178,15 +308,26 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
    const StereoFold fold = GetStereoFold();
    const SurroundMix mix = GetSurroundMix();
    const float gain = GetOutputGain();
@@ -212,7 +323,7 @@ index 20a2cd8..58ab7fa 100644
        if (!SDL_PutAudioStreamData(stream, data, len)) {
          REXAPU_ERROR("SDL_PutAudioStreamData() failed while filling silence: {}", SDL_GetError());
          break;
-@@ -195,9 +275,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+@@ -195,9 +336,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
      } else {
        auto buffer = driver->frames_queued_.front();
        driver->frames_queued_.pop();
@@ -223,7 +334,7 @@ index 20a2cd8..58ab7fa 100644
          switch (driver->sdl_device_channels_) {
            case 2:
              conversion::sequential_6_BE_to_interleaved_2_LE(data, buffer, channel_samples_, fold,
-@@ -211,6 +289,8 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+@@ -211,6 +350,8 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
              assert_unhandled_case(driver->sdl_device_channels_);
              break;
          }
@@ -232,6 +343,21 @@ index 20a2cd8..58ab7fa 100644
        }
        if (!SDL_PutAudioStreamData(stream, data, len)) {
          REXAPU_ERROR("SDL_PutAudioStreamData() failed: {}", SDL_GetError());
+@@ -219,8 +360,12 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+       }
+       driver->frames_unused_.push(buffer);
+ 
+-      auto ret = driver->semaphore_->Release(1, nullptr);
+-      assert_true(ret);
++      if (driver->pacing_) {
++        driver->pending_releases_.fetch_add(1, std::memory_order_acq_rel);
++      } else {
++        auto ret = driver->semaphore_->Release(1, nullptr);
++        assert_true(ret);
++      }
+       additional_amount -= len;
+     }
+   }
 diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
 index 11b83be..192f3c3 100644
 --- a/src/audio/xma_context.cpp

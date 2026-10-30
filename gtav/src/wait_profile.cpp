@@ -19,8 +19,12 @@
 #include <unordered_map>
 #include <vector>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <sys/syscall.h>
 #include <unistd.h>
+#endif
 
 REXCVAR_DEFINE_BOOL(gtav_wait_profile, false, "GTAV",
                     "Log where the game's threads wait (kernel wait wrappers, per thread and caller)");
@@ -57,6 +61,17 @@ ThreadTable& Table() {
   thread_local std::shared_ptr<ThreadTable> t;
   if (!t) {
     t = std::make_shared<ThreadTable>();
+#ifdef _WIN32
+    t->tid = long(GetCurrentThreadId());
+    PWSTR desc = nullptr;
+    if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &desc)) && desc) {
+      char name[64] = {};
+      WideCharToMultiByte(CP_UTF8, 0, desc, -1, name, sizeof(name) - 1, nullptr, nullptr);
+      LocalFree(desc);
+      t->name = name;
+    }
+    if (t->name.empty()) t->name = fmt::format("t{}", t->tid);
+#else
     t->tid = syscall(SYS_gettid);
     char path[64], name[32] = {};
     std::snprintf(path, sizeof(path), "/proc/self/task/%ld/comm", t->tid);
@@ -65,6 +80,7 @@ ThreadTable& Table() {
       std::fclose(f);
     }
     t->name = name;
+#endif
     std::lock_guard lock(g_tables_mutex);
     g_tables.push_back(t);
   }
@@ -195,6 +211,7 @@ REX_HOOK_RAW(sub_83216298) {
 // Game functions that call NtWaitForSingleObjectEx / KeWaitForSingleObject /
 // KeWaitForMultipleObjects (found in the generated code).
 GTAV_WAIT_HOOK(837972B8)
+GTAV_WAIT_HOOK(8378F5D0)  // SleepEx (the only caller of KeDelayExecutionThread)
 GTAV_WAIT_HOOK(83798C98)
 GTAV_WAIT_HOOK(83798C00)
 GTAV_WAIT_HOOK(83798B68)

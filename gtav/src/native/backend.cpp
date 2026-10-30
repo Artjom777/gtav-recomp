@@ -54,6 +54,11 @@ REXCVAR_DEFINE_INT32(gtav_native_dump_rt_skip, 0, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_native_exact_cache, false, "GTAV",
                     "Check cached vertex/index buffers and textures with a full content hash every frame "
                     "(no sampled-hash shortcut for large ones)");
+// Off by default: the hash is taken at the start of the frame, so data the game rewrites before
+// the draw is recorded keeps last frame's upload for one frame (foliage popping, owner 10-29).
+REXCVAR_DEFINE_INT32(gtav_native_hash_threads, 0, "GTAV",
+                     "Worker threads that hash the frame's small textures and buffers before it is recorded "
+                     "when there is no write watch (0: hash on the render thread)");
 REXCVAR_DEFINE_INT32(gtav_native_dump_rt_count, 150, "GTAV",
                      "Frame dumps: number of per-draw snapshots of --gtav_native_dump_rt (~2.7 MB each at 720p)");
 REXCVAR_DEFINE_DOUBLE(gtav_native_pipeline_wait_ms, 40.0, "GTAV",
@@ -74,7 +79,7 @@ REXCVAR_DEFINE_BOOL(gtav_native_write_watch_verify, false, "GTAV",
                     "log how many had changed (diagnostic)");
 REXCVAR_DEFINE_BOOL(gtav_native_tile_penumbra_all, true, "GTAV",
                     "Deferred sun lighting: every 16x16 tile takes the per-pixel penumbra variant "
-                    "(shaders/ps_D258EBE32001470C_tiles.hlsl); false uses the game's classification (blocky)");
+                    "(variant made by the shader compiler); false uses the game's classification (blocky)");
 
 namespace gtav::native {
 
@@ -238,6 +243,13 @@ class SpirvPreload {
   bool Contains(const std::string& name) {
     std::lock_guard lock(mutex_);
     return files_.count(name) != 0;
+  }
+
+  // In the folder when it was read at start-up (false until the read finished).
+  bool Listed(const std::string& name) {
+    if (!done_) return false;
+    std::lock_guard lock(mutex_);
+    return names_.count(name) != 0;
   }
 
   // Once the whole folder was read, a name it did not have is not on disk either (unless the
@@ -550,6 +562,9 @@ struct CachedTexture {
   // Write watch (write_watch.h): unchanged since the last full check while its pages are clean.
   WatchState watch;
   uint64_t full_frame = 0;  // last full hash of the guest bytes
+  // Hashed ahead on the hash pool at the start of the frame (PreHash): valid for pre_frame.
+  uint64_t pre_frame = ~0ull, pre_index = 0, pre_sampled = 0;
+  uint32_t pre_words[6] = {};
   bool failed = false;
   bool all_zero = false;  // decoded texels all zero (guest data not streamed in yet?)
 };
@@ -561,6 +576,134 @@ struct CachedBuffer {
   uint64_t sampled = 0;              // SampledHash at the last full check
   uint64_t full_frame = ~0ull;       // frame of the last full hash
   WatchState watch;
+  // Hashed ahead on the hash pool at the start of the frame (PreHash): valid for pre_frame.
+  uint64_t pre_frame = ~0ull, pre_index = 0, pre_size = 0;
+  const uint8_t* pre_guest = nullptr;
+};
+
+// Without a write watch (Windows, macOS) every small texture and buffer gets a full hash every
+// frame (~2.8 ms of the render thread at ~2,500 draws). Hashing only reads guest memory, so what
+// the previous frame hashed in full is hashed again on worker threads while this frame records,
+// roughly in draw order; a lookup takes the result once its item is ready and hashes inline
+// otherwise. Guest memory a draw reads is protected until that draw is recorded (its fence is
+// held), so a result that is ready before the lookup is a hash of the bytes the draw reads.
+struct PreHashItem {
+  uint64_t key;
+  const uint8_t* guest;  // buffer: guest bytes; texture: nullptr (words below)
+  uint64_t size;
+  uint32_t words[6];
+  uint64_t raw = 0, sampled = 0;
+};
+
+class HashPool {
+ public:
+  explicit HashPool(int threads) {
+    for (int i = 0; i < threads; i++)
+      workers_.emplace_back([this] {
+#ifdef _WIN32
+        SetThreadDescription(GetCurrentThread(), L"Native hash");
+#endif
+        uint64_t seen = 0;
+        for (;;) {
+          {
+            std::unique_lock lock(mutex_);
+            cv_.wait(lock, [&] { return stop_ || generation_ != seen; });
+            if (stop_) return;
+            seen = generation_;
+          }
+          Work();
+        }
+      });
+  }
+  ~HashPool() {
+    Finish();
+    {
+      std::lock_guard lock(mutex_);
+      stop_ = true;
+    }
+    cv_.notify_all();
+    for (auto& w : workers_) w.join();
+  }
+  // Starts hashing `items` in the background; the vector must stay untouched until Finish().
+  void Start(std::vector<PreHashItem>& items) {
+    Finish();
+    if (items.empty()) return;
+    if (ready_cap_ < items.size()) {
+      ready_cap_ = items.size() * 2;
+      ready_ = std::make_unique<std::atomic<uint8_t>[]>(ready_cap_);
+    }
+    for (size_t i = 0; i < items.size(); i++) ready_[i].store(0, std::memory_order_relaxed);
+    {
+      std::lock_guard lock(mutex_);
+      items_ = &items;
+      next_ = 0;
+      done_ = 0;
+      generation_++;
+    }
+    cv_.notify_all();
+  }
+  bool Ready(size_t i) const { return ready_[i].load(std::memory_order_acquire) != 0; }
+  // Waits until no worker holds the item vector.
+  void Finish() {
+    for (;;) {
+      std::lock_guard lock(mutex_);
+      if (!items_) return;
+      if (active_ == 0 && done_.load(std::memory_order_acquire) >= items_->size()) {
+        items_ = nullptr;
+        return;
+      }
+      if (active_ == 0) {  // workers not woken yet: finish the rest here
+        mutex_.unlock();
+        Work();
+        mutex_.lock();
+      }
+    }
+  }
+
+ private:
+  void Work() {
+    std::vector<PreHashItem>* items;
+    {
+      std::lock_guard lock(mutex_);
+      items = items_;
+      if (!items) return;
+      active_++;
+    }
+    struct Leave {
+      HashPool* pool;
+      ~Leave() {
+        std::lock_guard lock(pool->mutex_);
+        pool->active_--;
+      }
+    } leave{this};
+    constexpr size_t kChunk = 8;
+    for (;;) {
+      size_t begin = next_.fetch_add(kChunk, std::memory_order_relaxed);
+      if (begin >= items->size()) return;
+      size_t end = std::min(begin + kChunk, items->size());
+      for (size_t i = begin; i < end; i++) {
+        auto& it = (*items)[i];
+        if (it.guest) {
+          it.raw = XXH3_64bits_withSeed(it.guest, size_t(it.size), 0);
+        } else {
+          it.raw = HashGuestTexture(it.words);
+          it.sampled = HashGuestTexture(it.words, true);
+        }
+        ready_[i].store(1, std::memory_order_release);
+      }
+      done_.fetch_add(end - begin, std::memory_order_acq_rel);
+    }
+  }
+  std::vector<std::thread> workers_;
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  bool stop_ = false;
+  uint64_t generation_ = 0;
+  int active_ = 0;  // threads inside Work (under mutex_)
+  std::vector<PreHashItem>* items_ = nullptr;
+  std::atomic<size_t> next_{0}, done_{0};
+  std::unique_ptr<std::atomic<uint8_t>[]> ready_;
+  size_t ready_cap_ = 0;
 };
 
 // 16 runs of 256 bytes spread over a buffer: catches rewrites of large guest buffers at ~4 KB per
@@ -693,6 +836,43 @@ struct Backend::Impl {
   std::unordered_map<uint64_t, CachedBuffer> buffers;  // never erased: entries keep their address
   // Direct-mapped memo in front of `buffers` (~4,000 lookups a frame were 6% of the render thread).
   std::array<std::pair<uint64_t, CachedBuffer*>, 4096> buffer_memo{};
+  // PreHash: full hashes taken this frame (hashed ahead next frame) and the ones for this frame.
+  std::vector<PreHashItem> prehash_next, prehash_now;
+  std::unique_ptr<HashPool> hash_pool;  // after the vectors: destroyed (and finished) first
+  uint64_t prehash_hits = 0, prehash_late = 0, prehash_misses = 0;
+  double prehash_ms = 0;
+  bool prehash_on = false;
+
+  void PreHash() {
+    if (hash_pool) hash_pool->Finish();
+    prehash_now.swap(prehash_next);
+    prehash_next.clear();
+    int threads = REXCVAR_GET(gtav_native_hash_threads);
+    prehash_on = threads > 0 && !write_watch::Enabled() && !REXCVAR_GET(gtav_native_exact_cache);
+    if (!prehash_on) return;
+    if (!hash_pool) hash_pool = std::make_unique<HashPool>(std::min(threads, 8));
+    ScopedMs timer{prehash_ms};
+    hash_pool->Start(prehash_now);
+    for (size_t i = 0; i < prehash_now.size(); i++) {
+      auto& it = prehash_now[i];
+      if (it.guest) {
+        auto& b = buffers[it.key];  // never erased
+        b.pre_frame = frame, b.pre_index = i, b.pre_guest = it.guest, b.pre_size = it.size;
+      } else if (auto t = textures.find(it.key); t != textures.end()) {
+        t->second.pre_frame = frame, t->second.pre_index = i;
+        std::memcpy(t->second.pre_words, it.words, sizeof(it.words));
+      }
+    }
+  }
+  // The hashed-ahead result for item i, if a worker finished it.
+  const PreHashItem* PreHashed(uint64_t i) {
+    if (i < prehash_now.size() && hash_pool->Ready(i)) {
+      prehash_hits++;
+      return &prehash_now[i];
+    }
+    prehash_late++;
+    return nullptr;
+  }
   std::unordered_map<const RenderTexture*, RenderTextureLayout> layouts;
   // Objects replaced mid-frame stay alive until the frame's commands completed.
   std::vector<std::unique_ptr<RenderTexture>> dead_textures;
@@ -1322,7 +1502,7 @@ struct Backend::Impl {
 
   std::unordered_set<uint64_t> indirect_fetch_shaders;
 
-  // shaders/ps_D258EBE32001470C_tiles.hlsl replaces the game's tile classification while
+  // ps_D258EBE32001470C_tiles.spv replaces the game's tile classification while
   // --gtav_native_tile_penumbra_all is on (switchable live from the menu: shader and pipeline keys
   // carry the choice).
   static bool TileOverride(uint64_t ps_hash) {
@@ -1346,15 +1526,14 @@ struct Backend::Impl {
     if (dir.empty())
       dir = DefaultSpirvDir();
     g_spirv_preload.Start(dir, device);
-    std::string name = fmt::format("{}_{:016X}.spv", pixel ? "ps" : "vs", hash);
+    // The tile override is <hash>_tiles.spv, a variant the shader compiler makes from the game's own
+    // shader (shader_compiler.cpp kVariants).
+    std::string name = fmt::format("{}_{:016X}{}.spv", pixel ? "ps" : "vs", hash, tile_override ? "_tiles" : "");
     std::string path = fmt::format("{}/{}", dir, name);
     std::unique_ptr<RenderShader> shader;
     std::vector<uint8_t> data;
     std::unique_ptr<RenderShader> ready;
-    if (tile_override) {
-      shader = device->createShader(g_native_tile_classify_ps, sizeof(g_native_tile_classify_ps), "main",
-                                    RenderShaderFormat::SPIRV);
-    } else if (int got = g_spirv_preload.TakeShader(name, &ready, &data); got == 1) {
+    if (int got = g_spirv_preload.TakeShader(name, &ready, &data); got == 1) {
       shader = std::move(ready);
     } else if (got == 2) {
       shader = device->createShader(data.data(), data.size(), "main", RenderShaderFormat::SPIRV);
@@ -1516,7 +1695,14 @@ struct Backend::Impl {
       b.watch.ranges[0] = physical, b.watch.ranges[1] = uint32_t(guest_size);
       b.watch.epoch = write_watch::Watch(physical, uint32_t(guest_size));
     }
-    uint64_t content = Hash(guest, guest_size);
+    uint64_t content;
+    const PreHashItem* pre = nullptr;
+    if (prehash_on && b.pre_frame == frame && b.pre_guest == guest && b.pre_size == guest_size)
+      pre = PreHashed(b.pre_index);
+    else
+      prehash_misses += prehash_on;
+    content = pre ? pre->raw : Hash(guest, guest_size);
+    if (prehash_on && guest_size <= kSmallBuffer) prehash_next.push_back({key, guest, guest_size, {}});
     b.full_frame = frame;
     if (guest_size > kSmallBuffer) b.sampled = SampledHash(guest, guest_size);
     if (!b.buffer || b.content != content || b.size != host_size) {
@@ -1599,10 +1785,25 @@ struct Backend::Impl {
       ScopedMs ft{tprof.full_ms};
       tprof.full++;
       tprof.full_bytes += t.bytes;
-      raw = HashGuestTexture(words);
+      const PreHashItem* pre = nullptr;
+      if (prehash_on && t.pre_frame == frame && !std::memcmp(t.pre_words, words, sizeof(t.pre_words)))
+        pre = PreHashed(t.pre_index);
+      else
+        prehash_misses += prehash_on;
+      if (pre) {
+        raw = pre->raw;
+        t.pre_sampled = pre->sampled;
+      } else {
+        raw = HashGuestTexture(words);
+        t.pre_sampled = HashGuestTexture(words, true);
+      }
+    }
+    if (prehash_on && t.bytes <= kSmallTexture) {
+      prehash_next.push_back({key, nullptr, 0, {}});
+      std::memcpy(prehash_next.back().words, words, 24);
     }
     t.full_frame = frame;
-    t.sampled_hash = HashGuestTexture(words, true);
+    t.sampled_hash = t.pre_sampled;
     t.sample_frame = frame;
     if (t.texture && raw && raw == t.raw_hash) {
       t.checked_frame = frame;
@@ -3504,10 +3705,12 @@ Backend::Backend() : impl_(std::make_unique<Impl>()) {}
 Backend::~Backend() = default;
 
 bool Backend::Init(RenderDevice* device) { return impl_->Init(device); }
+bool Backend::SpirvListed(const std::string& name) { return g_spirv_preload.Listed(name); }
 
 RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, uint32_t* front_descriptor) {
   auto& s = *impl_;
   s.frame++;
+  s.PreHash();
   s.bound_fb = nullptr;
   s.grow_list = list;
   s.stat_draws = s.stat_skipped = s.stat_pipelines_created = s.stat_textures = s.stat_rewritten = 0;
@@ -3581,6 +3784,13 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
                   t.full_bytes / n / 1048576.0, t.full_ms / n);
       REXLOG_INFO("[native]   texture ms per frame: slots {:.2f}, {:.0f} slots from the memo",
                   t.descriptor_ms / n, s.slot_memo_hits / n);
+      if (s.prehash_on) {
+        REXLOG_INFO("[native]   hashed ahead per frame: {:.0f} used, {:.0f} not ready yet, {:.0f} not listed "
+                    "(hashed on the render thread), {:.2f} ms to start",
+                    s.prehash_hits / n, s.prehash_late / n, s.prehash_misses / n, s.prehash_ms / n);
+        s.prehash_hits = s.prehash_late = s.prehash_misses = 0;
+        s.prehash_ms = 0;
+      }
       if (write_watch::Enabled()) {
         auto ws = write_watch::TakeStats();
         REXLOG_INFO("[native]   write watch per frame: {:.0f} textures and {:.0f} buffers unchanged without a hash, "

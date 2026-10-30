@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <vector>
 #include <memory>
+#include <string>
 
 struct ImDrawData;
 
@@ -29,6 +30,8 @@ class Backend {
   Backend();
   ~Backend();
   bool Init(plume::RenderDevice* device);
+  // <name> (e.g. "ps_<HASH>.spv") was in the SPIR-V folder read at start-up (no disk access).
+  static bool SpirvListed(const std::string& name);
 
   // Records the frame into `list`. Returns the texture holding the guest front buffer (in
   // SHADER_READ layout) and its descriptor index, or nullptr when the frame has none yet.
