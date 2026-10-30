@@ -34,8 +34,10 @@ Everything made from your files stays in this folder (data\ and gtav_game.dll). 
 it contains Rockstar Games' copyrighted work.
 
 This project is free software under the GNU GPL, version 3 or later (LICENSES\gtav-recomp-GPL-3.0.txt).
-Source code: https://github.com/andrewnakas/gtav-recomp (the launcher, the runtime changes as
-patches on top of ReXGlue SDK v0.10.0 and XenosRecomp, and the release tools).
+Source code: https://github.com/andrewnakas/gtav-recomp. The complete source of every program in
+this package that is under the GPL or LGPL (this project, the ReXGlue SDK runtime with the FFmpeg
+it links statically, XenosRecomp, plume) is in gtav-recomp-src-<version>.tar.xz on the same
+release page.
 Licenses for the bundled open-source components are in LICENSES\.
 Grand Theft Auto V is a trademark of Take-Two Interactive Software. This project is not affiliated
 with or endorsed by Rockstar Games, Take-Two Interactive or Microsoft.

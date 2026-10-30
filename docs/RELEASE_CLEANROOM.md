@@ -76,22 +76,26 @@ Developer side:
 
 `gtav/src/native/shaders/ps_D258EBE32001470C_tiles.hlsl` was XenosRecomp's translation of a game
 shader. It was removed from the tree and from **all history** with git filter-repo, and
-`windows-native` was force-pushed. Every commit from `214b060` on has a new hash.
+`windows-native` was force-pushed. Every commit from `214b060` on has a new hash. Then the old
+Linux `main` was merged in (`main` and `windows-native` had separate roots) and **everything now
+lives on `main`**; `windows-native` points at the same commit and is no longer needed.
 
 - Any clone made before the scrub (the Linux machine, `E:/gtav-rex/linux-native-*`, `.codex`
   worktrees) still has the old commits. **Do not push from it, and do not merge or cherry-pick
-  old-hash commits.** Re-clone `windows-native`, or `git fetch && git reset --hard
-  origin/windows-native` after saving local work as a patch, then check with
+  old-hash commits.** Re-clone `main`, or save local work as a patch and
+  `git fetch && git reset --hard origin/main`, then check with
   `git log --all -- '*ps_D258EBE32001470C*'` (must print nothing).
+- Text is stored with LF (`.gitattributes`; `.cmd` files CRLF). The old `main` had CRLF in a few
+  files; the merge took the LF versions.
 - If the Linux tree has its own copy of that file or any other translated game shader
   (`ps_*.hlsl`, `vs_*.hlsl`, `*.spv` from the game, `shader_src_all/`), it must not be committed.
 - GitHub keeps unreferenced old commits reachable by hash for a while. Before making the repo
   public, ask GitHub Support to purge cached views of the old `windows-native` commits (or publish
   from a fresh repo).
-- `origin/main` (the Linux root, 2 commits) never had the shader. It has
-  `tools/scripttools/fn2name.txt` (script native names, community NativeDB style, not from the
-  game files) and address tables (`ptrs.txt`, `handlers.txt`, `buckets.txt`, `pro1.natives`); keep
-  those out of the release package. `main` and `windows-native` have no common ancestor.
+- The old Linux root never had the shader. It brought `tools/scripttools/fn2name.txt` (script
+  native names, community NativeDB style, not from the game files) and address tables
+  (`ptrs.txt`, `handlers.txt`, `buckets.txt`, `pro1.natives`); keep those out of the release
+  package.
 
 ## Linux: what to build
 
@@ -143,12 +147,24 @@ seed.
 8. **End-to-end**: install from the ISOs with `--unattended` into a copy of the package, boot it
    headless, check: hashes OK, gen match, shared library loads, in world after A presses,
    shaders compile with 0 failures.
+9. **Corresponding source** (GPL/LGPL, below): tag the commit the Linux binaries are built from,
+   run `tools/release/make_source_archive.sh` on the Linux SDK/XenosRecomp/plume trees, upload
+   the archive next to the Linux package. If the Linux SDK tree is not exactly v0.10.0 +
+   `rexglue-sdk-gtav-linux.patch` (check: `git diff HEAD` plus the two untracked
+   `thirdparty/imgui_rex_*` files must equal the patch), commit the difference into the patch
+   first.
 
-## Open owner decisions (both platforms)
+## Licensing and source (decided 2026-10-29)
 
-- The runtime contains the Xbox 360 XEX retail AES key (as Xenia does), needed to decrypt
-  `default.xex`. Strictly, it is Microsoft's 16-byte key. The alternative is asking players to
-  supply it.
-- SDK third-party: binutils' PowerPC disassembler (GPL-3) is linked in, so the project is
-  GPL-3.0-or-later; FFmpeg is LGPL (licenses bundled; check the static-link obligations).
+- This project: **GPL-3.0-or-later** (`LICENSE`). Required anyway: the SDK links binutils' PowerPC
+  disassembler (GPL-3).
+- **FFmpeg** (LGPL-2.1-or-later, configured with `CONFIG_GPL 0`: mp3/wmav2/xmaframes decoders) is
+  linked **statically** into the SDK runtime. Compliance: the release carries
+  `LICENSES/third_party/FFmpeg-NOTICE.txt`, and every release has a **complete corresponding
+  source archive** (`gtav-recomp-src-<tag>.tar.xz`, `tools/release/make_source_archive.sh`):
+  this repo at the tag, the SDK + every submodule (FFmpeg included) at the exact commits, XenosRecomp
+  and plume + submodules, with our patches and `SOURCE.txt` saying how to rebuild/relink with a
+  modified FFmpeg. Upload it with every binary release, from the same commits.
+- The Xbox 360 XEX retail key in the runtime stays (owner decision: Xenia ships it too).
 - dxc/dxcompiler are Microsoft open source (NCSA): shipped. `dxil.dll` is not shipped.
+- The Visual C++ runtime is not bundled (the README links Microsoft's installer).

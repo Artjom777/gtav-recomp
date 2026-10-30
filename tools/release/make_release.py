@@ -67,6 +67,18 @@ SDK_THIRDPARTY = ["FFmpeg", "aes_128", "cli11", "crypto/des", "disasm", "disrupt
                   "vulkan-headers", "vulkan-loader", "vulkan-memory-allocator", "xxHash"]
 XR_THIRDPARTY = ["fmt", "smol-v", "xxHash", "zstd"]
 
+FFMPEG_NOTICE = """\
+FFmpeg (https://ffmpeg.org) is used under the GNU Lesser General Public License, version 2.1 or
+later (sdk-FFmpeg.txt; the LGPL text is in FFmpeg's COPYING.LGPLv2.1, included in the source
+archive). It is linked statically into rexruntimerd.dll, configured without GPL or non-free parts
+(decoders mp3, wmav2, xmaframes only), from the Xenia FFmpeg branch (github.com/wmarti/FFmpeg,
+xenia-ffmpeg-canary-full) as pinned by the ReXGlue SDK.
+
+The complete source of rexruntimerd.dll, FFmpeg included, and of everything else in this release
+is in gtav-recomp-src-<version>.tar.xz on the same GitHub release page. To use a modified FFmpeg,
+rebuild the SDK from that archive and replace rexruntimerd.dll (see SOURCE.txt in the archive).
+"""
+
 # Never in a release, whatever the source lists say.
 FORBIDDEN_EXT = {".xex", ".xexp", ".rpf", ".iso", ".spv", ".bin", ".pdb", ".ilk", ".obj", ".lib", ".exp",
                  ".timestamp", ".dmp", ".log", ".hlsl"}
@@ -145,6 +157,7 @@ def main():
                 sys.exit(f"no license found in {base / n}")
     # binutils' PowerPC disassembler (SDK thirdparty/disasm) is GPL-3.0-or-later.
     copy(Path(a.licenses) / "GPL-3.0.txt", lic / "third_party" / "GPL-3.0.txt")
+    (lic / "third_party" / "FFmpeg-NOTICE.txt").write_text(FFMPEG_NOTICE)
 
     bad = [p for p in out.rglob("*") if p.is_file() and p.suffix.lower() in FORBIDDEN_EXT]
     if bad:
