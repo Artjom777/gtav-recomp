@@ -3303,6 +3303,17 @@ struct Backend::Impl {
         dst = a.cpu;
         ref = RenderBufferReference(a.buffer, a.offset);
       }
+      rect_elems.clear();
+      for (uint32_t n = 0; n < vl.element_count; n++) {
+        if (vl.elements[n].slotIndex != s) continue;
+        const RenderFormat f = vl.info[n].host;
+        const uint32_t floats = f == RenderFormat::R32_FLOAT            ? 1
+                                : f == RenderFormat::R32G32_FLOAT       ? 2
+                                : f == RenderFormat::R32G32B32_FLOAT    ? 3
+                                : f == RenderFormat::R32G32B32A32_FLOAT ? 4
+                                                                        : 0;
+        rect_elems.push_back({vl.host_offset[n], floats, f});
+      }
       ConvertInto(dst, size, [&](uint8_t* out) {
         const uint8_t* src = rect_conv[s].data();
         for (uint32_t q = 0; q < rects; q++, out += 6 * stride) {
@@ -3320,15 +3331,24 @@ struct Backend::Impl {
           const uint8_t* order[5] = {corner, va, vb, vb, va};
           for (int k = 0; k < 5; k++) std::memcpy(out + k * stride, order[k], stride);
           uint8_t* fourth = out + 5 * stride;
-          for (uint32_t n = 0; n < vl.element_count; n++) {
-            if (vl.elements[n].slotIndex != s) continue;
-            uint32_t o = vl.host_offset[n];
+          for (const auto& e : rect_elems) {
+            if (e.floats) {  // 32-bit float components: no format dispatch
+              for (uint32_t i = 0; i < e.floats; i++) {
+                float x, y, z;
+                std::memcpy(&x, va + e.offset + 4 * i, 4);
+                std::memcpy(&y, vb + e.offset + 4 * i, 4);
+                std::memcpy(&z, corner + e.offset + 4 * i, 4);
+                const float r = x + y - z;
+                std::memcpy(fourth + e.offset + 4 * i, &r, 4);
+              }
+              continue;
+            }
             float x[4] = {}, y[4] = {}, z[4] = {}, r[4] = {};
-            uint32_t comps = ReadHostElement(vl.info[n].host, va + o, x);
-            ReadHostElement(vl.info[n].host, vb + o, y);
-            ReadHostElement(vl.info[n].host, corner + o, z);
+            uint32_t comps = ReadHostElement(e.format, va + e.offset, x);
+            ReadHostElement(e.format, vb + e.offset, y);
+            ReadHostElement(e.format, corner + e.offset, z);
             for (uint32_t i = 0; i < comps; i++) r[i] = x[i] + y[i] - z[i];
-            if (comps) WriteHostElement(vl.info[n].host, fourth + o, r);
+            if (comps) WriteHostElement(e.format, fourth + e.offset, r);
           }
         }
       });
@@ -3336,6 +3356,11 @@ struct Backend::Impl {
     }
   }
   std::vector<uint8_t> rect_corner;
+  struct RectElement {
+    uint32_t offset, floats;  // floats: 32-bit float components (fast path), 0: by format
+    RenderFormat format;
+  };
+  std::vector<RectElement> rect_elems;  // RectExpand: the elements of the stream being expanded
 
   void DrawImpl(RenderCommandList* list, const FramePacket& f, const DrawCommand& d, void*) {
     prof.Start();

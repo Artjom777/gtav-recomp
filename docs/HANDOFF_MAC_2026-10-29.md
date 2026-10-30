@@ -30,7 +30,7 @@ session (owner): **native-renderer rendering on the Mac as correct as the Linux 
   gtav_manifest.toml` (4.5 min).
 - Game build dir: `build/gtav` (Ninja, Release). Configured with
   `cmake -S gtav -B build/gtav -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64
-  -DCMAKE_C_FLAGS=-march=armv8-a -DCMAKE_CXX_FLAGS=-march=armv8-a
+  -DCMAKE_C_FLAGS=-mcpu=apple-m1 -DCMAKE_CXX_FLAGS=-mcpu=apple-m1 (was -march=armv8-a: ~3% slower)
   -DCMAKE_PREFIX_PATH=$PWD/rexglue-sdk/out/install/mac-arm64
   -DGTAV_PREBUILT_NATIVE_SHADERS=<bundle>/native_shaders`; build `ninja -j 4` (8 GB RAM).
   Precompiled game SPIR-V in `build/gtav/spirv` (from the bundle).
