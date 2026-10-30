@@ -576,6 +576,21 @@ index cbdd7f7..6b9067c 100644
    ctx.println("\t}}");
    return true;
  }
+diff --git a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
+index b52bf39..d34c7d0 100644
+--- a/src/core/memory_posix.cpp
++++ b/src/core/memory_posix.cpp
+@@ -483,6 +483,10 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
+     shm_unlink(full_path.c_str());
+     return kFileMappingHandleInvalid;
+   }
++  // Nothing opens the object by name again: unlink it now, so its memory goes with the last fd and
++  // mapping. Unlinked only at a clean shutdown, every killed or crashed run left its guest memory
++  // behind until reboot (it filled 30 GB of swap on an 8 GB Mac).
++  shm_unlink(full_path.c_str());
+   return static_cast<FileMappingHandle>(ret);
+ #endif
+ }
 diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
 index 9ac8d15..07992ab 100644
 --- a/src/core/threading_posix.cpp
