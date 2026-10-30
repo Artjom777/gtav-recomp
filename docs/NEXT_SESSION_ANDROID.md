@@ -23,10 +23,11 @@ game files and anything derived from them never go into git.
 
 ## Blockers to clear first (10-30)
 
-1. **The phone was not detected**: `lsusb` showed no Android device and `adb devices` was empty.
-   Use a data cable, unlock the phone, pick "File transfer", enable Developer options and USB
-   debugging, then accept the RSA prompt. On Ubuntu `adb` may also need a udev rule for the vendor
-   (Samsung 04e8) or `plugdev` membership.
+1. ~~Phone not detected~~ **Fixed 10-30**: with USB tethering + debugging on, adb sees it (serial R5CX13SPC2J).
+   Device: Samsung Galaxy S23 FE, SM-S711U, Snapdragon SM8450 (8 Gen 1), Adreno 730 (Vulkan),
+   Android 16 (API 36), kernel 5.10 (no PAGEMAP_SCAN, so the hashing fallback applies), 4 KB pages, 7.4 GB RAM
+   (keep the 4.8 GB guest mapping sparse/memfd and the footprint well under ~3 GB), 61 GB free.
+   ISOs (both 8,738,846,720 bytes) and the bundle are in /sdcard/Download/.
 2. **Disk**: the SSD (`/`) has 5.8 GB free and the TOSHIBA drive has 9.6 GB. The NDK (~2.5 GB),
    the SDK cmdline tools and platform (~1 GB), Gradle and a JDK (~1 GB) and the build tree need
    ~10+ GB. Free space on `/` first (old /dev/shm files, `build/gtav/logs/native_dump`, flicker
