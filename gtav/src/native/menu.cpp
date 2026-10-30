@@ -195,11 +195,14 @@ void OnKey(Key key, bool down) { Push({Input::kKey, 0, 0, int(key), down}); }
 void TestSet(const std::string& name, const std::string& value) {
   REXLOG_INFO("[native] menu test: {} = {}", name, value);
   rex::cvar::SetFlagByName(name, value);
+  if (std::getenv("GTAV_IGNORE_SETTINGS")) return;  // benchmark runs leave gtav_settings.ini alone
   SaveSettings();
   REXLOG_INFO("[native] menu test: saved");
 }
 
 void LoadSettings() {
+  // GTAV_IGNORE_SETTINGS=1: command-line settings only (benchmark runs).
+  if (std::getenv("GTAV_IGNORE_SETTINGS")) return;
   std::ifstream in(SettingsPath());
   if (!in) return;
   std::string line;

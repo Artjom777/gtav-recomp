@@ -12,6 +12,8 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
 #endif
 
 namespace gtav::native {
@@ -21,6 +23,13 @@ inline std::filesystem::path ExeDir() {
   wchar_t buf[MAX_PATH];
   DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
   return std::filesystem::path(std::wstring(buf, n)).parent_path();
+#elif defined(__APPLE__)
+  char buf[4096];
+  uint32_t size = sizeof(buf);
+  if (_NSGetExecutablePath(buf, &size) != 0) return std::filesystem::current_path();
+  std::error_code ec;
+  auto exe = std::filesystem::canonical(buf, ec);
+  return ec ? std::filesystem::path(buf).parent_path() : exe.parent_path();
 #else
   std::error_code ec;
   auto exe = std::filesystem::read_symlink("/proc/self/exe", ec);

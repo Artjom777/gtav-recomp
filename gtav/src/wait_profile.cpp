@@ -22,8 +22,12 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
-#include <sys/syscall.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <pthread.h>
+#else
+#include <sys/syscall.h>
+#endif
 #endif
 
 REXCVAR_DEFINE_BOOL(gtav_wait_profile, false, "GTAV",
@@ -72,13 +76,21 @@ ThreadTable& Table() {
     }
     if (t->name.empty()) t->name = fmt::format("t{}", t->tid);
 #else
+    char name[64] = {};
+#ifdef __APPLE__
+    uint64_t tid = 0;
+    pthread_threadid_np(nullptr, &tid);
+    t->tid = long(tid);
+    pthread_getname_np(pthread_self(), name, sizeof(name));
+#else
     t->tid = syscall(SYS_gettid);
-    char path[64], name[32] = {};
+    char path[64];
     std::snprintf(path, sizeof(path), "/proc/self/task/%ld/comm", t->tid);
     if (FILE* f = std::fopen(path, "r")) {
       if (std::fgets(name, sizeof(name), f)) name[std::strcspn(name, "\n")] = 0;
       std::fclose(f);
     }
+#endif
     t->name = name;
 #endif
     std::lock_guard lock(g_tables_mutex);

@@ -55,10 +55,13 @@ if(WIN32)
 else()
     add_executable(gtav ${GTAV_SOURCES})
     # The SDK's Vulkan command processor finds rex_skip_rendering_swap with dlsym.
-    target_link_options(gtav PRIVATE -Wl,--export-dynamic-symbol=rex_skip_rendering_swap
-                        -Wl,--export-dynamic-symbol=rex_skip_rendering_fence
-                        -Wl,--export-dynamic-symbol=rex_skip_rendering_idle
-                        -Wl,--export-dynamic-symbol=rex_skip_rendering_gpu_waiters)
+    # (macOS executables export their global symbols by default.)
+    if(NOT APPLE)
+        target_link_options(gtav PRIVATE -Wl,--export-dynamic-symbol=rex_skip_rendering_swap
+                            -Wl,--export-dynamic-symbol=rex_skip_rendering_fence
+                            -Wl,--export-dynamic-symbol=rex_skip_rendering_idle
+                            -Wl,--export-dynamic-symbol=rex_skip_rendering_gpu_waiters)
+    endif()
 endif()
 
 if(GTAV_GAME_DLL)
@@ -138,6 +141,11 @@ if(NOT GTAV_SDK_COUNTERS)
     endforeach()
 endif()
 
+# The generated registration function (one call per game function, ~100k) takes clang's arm64
+# backend hours (-O3, and GlobalISel at -O0); it runs once at startup: unoptimized, SelectionDAG.
+set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/generated/default/gtav_register.cpp
+                            PROPERTIES COMPILE_OPTIONS "-O0;-fno-global-isel" SKIP_PRECOMPILE_HEADERS ON)
+
 # Profile-guided optimization of the recompiled game code (clang): GTAV_PGO=GENERATE builds an
 # instrumented game (writes LLVM_PROFILE_FILE when it exits normally or on the profile flush); merge
 # the .profraw files with llvm-profdata into GTAV_PGO_PROFILE and build with GTAV_PGO=USE.
@@ -203,6 +211,12 @@ set(GTAV_BLIT_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/native_blit.hl
 set(GTAV_RECTLIST_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/native_rectlist.hlsl)
 set(GTAV_MEMORY_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/native_memory.hlsl)
 set(GTAV_MENU_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/native_menu.hlsl)
+# No dxc for macOS here: copy prebuilt headers (compiled by dxc on Linux) from GTAV_PREBUILT_NATIVE_SHADERS.
+set(GTAV_PREBUILT_NATIVE_SHADERS "" CACHE PATH "Directory of prebuilt native shader headers (skips dxc)")
+if(GTAV_PREBUILT_NATIVE_SHADERS)
+    file(GLOB _gtav_prebuilt ${GTAV_PREBUILT_NATIVE_SHADERS}/*.h)
+    file(COPY ${_gtav_prebuilt} DESTINATION ${GTAV_NATIVE_SHADER_DIR})
+else()
 add_custom_command(
     OUTPUT ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h
     COMMAND ${CMAKE_COMMAND} -E make_directory ${GTAV_NATIVE_SHADER_DIR}
@@ -259,11 +273,12 @@ add_custom_command(
     VERBATIM)
 add_custom_target(gtav_native_shaders DEPENDS ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h)
 add_dependencies(gtav gtav_native_shaders)
+endif()
 target_include_directories(gtav PRIVATE ${GTAV_NATIVE_SHADER_DIR})
 
 # Background shader compiler tools (shader_compiler.cpp; build.cmd copies them on Windows):
 # <exe>/tools/XenosRecomp, dxc (a wrapper that sets the library path) and shader_common.h.
-if(NOT WIN32)
+if(NOT WIN32 AND NOT APPLE)
     set(GTAV_XR_BIN ${CMAKE_CURRENT_SOURCE_DIR}/../build/xenosrecomp/XenosRecomp/XenosRecomp CACHE FILEPATH
         "XenosRecomp binary for the background shader compiler")
     set(GTAV_TOOLS_DIR $<TARGET_FILE_DIR:gtav>/tools)

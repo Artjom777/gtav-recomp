@@ -25,8 +25,8 @@
 #define XXH_INLINE_ALL
 #include <xxhash.h>
 
+#include "safe_read.h"
 #ifndef _WIN32
-#include <sys/uio.h>
 #include <unistd.h>
 #endif
 
@@ -48,7 +48,16 @@ REXCVAR_DEFINE_BOOL(gtav_native_snapshot_draws, false, "GTAV",
 REXCVAR_DEFINE_INT32(gtav_native_fence_lag, 0, "GTAV",
                      "Kicks the game's GPU fence is held back (the real GPU runs behind the CPU; released "
                      "when the command processor idles and at every swap)");
-REXCVAR_DEFINE_BOOL(gtav_native_fence_wait, false, "GTAV",
+// On by default on macOS: the renderer there runs up to a few frames behind (record ~20-33 ms per
+// open-world frame), so the game recycled streamed meshes and textures under queued frames:
+// one-frame exploded geometry, black ground and sky (ow2: ~5 per 1000 frames, 2 in 21000 with the
+// wait, same fps). Linux keeps the copies.
+#ifdef __APPLE__
+#define GTAV_FENCE_WAIT_DEFAULT true
+#else
+#define GTAV_FENCE_WAIT_DEFAULT false
+#endif
+REXCVAR_DEFINE_BOOL(gtav_native_fence_wait, GTAV_FENCE_WAIT_DEFAULT, "GTAV",
                     "The command processor waits at a GPU fence until the renderer recorded the draws before "
                     "it (textures too) when their frame is complete, instead of copying their vertex data");
 REXCVAR_DEFINE_BOOL(gtav_native_fence_copy, true, "GTAV",
@@ -228,9 +237,7 @@ bool SafeCopy(uint32_t phys, uint32_t size, std::vector<uint8_t>& out) {
   std::memcpy(out.data(), REX_KERNEL_MEMORY()->TranslatePhysical(phys), size);
   return true;
 #else
-  iovec local{out.data(), size};
-  iovec remote{const_cast<uint8_t*>(REX_KERNEL_MEMORY()->TranslatePhysical(phys)), size};
-  return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == ssize_t(size);
+  return SafeReadMemory(out.data(), REX_KERNEL_MEMORY()->TranslatePhysical(phys), size);
 #endif
 }
 struct Expected {
@@ -531,8 +538,9 @@ void FenceCopiesRecorded(uint64_t frame) {
     if (frame % 300 == 0) {
       auto& st = g_copy_stats;
       REXLOG_INFO("[native] fence copies per 300 frames: {} draws ({} KB), GPU waited for the renderer {} times "
-                  "({:.1f} ms, {} timeouts), {} queued",
-                  st.copies, st.bytes / 1024, st.waits, st.wait_ms, st.wait_timeouts, g_pending_copies.size());
+                  "({:.1f} ms, {} timeouts), {} queued; packet arenas grew {} times ({} MB moved)",
+                  st.copies, st.bytes / 1024, st.waits, st.wait_ms, st.wait_timeouts, g_pending_copies.size(),
+                  g_arena_grows.exchange(0), g_arena_grow_bytes.exchange(0) >> 20);
       st = {};
     }
   }
@@ -1106,6 +1114,15 @@ void OnCaptureSwap(uint32_t front_buffer) {
   g_packet.index = frame;
   g_packet.front_buffer = front_buffer;
   if (REXCVAR_GET(gtav_native) == "on") NoteGuestSwap(frame);
+  {
+    static size_t max_bytes = 0, max_draws = 0, max_inline = 0;
+    max_bytes = std::max(max_bytes, g_packet.arena.size());
+    max_draws = std::max(max_draws, g_packet.draws.size());
+    if (frame % 300 == 0) {
+      REXLOG_INFO("[native] packets per 300 frames: largest {} KB, most draws {}", max_bytes >> 10, max_draws);
+      max_bytes = max_draws = 0;
+    }
+  }
   Submit(std::move(g_packet));
   g_packet = TakeSpare();
 }

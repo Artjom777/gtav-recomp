@@ -22,10 +22,7 @@
 
 #include "paths.h"
 
-#ifndef _WIN32
-#include <sys/uio.h>
-#include <unistd.h>
-#endif
+#include "safe_read.h"
 
 REXCVAR_DEFINE_BOOL(gtav_d3d_probe, false, "GTAV", "Count calls to every D3D runtime function");
 
@@ -62,8 +59,7 @@ bool SafeRead32(const uint8_t* base, uint32_t addr, uint32_t* out) {
   SIZE_T got = 0;
   if (!ReadProcessMemory(GetCurrentProcess(), base + addr, b, 4, &got) || got != 4) return false;
 #else
-  iovec local{b, 4}, remote{const_cast<uint8_t*>(base) + addr, 4};
-  if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != 4) return false;
+  if (!gtav::native::SafeReadMemory(b, base + addr, 4)) return false;
 #endif
   *out = uint32_t(b[0]) << 24 | b[1] << 16 | b[2] << 8 | b[3];
   return true;

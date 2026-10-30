@@ -116,7 +116,7 @@ index 0a43f07..a9bf21f 100644
                  uint64_t* opt_timeout);
    static X_STATUS SignalAndWait(XObject* signal_object, XObject* wait_object, uint32_t wait_reason,
 diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
-index 20a2cd8..9033d64 100644
+index 20a2cd8..7d0e54d 100644
 --- a/src/audio/sdl/sdl_audio_driver.cpp
 +++ b/src/audio/sdl/sdl_audio_driver.cpp
 @@ -11,7 +11,14 @@
@@ -134,7 +134,7 @@ index 20a2cd8..9033d64 100644
  
  #include <rex/assert.h>
  #include <rex/audio/conversion.h>
-@@ -24,7 +31,27 @@
+@@ -24,7 +31,35 @@
  #include <rex/perf/counter.h>
  #include <SDL3/SDL.h>
  
@@ -155,6 +155,14 @@ index 20a2cd8..9033d64 100644
  REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
 +REXCVAR_DEFINE_BOOL(audio_release_pacing, REX_AUDIO_PACING_DEFAULT, "Audio",
 +                    "Hand consumed frames back to the guest one per 5.3 ms instead of in bursts per device callback");
++#ifdef __APPLE__
++#define REX_AUDIO_FORCE_STEREO_DEFAULT true
++#else
++#define REX_AUDIO_FORCE_STEREO_DEFAULT false
++#endif
++REXCVAR_DEFINE_BOOL(audio_force_stereo, REX_AUDIO_FORCE_STEREO_DEFAULT, "Audio",
++                    "Submit the stereo fold even when the device reports more channels (macOS reports 6 for "
++                    "built-in stereo speakers and its own 5.1 fold drops the centre channel: no dialogue)");
 +REXCVAR_DEFINE_INT32(audio_device_frames, 256, "Audio",
 +                     "Audio device period in samples (0 = SDL default); one guest frame is 256");
 +REXCVAR_DEFINE_STRING(audio_dump_raw, "", "Audio",
@@ -162,7 +170,7 @@ index 20a2cd8..9033d64 100644
  
  namespace rex::audio::sdl {
  
-@@ -39,6 +66,12 @@ SDLAudioDriver::~SDLAudioDriver() {
+@@ -39,6 +74,12 @@ SDLAudioDriver::~SDLAudioDriver() {
  bool SDLAudioDriver::Initialize() {
    // Set audio category for proper OS audio handling
    SDL_SetHint(SDL_HINT_AUDIO_CATEGORY, "playback");
@@ -175,7 +183,16 @@ index 20a2cd8..9033d64 100644
  
    // Set app name for audio device identification
    SDL_SetAppMetadataProperty(SDL_PROP_APP_METADATA_NAME_STRING, "rexglue");
-@@ -106,9 +139,50 @@ bool SDLAudioDriver::Initialize() {
+@@ -75,7 +116,7 @@ bool SDLAudioDriver::Initialize() {
+ 
+   // A 1-channel device gets the stereo fold too, then SDL collapses to mono.
+   // Handing it a 6ch stream instead would use SDL's own downmix.
+-  if (obtained_spec.channels <= 2) {
++  if (obtained_spec.channels <= 2 || REXCVAR_GET(audio_force_stereo)) {
+     SDL_DestroyAudioStream(sdl_stream_);
+     sdl_stream_ = nullptr;
+     desired_spec.channels = 2;
+@@ -106,9 +147,50 @@ bool SDLAudioDriver::Initialize() {
      return false;
    }
  
@@ -226,7 +243,7 @@ index 20a2cd8..9033d64 100644
  void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
    const auto input_frame = memory_->TranslateVirtual<float*>(frame_ptr);
    float* output_frame;
-@@ -139,6 +213,10 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
+@@ -139,6 +221,10 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
  }
  
  void SDLAudioDriver::Shutdown() {
@@ -237,7 +254,7 @@ index 20a2cd8..9033d64 100644
    if (sdl_stream_) {
      SDL_DestroyAudioStream(sdl_stream_);
      sdl_stream_ = nullptr;
-@@ -158,6 +236,58 @@ void SDLAudioDriver::Shutdown() {
+@@ -158,6 +244,58 @@ void SDLAudioDriver::Shutdown() {
    }
  }
  
@@ -296,7 +313,7 @@ index 20a2cd8..9033d64 100644
  void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int additional_amount,
                                   [[maybe_unused]] int total_amount) {
    SCOPE_profile_cpu_f("apu");
-@@ -178,15 +308,26 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+@@ -178,15 +316,26 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
    const StereoFold fold = GetStereoFold();
    const SurroundMix mix = GetSurroundMix();
    const float gain = GetOutputGain();
@@ -323,7 +340,7 @@ index 20a2cd8..9033d64 100644
        if (!SDL_PutAudioStreamData(stream, data, len)) {
          REXAPU_ERROR("SDL_PutAudioStreamData() failed while filling silence: {}", SDL_GetError());
          break;
-@@ -195,9 +336,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+@@ -195,9 +344,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
      } else {
        auto buffer = driver->frames_queued_.front();
        driver->frames_queued_.pop();
@@ -334,7 +351,7 @@ index 20a2cd8..9033d64 100644
          switch (driver->sdl_device_channels_) {
            case 2:
              conversion::sequential_6_BE_to_interleaved_2_LE(data, buffer, channel_samples_, fold,
-@@ -211,6 +350,8 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+@@ -211,6 +358,8 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
              assert_unhandled_case(driver->sdl_device_channels_);
              break;
          }
@@ -343,7 +360,7 @@ index 20a2cd8..9033d64 100644
        }
        if (!SDL_PutAudioStreamData(stream, data, len)) {
          REXAPU_ERROR("SDL_PutAudioStreamData() failed: {}", SDL_GetError());
-@@ -219,8 +360,12 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+@@ -219,8 +368,12 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
        }
        driver->frames_unused_.push(buffer);
  
@@ -560,10 +577,21 @@ index cbdd7f7..6b9067c 100644
    return true;
  }
 diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
-index 9ac8d15..f5ba30f 100644
+index 9ac8d15..07992ab 100644
 --- a/src/core/threading_posix.cpp
 +++ b/src/core/threading_posix.cpp
-@@ -50,6 +50,8 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+@@ -41,6 +41,10 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+ #include <rex/thread/timer_queue.h>
+ 
+ #include <sched.h>
++#if defined(__APPLE__)
++#include <pthread/qos.h>
++#endif
++#include <string>
+ 
+ #if REX_PLATFORM_ANDROID
+ #include <dlfcn.h>
+@@ -50,6 +54,8 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
  #endif
  
  #if REX_PLATFORM_LINUX
@@ -572,7 +600,7 @@ index 9ac8d15..f5ba30f 100644
  // SIGEV_THREAD_ID in timer_create(...) is a Linux extension
  #define REX_HAS_SIGEV_THREAD_ID 1
  #ifdef __GLIBC__
-@@ -267,8 +269,33 @@ static sem_t* RexCreateAnonymousSemaphore() {
+@@ -267,8 +273,33 @@ static sem_t* RexCreateAnonymousSemaphore() {
  }
  #endif  // __APPLE__
  
@@ -606,7 +634,7 @@ index 9ac8d15..f5ba30f 100644
    PosixConditionBase() {
  #if REX_PLATFORM_LINUX
      // Use robust mutexes so waits can recover if owner thread terminates.
-@@ -330,12 +357,28 @@ class PosixConditionBase {
+@@ -330,12 +361,28 @@ class PosixConditionBase {
        return std::make_pair(result, 0);
      }
  
@@ -635,7 +663,7 @@ index 9ac8d15..f5ba30f 100644
        size_t first_signaled = std::numeric_limits<size_t>::max();
        bool condition_met = false;
        bool all_locked = true;
-@@ -411,6 +454,19 @@ class PosixConditionBase {
+@@ -411,6 +458,19 @@ class PosixConditionBase {
          return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
        }
  
@@ -655,7 +683,7 @@ index 9ac8d15..f5ba30f 100644
        if (timeout == std::chrono::milliseconds::max()) {
          std::this_thread::sleep_for(std::chrono::milliseconds(1));
        } else {
-@@ -418,6 +474,7 @@ class PosixConditionBase {
+@@ -418,6 +478,7 @@ class PosixConditionBase {
          auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
          std::this_thread::sleep_for(sleep_time);
        }
@@ -663,7 +691,7 @@ index 9ac8d15..f5ba30f 100644
      }
    }
  
-@@ -450,6 +507,7 @@ class PosixCondition<Event> : public PosixConditionBase {
+@@ -450,6 +511,7 @@ class PosixCondition<Event> : public PosixConditionBase {
      auto lock = std::unique_lock<std::mutex>(mutex_);
      signal_ = true;
      cond_.notify_all();
@@ -671,7 +699,7 @@ index 9ac8d15..f5ba30f 100644
      return true;
    }
  
-@@ -487,6 +545,7 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
+@@ -487,6 +549,7 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
      }
      count_ += release_count;
      cond_.notify_all();
@@ -679,7 +707,7 @@ index 9ac8d15..f5ba30f 100644
      return true;
    }
  
-@@ -519,6 +578,7 @@ class PosixCondition<Mutant> : public PosixConditionBase {
+@@ -519,6 +582,7 @@ class PosixCondition<Mutant> : public PosixConditionBase {
        // Free to be acquired by another thread
        if (count_ == 0) {
          cond_.notify_all();
@@ -687,7 +715,7 @@ index 9ac8d15..f5ba30f 100644
        }
        return true;
      }
-@@ -551,6 +611,7 @@ class PosixCondition<Timer> : public PosixConditionBase {
+@@ -551,6 +615,7 @@ class PosixCondition<Timer> : public PosixConditionBase {
      std::lock_guard<std::mutex> lock(mutex_);
      signal_ = true;
      cond_.notify_all();
@@ -695,7 +723,7 @@ index 9ac8d15..f5ba30f 100644
      return true;
    }
  
-@@ -979,6 +1040,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -979,6 +1044,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
        exit_code_ = exit_code;
        signaled_ = true;
        cond_.notify_all();
@@ -703,7 +731,22 @@ index 9ac8d15..f5ba30f 100644
      }
      if (is_current_thread) {
        pthread_exit(reinterpret_cast<void*>(exit_code));
-@@ -1449,6 +1511,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+@@ -1405,6 +1471,14 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+   }
+ #endif
+   set_current_thread_name("");
++#if defined(__APPLE__)
++  // Without a QoS class the scheduler may run guest threads on the efficiency cores (a process
++  // started from a shell in the background has no app to inherit one from). REX_THREAD_QOS=0: off.
++  {
++    static const bool qos = !getenv("REX_THREAD_QOS") || std::string(getenv("REX_THREAD_QOS")) != "0";
++    if (qos) pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
++  }
++#endif
+ 
+   auto start_data = static_cast<ThreadStartData*>(parameter);
+   assert_not_null(start_data);
+@@ -1449,6 +1523,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
      thread->handle_.exit_code_ = 0;
      thread->handle_.signaled_ = true;
      thread->handle_.cond_.notify_all();
@@ -712,7 +755,7 @@ index 9ac8d15..f5ba30f 100644
  
    current_thread_ = nullptr;
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index a744375..f5e6ae2 100644
+index a744375..a30f459 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
 @@ -10,11 +10,21 @@
@@ -965,6 +1008,20 @@ index a744375..f5e6ae2 100644
    auto shader = LoadShader(shader_type, uint32_t(reader->read_ptr()),
                             reinterpret_cast<uint32_t*>(reader->read_ptr()), size_dwords);
    switch (shader_type) {
+@@ -1594,11 +1727,11 @@ bool CommandProcessor::ExecutePacketType3_VIZ_QUERY(memory::RingBuffer* reader,
+     // On hardware this clears the internal state of the scan converter (which
+     // is different to the register)
+     WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, VIZQUERY_START);
+-    REXGPU_INFO("Begin viz query ID {:02X}", id);
++    REXGPU_DEBUG("Begin viz query ID {:02X}", id);
+   } else {
+     // end the viz query
+     WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, VIZQUERY_END);
+-    REXGPU_INFO("End viz query ID {:02X}", id);
++    REXGPU_DEBUG("End viz query ID {:02X}", id);
+     // The scan converter writes the internal result back to the register here.
+     // We just fake it and say it was visible in case it is read back.
+     if (id < 32) {
 diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
 index 19874a5..1c2dada 100644
 --- a/src/graphics/d3d12/command_processor.cpp
@@ -1182,7 +1239,7 @@ index a53a222..087fada 100644
 +  return true;
 +}
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 001f36b..48c679c 100644
+index 001f36b..0a6a909 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -10,6 +10,7 @@
@@ -1235,7 +1292,18 @@ index 001f36b..48c679c 100644
  REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
                      "Read render-to-texture results on the CPU")
      .lifecycle(rex::cvar::Lifecycle::kHotReload);
-@@ -2275,7 +2304,13 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+@@ -1066,6 +1095,10 @@ bool VulkanCommandProcessor::SetupContext() {
+     shared_memory_descriptor_buffer_info.buffer = shared_memory_->buffer();
+     shared_memory_descriptor_buffer_info.offset = shared_memory_binding_range * i;
+     shared_memory_descriptor_buffer_info.range = shared_memory_binding_range;
++    if (REXCVAR_GET(gpu_skip_rendering)) {  // the token buffer (VulkanSharedMemory::Initialize)
++      shared_memory_descriptor_buffer_info.offset = 0;
++      shared_memory_descriptor_buffer_info.range = VK_WHOLE_SIZE;
++    }
+   }
+   VkWriteDescriptorSet write_descriptor_sets[2];
+   VkWriteDescriptorSet& write_descriptor_set_shared_memory = write_descriptor_sets[0];
+@@ -2275,7 +2308,13 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
    vertex_buffers_in_sync_[0] = 0;
    vertex_buffers_in_sync_[1] = 0;
  
@@ -1250,7 +1318,7 @@ index 001f36b..48c679c 100644
      return;
    ui::Presenter* presenter = graphics_system_->presenter();
    if (!presenter) {
-@@ -3594,8 +3629,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3594,8 +3633,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    SCOPE_profile_cpu_f("gpu");
  #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
  
@@ -1263,7 +1331,7 @@ index 001f36b..48c679c 100644
    auto draw_fail = [&](const char* stage) {
      auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
      REXGPU_ERROR(
-@@ -4385,6 +4424,9 @@ bool VulkanCommandProcessor::IssueCopy() {
+@@ -4385,6 +4428,9 @@ bool VulkanCommandProcessor::IssueCopy() {
  #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
    SCOPE_profile_cpu_f("gpu");
  #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -1273,7 +1341,7 @@ index 001f36b..48c679c 100644
  
    if (!BeginSubmission(true)) {
      return false;
-@@ -4400,6 +4442,64 @@ bool VulkanCommandProcessor::IssueCopy() {
+@@ -4400,6 +4446,64 @@ bool VulkanCommandProcessor::IssueCopy() {
    return IssueCopy_ReadbackResolvePath();
  }
  
@@ -1338,7 +1406,7 @@ index 001f36b..48c679c 100644
  bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
    const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
-@@ -4682,6 +4782,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
+@@ -4682,6 +4786,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
      uint8_t* destination = memory_->TranslatePhysical(written_address);
      if (destination) {
        std::memcpy(destination, readback.mapped_data[read_index], written_length);
@@ -1365,6 +1433,32 @@ index 0298f06..b3355e9 100644
      switch (mode.output) {
        case TransferOutput::kColor: {
          // Unless a special path was taken, unpack the raw 32bpp value into the
+diff --git a/src/graphics/vulkan/shared_memory.cpp b/src/graphics/vulkan/shared_memory.cpp
+index 6788214..dbe172a 100644
+--- a/src/graphics/vulkan/shared_memory.cpp
++++ b/src/graphics/vulkan/shared_memory.cpp
+@@ -23,6 +23,9 @@
+ #include <rex/math.h>
+ #include <rex/ui/vulkan/util.h>
+ 
++REXCVAR_DECLARE(bool, gpu_skip_rendering);
++REXCVAR_DEFINE_BOOL(vulkan_skip_rendering_small_shared_memory, true, "GPU/Vulkan",
++                    "With gpu_skip_rendering, a 1 MB shared memory buffer instead of 512 MB");
+ REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
+                     "Use sparse shared memory on Vulkan")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+@@ -56,6 +59,11 @@ bool VulkanSharedMemory::Initialize() {
+   buffer_create_info.pNext = nullptr;
+   buffer_create_info.flags = sparse_flags;
+   buffer_create_info.size = kBufferSize;
++  // A title-side renderer (gpu_skip_rendering) never draws through this buffer: a token 1 MB
++  // instead of 512 MB of GPU memory (8 GB Macs swap with it).
++  if (REXCVAR_GET(gpu_skip_rendering) && REXCVAR_GET(vulkan_skip_rendering_small_shared_memory)) {
++    buffer_create_info.size = 1 << 20;
++  }
+   buffer_create_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+   buffer_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
 index 813bb1c..bf17297 100644
 --- a/src/input/input_system.cpp
