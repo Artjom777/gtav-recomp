@@ -60,6 +60,10 @@ REXCVAR_DEFINE_INT32(gtav_native_fence_lag, 0, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_native_fence_wait, GTAV_FENCE_WAIT_DEFAULT, "GTAV",
                     "The command processor waits at a GPU fence until the renderer recorded the draws before "
                     "it (textures too) when their frame is complete, instead of copying their vertex data");
+REXCVAR_DEFINE_BOOL(gtav_native_fence_wait_draw, false, "GTAV",
+                    "Experiment, with --gtav_native_fence_wait: wait only until the draw before the fence is "
+                    "recorded, not its whole frame (the command processor then reaches the fences of the frame "
+                    "still being built and copies ~3x more draw data: no gain measured, Mac swapping)");
 REXCVAR_DEFINE_BOOL(gtav_native_fence_copy, true, "GTAV",
                     "Copy a draw's vertex and index data when the GPU fence after it is reached before the "
                     "frame was recorded (the game may reuse that memory from then on)");
@@ -421,12 +425,30 @@ struct PendingCopy {
   StreamBinding streams[kMaxStreams];
 };
 struct FenceCopy {
-  std::vector<uint8_t> bytes;
-  DrawCommand d;  // snap_* offsets into bytes
+  DrawCommand d;  // snap_* offsets into the frame's g_fence_arenas entry
 };
+// One arena per frame for its fence copies, handed to the packet whole (ApplyFenceCopies swaps it
+// in): the copies were vectors of their own, moved into the packet's arena again on the render
+// thread (3-5 MB a frame in the open world: ~13% of that thread). Spares keep their capacity.
+static std::map<uint64_t, ByteArena> g_fence_arenas;
+static std::vector<ByteArena> g_spare_fence_arenas;
 static std::mutex g_copy_mutex;
 static std::condition_variable g_copy_cv;
 static std::deque<PendingCopy> g_pending_copies;
+// Draws are queued here by the game's render thread under a lock of their own: g_copy_mutex is
+// held by the command processor through its copies and waits (the game's D3D thread spent ~16% of
+// its time blocked on it). Moved into g_pending_copies (DrainIncomingCopies) under g_copy_mutex.
+static std::mutex g_incoming_mutex;
+static std::vector<PendingCopy> g_incoming_copies, g_incoming_spare;
+static void DrainIncomingCopies() {  // g_copy_mutex held
+  {
+    std::lock_guard lock(g_incoming_mutex);
+    if (g_incoming_copies.empty()) return;
+    std::swap(g_incoming_copies, g_incoming_spare);
+  }
+  for (const auto& p : g_incoming_spare) g_pending_copies.push_back(p);
+  g_incoming_spare.clear();
+}
 static std::map<std::pair<uint64_t, uint32_t>, FenceCopy> g_fence_copies;  // (frame, draw)
 static uint64_t g_copy_floor = 0;           // frames below this were recorded
 static uint64_t g_recording = ~0ull;        // frame being recorded
@@ -441,6 +463,7 @@ static struct {
 
 static void FenceReached(uint32_t value) {
   std::unique_lock lock(g_copy_mutex);
+  DrainIncomingCopies();
   while (!g_pending_copies.empty() && int32_t(value - g_pending_copies.front().fence) >= 0) {
     const PendingCopy& p = g_pending_copies.front();
     if (p.frame < g_copy_floor) {
@@ -475,6 +498,38 @@ static void FenceReached(uint32_t value) {
       if (!reached) break;
       continue;  // re-evaluate the front: it may have been recorded and popped meanwhile
     }
+    if (REXCVAR_GET(gtav_native_fence_wait) && REXCVAR_GET(gtav_native_fence_wait_draw) &&
+        p.frame < g_frame.load(std::memory_order_relaxed)) {
+      // Until this draw is recorded (it read its vertices, indices and textures then), not until
+      // its whole frame is: the later draws' fences hold the game off their memory meanwhile.
+      // (Waiting for the whole frame cost the game ~8 ms a frame in the open world.)
+      uint64_t frame = p.frame;
+      uint32_t draw = p.draw;
+      auto start = std::chrono::steady_clock::now();
+      g_copy_stats.waits++;
+      auto recorded = [&] {
+        return g_recording == frame && g_recorded_draws.load(std::memory_order_acquire) > draw;
+      };
+      bool reached = false;
+      while (!(reached = g_copy_floor > frame || recorded())) {
+        if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(100)) break;
+        if (g_recording == frame) {
+          lock.unlock();
+          std::this_thread::sleep_for(std::chrono::microseconds(50));
+          lock.lock();
+        } else {
+          g_copy_cv.wait_for(lock, std::chrono::milliseconds(1));  // until its recording starts
+        }
+      }
+      g_copy_stats.wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+      if (!reached) {
+        g_copy_stats.wait_timeouts++;
+        if (frame != g_recording) goto copy;  // (the game waits on its own frame): copy
+        break;
+      }
+      if (recorded()) g_pending_copies.pop_front();
+      continue;  // a finished frame's entries are popped at the top
+    }
     if (p.frame == g_recording ||
         (REXCVAR_GET(gtav_native_fence_wait) && p.frame < g_frame.load(std::memory_order_relaxed))) {
       uint64_t frame = p.frame;
@@ -490,19 +545,33 @@ static void FenceReached(uint32_t value) {
       continue;
     }
   copy:
-    FenceCopy c;
-    c.d.indexed = p.indexed, c.d.index32 = p.index32, c.d.base_vertex = p.base_vertex;
-    c.d.start = p.start, c.d.count = p.count, c.d.index_address = p.index_address, c.d.index_size = p.index_size;
-    std::copy(std::begin(p.streams), std::end(p.streams), c.d.streams);
-    SnapshotDrawData(c.d, [&](const uint8_t* data, uint32_t size) {
-      uint32_t at = uint32_t(c.bytes.size());
-      c.bytes.insert(c.bytes.end(), data, data + size);
-      return at;
-    });
-    if (c.d.snap_vertices) {
-      g_copy_stats.copies++;
-      g_copy_stats.bytes += c.bytes.size();
-      g_fence_copies[{p.frame, p.draw}] = std::move(c);
+    {
+      FenceCopy c;
+      c.d.indexed = p.indexed, c.d.index32 = p.index32, c.d.base_vertex = p.base_vertex;
+      c.d.start = p.start, c.d.count = p.count, c.d.index_address = p.index_address, c.d.index_size = p.index_size;
+      std::copy(std::begin(p.streams), std::end(p.streams), c.d.streams);
+      auto found = g_fence_arenas.find(p.frame);
+      if (found == g_fence_arenas.end()) {
+        found = g_fence_arenas.emplace(p.frame, ByteArena{}).first;
+        if (!g_spare_fence_arenas.empty()) {
+          found->second = std::move(g_spare_fence_arenas.back());
+          g_spare_fence_arenas.pop_back();
+        }
+      }
+      ByteArena& arena = found->second;
+      const size_t before = arena.size();
+      SnapshotDrawData(c.d, [&](const uint8_t* data, uint32_t size) {
+        uint32_t at = uint32_t(arena.size());
+        std::memcpy(arena.Grow(size), data, size);
+        return at;
+      });
+      if (c.d.snap_vertices) {
+        g_copy_stats.copies++;
+        g_copy_stats.bytes += arena.size() - before;
+        g_fence_copies[{p.frame, p.draw}] = std::move(c);
+      } else {
+        arena.Shrink(arena.size() - before);
+      }
     }
     g_pending_copies.pop_front();
   }
@@ -512,17 +581,26 @@ void ApplyFenceCopies(FramePacket& f) {
   std::lock_guard lock(g_copy_mutex);
   g_recording = f.index;
   g_recorded_draws.store(0, std::memory_order_release);
+  // This frame's arena becomes the packet's; the packet's previous one (and those of frames that
+  // were never recorded) go back to the spares.
+  f.fence_arena.clear();
+  for (auto it = g_fence_arenas.begin(); it != g_fence_arenas.end() && it->first <= f.index;
+       it = g_fence_arenas.erase(it)) {
+    if (it->first == f.index) std::swap(f.fence_arena, it->second);
+    it->second.clear();
+    if (g_spare_fence_arenas.size() < 4) g_spare_fence_arenas.push_back(std::move(it->second));
+  }
+  constexpr uint32_t kFenceBit = FramePacket::kFenceBit;
   for (auto it = g_fence_copies.begin(); it != g_fence_copies.end() && it->first.first <= f.index;
        it = g_fence_copies.erase(it)) {
     if (it->first.first != f.index || it->first.second >= f.draws.size()) continue;
     DrawCommand& d = f.draws[it->first.second];
     const FenceCopy& c = it->second;
     if (d.snap_vertices) continue;
-    uint32_t base = f.Push(c.bytes.data(), uint32_t(c.bytes.size()));
     d.snap_first = c.d.snap_first;
     d.snap_vertices = c.d.snap_vertices;
-    for (uint32_t s = 0; s < kMaxStreams; s++) d.snap_stream[s] = c.d.snap_stream[s] + base;
-    d.snap_index = c.d.snap_index + base;
+    for (uint32_t s = 0; s < kMaxStreams; s++) d.snap_stream[s] = c.d.snap_stream[s] | kFenceBit;
+    d.snap_index = c.d.snap_index | kFenceBit;
     d.snap_index_size = c.d.snap_index_size;
   }
 }
@@ -534,6 +612,7 @@ void FenceCopiesRecorded(uint64_t frame) {
     std::lock_guard lock(g_copy_mutex);
     g_recording = ~0ull;
     g_copy_floor = frame + 1;
+    DrainIncomingCopies();
     while (!g_pending_copies.empty() && g_pending_copies.front().frame <= frame) g_pending_copies.pop_front();
     if (frame % 300 == 0) {
       auto& st = g_copy_stats;
@@ -691,8 +770,8 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
     PendingCopy p{GuestFrame(), uint32_t(g_packet.draws.size()), be32(dev + kDevFence), d.indexed, d.index32,
                   d.base_vertex, d.start, d.count, d.index_address, d.index_size, {}};
     std::copy(std::begin(d.streams), std::end(d.streams), p.streams);
-    std::lock_guard lock(g_copy_mutex);
-    g_pending_copies.push_back(p);
+    std::lock_guard lock(g_incoming_mutex);
+    g_incoming_copies.push_back(p);
   }
   g_packet.commands.push_back({CommandKind::kDraw, uint32_t(g_packet.draws.size()), WritePointer(device)});
   g_packet.draws.push_back(d);

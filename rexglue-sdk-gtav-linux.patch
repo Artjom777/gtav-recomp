@@ -13,6 +13,21 @@ index 9b3cdf5..c03fff2 100644
  elseif(UNIX AND NOT APPLE)
      if(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
          set(REX_PLATFORM "linux-amd64")
+diff --git a/CMakePresets.json b/CMakePresets.json
+index 622b924..2193531 100644
+--- a/CMakePresets.json
++++ b/CMakePresets.json
+@@ -99,8 +99,8 @@
+             "hidden": true,
+             "inherits": "mac-base",
+             "cacheVariables": {
+-                "CMAKE_C_FLAGS": "-march=armv8-a",
+-                "CMAKE_CXX_FLAGS": "-march=armv8-a",
++                "CMAKE_C_FLAGS": "-mcpu=apple-m1",
++                "CMAKE_CXX_FLAGS": "-mcpu=apple-m1",
+                 "CMAKE_OSX_ARCHITECTURES": "arm64"
+             }
+         },
 diff --git a/include/rex/audio/sdl/sdl_audio_driver.h b/include/rex/audio/sdl/sdl_audio_driver.h
 index f8949ca..32ce942 100644
 --- a/include/rex/audio/sdl/sdl_audio_driver.h
@@ -906,7 +921,7 @@ index ef5bdf4..7a6cf2e 100644
 +
  }  // namespace rex
 diff --git a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
-index b52bf39..d84a12c 100644
+index b52bf39..1d25fcf 100644
 --- a/src/core/memory_posix.cpp
 +++ b/src/core/memory_posix.cpp
 @@ -51,10 +51,7 @@
@@ -992,6 +1007,17 @@ index b52bf39..d84a12c 100644
  #else
    int oflag;
    switch (access) {
+@@ -483,6 +445,10 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
+     shm_unlink(full_path.c_str());
+     return kFileMappingHandleInvalid;
+   }
++  // Nothing opens the object by name again: unlink it now, so its memory goes with the last fd and
++  // mapping. Unlinked only at a clean shutdown, every killed or crashed run left its guest memory
++  // behind until reboot (it filled 30 GB of swap on an 8 GB Mac).
++  shm_unlink(full_path.c_str());
+   return static_cast<FileMappingHandle>(ret);
+ #endif
+ }
 diff --git a/src/core/seh_posix.cpp b/src/core/seh_posix.cpp
 index 5e0a932..cd75b74 100644
 --- a/src/core/seh_posix.cpp
@@ -1355,6 +1381,44 @@ index 9ac8d15..4f692bc 100644
    }
  
    current_thread_ = nullptr;
+diff --git a/src/core/timer_queue.cpp b/src/core/timer_queue.cpp
+index 5cfea05..6ca9d62 100644
+--- a/src/core/timer_queue.cpp
++++ b/src/core/timer_queue.cpp
+@@ -15,7 +15,7 @@
+ #include <disruptorplus/multi_threaded_claim_strategy.hpp>
+ #include <disruptorplus/ring_buffer.hpp>
+ #include <disruptorplus/sequence_barrier.hpp>
+-#include <disruptorplus/spin_wait_strategy.hpp>
++#include <disruptorplus/blocking_wait_strategy.hpp>
+ 
+ #include <rex/assert.h>
+ #include <rex/thread.h>
+@@ -69,7 +69,8 @@ class TimerQueue {
+         // Consume new wait items and add them to sorted wait queue
+         dp::sequence_t available = claim_strategy_.wait_until_published(
+             next_sequence, next_sequence - 1,
+-            wait_queue_.empty() ? clock::time_point::max() : wait_queue_.front()->due_);
++            // (not time_point::max(): a condition variable's timed wait can overflow on it)
++            wait_queue_.empty() ? clock::now() + std::chrono::seconds(1) : wait_queue_.front()->due_);
+ 
+         // Check for timeout
+         if (available != next_sequence - 1) {
+@@ -142,9 +143,11 @@ class TimerQueue {
+   // This ring buffer will be used to introduce timers queued by the public API
+   static constexpr size_t kWaitCount = 512;
+   dp::ring_buffer<std::shared_ptr<WaitItem>> buffer_;
+-  dp::spin_wait_strategy wait_strategy_;
+-  dp::multi_threaded_claim_strategy<dp::spin_wait_strategy> claim_strategy_;
+-  dp::sequence_barrier<dp::spin_wait_strategy> consumed_;
++  // Blocking, not spin: the spin strategy yielded in a loop while idle (~30% of a core on an M1,
++  // plus a sysctl per spin_wait for hardware_concurrency).
++  dp::blocking_wait_strategy wait_strategy_;
++  dp::multi_threaded_claim_strategy<dp::blocking_wait_strategy> claim_strategy_;
++  dp::sequence_barrier<dp::blocking_wait_strategy> consumed_;
+ 
+   // This is a _sorted_ (ascending due_) list of active timers managed by a
+   // dedicated thread
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
 index a744375..a30f459 100644
 --- a/src/graphics/command_processor.cpp
@@ -2695,6 +2759,38 @@ index f102b56..cf06f7a 100644
  target_include_directories(imgui PUBLIC
      $<BUILD_INTERFACE:${IMGUI_DIR}>
      $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+diff --git a/thirdparty/disruptorplus/include/disruptorplus/blocking_wait_strategy.hpp b/thirdparty/disruptorplus/include/disruptorplus/blocking_wait_strategy.hpp
+index 32d427d..23fd3e1 100644
+--- a/thirdparty/disruptorplus/include/disruptorplus/blocking_wait_strategy.hpp
++++ b/thirdparty/disruptorplus/include/disruptorplus/blocking_wait_strategy.hpp
+@@ -118,11 +118,11 @@ namespace disruptorplus
+                 std::unique_lock<std::mutex> lock(m_mutex);
+                 m_cv.wait_for(
+                     lock,
++                    timeout,
+                     [&]() -> bool {
+                         result = minimum_sequence_after(sequence, count, sequences);
+                         return difference(result, sequence) >= 0;
+-                    },
+-                    timeout);
++                    });
+             }
+             return result;
+         }
+@@ -171,11 +171,11 @@ namespace disruptorplus
+                 std::unique_lock<std::mutex> lock(m_mutex);
+                 m_cv.wait_until(
+                     lock,
++                    timeoutTime,
+                     [&]() -> bool {
+                         result = minimum_sequence_after(sequence, count, sequences);
+                         return difference(result, sequence) >= 0;
+-                    },
+-                    timeoutTime);
++                    });
+             }
+             return result;
+         }
 diff --git a/thirdparty/imgui_rex_config.h b/thirdparty/imgui_rex_config.h
 new file mode 100644
 index 0000000..0fdc5e9
