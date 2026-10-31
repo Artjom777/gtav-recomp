@@ -48,6 +48,10 @@ bool CheckGameFolder(const std::filesystem::path& home, std::wstring* error);
 // package into the game folder when they changed. Run before every launch.
 bool SyncRuntime(const std::filesystem::path& root, const std::filesystem::path& home,
                  std::wstring* error);
+// iPhone: from the installed game folder, <home>/iphone/GTAV.ipa (the package's iOS shell with
+// gtav_game.dylib built for iOS) and <home>/iphone/Documents (args.txt, spirv/) for the phone.
+bool RunIphoneBuild(const std::filesystem::path& root, const std::filesystem::path& home, InstallUi& ui,
+                    std::wstring* error);
 #endif
 
 }  // namespace loader

@@ -83,11 +83,13 @@ def thin(path):
         subprocess.run(["lipo", str(path), "-thin", "arm64", "-output", str(path)], check=True)
 
 
-def check_macho(out):
+def check_macho(out, ios_dir=None):
     bad = []
     for p in sorted(out.rglob("*")):
         if not p.is_file() or p.is_symlink() or not is_macho(p):
             continue
+        if ios_dir and ios_dir in p.parents:
+            continue  # check_ios_shell
         libs = subprocess.run(["otool", "-L", str(p)], capture_output=True, text=True).stdout
         for line in libs.splitlines()[1:]:
             lib = line.strip().split(" (")[0]
@@ -108,6 +110,40 @@ def check_macho(out):
         sys.exit("shipped binaries that would fail on players' Macs:\n" + "\n".join(bad))
 
 
+# The iOS shell (tools/ios/make_shell.sh): everything next to the exe; the game library is made by
+# the player's Mac (install.cpp RunIphone).
+IOS_LIBS = {"@rpath/librexruntime.dylib", "@rpath/librexgpu-xenos.dylib", "@rpath/libMoltenVK.dylib",
+            "@rpath/gtav_game.dylib"}
+
+
+def check_ios_shell(app):
+    bad = []
+    for p in sorted(app.rglob("*")):
+        if not p.is_file() or not is_macho(p):
+            continue
+        cmds = subprocess.run(["otool", "-l", str(p)], capture_output=True, text=True).stdout
+        if "platform 2" not in cmds:
+            bad.append(f"{p.name} is not an iOS binary")
+        libs = subprocess.run(["otool", "-L", str(p)], capture_output=True, text=True).stdout
+        for line in libs.splitlines()[1:]:
+            lib = line.strip().split(" (")[0]
+            if lib.startswith(("/usr/lib/", "/System/Library/")) or lib in IOS_LIBS or lib == f"@rpath/{p.name}":
+                continue
+            bad.append(f"ios/{p.name} needs {lib}")
+        for line in cmds.splitlines():
+            line = line.strip()
+            if line.startswith("path /") or line.startswith("name /Users"):
+                bad.append(f"ios/{p.name} has an absolute path: {line}")
+        minos = [l.split()[1] for l in cmds.splitlines() if l.strip().startswith("minos ")]
+        if minos and tuple(int(x) for x in minos[0].split(".")[:2]) > (17, 0):
+            bad.append(f"ios/{p.name} needs iOS {minos[0]} (build for 17.0)")
+    if subprocess.run(["otool", "-L", str(app / "gtav")], capture_output=True, text=True).stdout.count(
+            "@rpath/gtav_game.dylib") != 1:
+        bad.append("ios/gtav is not the shell build (it must load gtav_game.dylib)")
+    if bad:
+        sys.exit("iOS shell problems:\n" + "\n".join(bad))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out")
@@ -116,6 +152,7 @@ def main():
     ap.add_argument("--licenses", required=True)
     ap.add_argument("--sdk", default=str(SDK / "out" / "install" / "mac-arm64"))
     ap.add_argument("--zip", action="store_true")
+    ap.add_argument("--ios-shell", help="folder holding GTAV.app from tools/ios/make_shell.sh (the iPhone step)")
     ap.add_argument("--allow-newer-os", action="store_true", help="skip the macOS 15 floor check (testing)")
     a = ap.parse_args()
     sdk_install = Path(a.sdk)
@@ -176,6 +213,15 @@ def main():
                     ("gtav_fast", "librexruntime.dylib", "librexgpu-xenos.dylib", "libTracyClient.dylib",
                      "rexglue", "tools/shaders/XenosRecomp")], check=True, capture_output=True)
 
+    ios_dir = None
+    if a.ios_shell:
+        ios_dir = pkg / "ios" / "GTAV.app"
+        shutil.copytree(Path(a.ios_shell) / "GTAV.app", ios_dir)
+        copy(REPO / "tools" / "game_dll" / "libSystem_ios.tbd", pkg / "tools/game_dll/libSystem_ios.tbd")
+        subprocess.run(["strip", "-S", "-x", str(ios_dir / "gtav"), str(ios_dir / "librexruntime.dylib"),
+                        str(ios_dir / "librexgpu-xenos.dylib")], check=True, capture_output=True)
+        check_ios_shell(ios_dir)
+
     llvm = Path(a.llvm)
     copy(llvm / "bin" / "clang-19", pkg / "tools/llvm/bin/clang++", True)
     copy(llvm / "bin" / "lld", pkg / "tools/llvm/bin/ld64.lld", True)  # lld picks Mach-O from the name
@@ -204,7 +250,7 @@ def main():
     shutil.copytree(lic, app / "Contents" / "Resources" / "LICENSES")
 
     if not a.allow_newer_os:
-        check_macho(app)
+        check_macho(app, ios_dir)
     bad = [p for p in out.rglob("*") if p.is_file() and p.suffix.lower() in FORBIDDEN_EXT]
     if bad:
         sys.exit("forbidden files in release:\n" + "\n".join(str(p) for p in bad))

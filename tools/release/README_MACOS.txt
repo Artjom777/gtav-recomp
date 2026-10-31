@@ -39,6 +39,26 @@ Esc in game opens the settings menu (quality presets, frame rate limit, VSync, F
 Keyboard: Space = A, Backspace = B, Return = Start, WASD = left stick, arrows = right stick.
 Logs: <game folder>/data/logs (gtav.log for the game, install.log for setup).
 
+iPhone (experimental)
+---------------------
+The Mac builds an iPhone version from your installed game: iOS cannot compile code or shaders
+itself. Needs an iPhone 12 or newer (A14+, 4 GB RAM; tested on an iPhone 13 mini) on iOS 17 or
+newer, about 17 GB free on the phone, and a sideloading tool that signs apps with your own Apple ID
+(Sideloadly or AltStore; with a free Apple ID the app has to be re-signed every 7 days).
+1. Install and play the game on the Mac for a while first: the game saves every shader it meets,
+   and only those can be translated for the phone (drive around the map, enter interiors).
+2. Hold Option while opening GTAV.app, press "Build for iPhone" (about 15-25 minutes). The game
+   folder then has iphone/GTAV.ipa and iphone/Documents (args.txt and spirv/).
+3. Install iphone/GTAV.ipa on the phone with Sideloadly or AltStore.
+4. Connect the phone, open it in Finder > Files > GTA V and drag in: iphone/Documents/args.txt,
+   iphone/Documents/spirv, and data/game, data/update and data/user from the game folder (about
+   16 GB; the copy takes a while).
+5. Open GTA V on the phone. Touch controls appear on screen; a Bluetooth controller works too.
+Shaders the phone has no translation for are skipped (missing objects) and saved on the phone in
+Documents/shader_cache. To fix them: copy that folder from the phone to <game folder>/iphone/
+shader_cache, press "Build for iPhone" again (only the shaders are redone, a few minutes) and copy
+iphone/Documents/spirv to the phone again.
+
 Everything made from your files stays in the game folder (data/ and gtav_game.dylib). Do not share
 it: it contains Rockstar Games' copyrighted work. To uninstall, delete GTAV.app and the game folder.
 

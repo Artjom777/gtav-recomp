@@ -47,6 +47,7 @@ extern char** environ;
 #include <fstream>
 #include <map>
 #include <memory>
+#include <regex>
 #include <set>
 #include <sstream>
 #include <thread>
@@ -890,7 +891,7 @@ class Installer {
 
   bool Compile() {
     fs::path gen = data_ / L"build" / L"generated" / L"default";
-    fs::path obj = data_ / L"build" / L"obj";
+    fs::path obj = data_ / L"build" / (ios_ ? L"obj_ios" : L"obj");
     fs::path fsdir = root_ / L"tools" / L"game_dll" / L"fs";
     fs::path iface = root_ / L"tools" / L"game_dll" / L"interface";
     std::error_code ec;
@@ -918,11 +919,12 @@ class Installer {
                   L"-std=gnu++23", L"-march=x86-64-v3", L"-msse4.1", L"-fno-exceptions",
                   L"-fno-rtti", L"-fno-threadsafe-statics", L"-fno-math-errno", L"-w"};
 #elif defined(__APPLE__)
-    // fs/include also holds simde (SSE on NEON, the SDK's own headers).
-    Args flags = {L"--target=arm64-apple-macos15", L"-nostdinc++", L"-nostdlibinc",
-                  L"-fno-stack-protector", L"-O2",
-                  L"-std=gnu++23", L"-mcpu=apple-m1", L"-fno-exceptions", L"-fno-rtti",
-                  L"-fno-threadsafe-statics", L"-fno-math-errno", L"-w"};
+    // fs/include also holds simde (SSE on NEON, the SDK's own headers). iPhone: the same code for
+    // arm64 iOS 17, A14 or newer (build_game_dll.py --ios).
+    Args flags = {ios_ ? L"--target=arm64-apple-ios17.0" : L"--target=arm64-apple-macos15",
+                  L"-nostdinc++", L"-nostdlibinc", L"-fno-stack-protector", L"-O2",
+                  L"-std=gnu++23", ios_ ? L"-mcpu=apple-a14" : L"-mcpu=apple-m1", L"-fno-exceptions",
+                  L"-fno-rtti", L"-fno-threadsafe-statics", L"-fno-math-errno", L"-w"};
 #else
     Args flags = {L"--target=x86_64-linux-gnu", L"-nostdinc++", L"-nostdlibinc", L"-fPIC",
                   L"-fno-semantic-interposition", L"-fno-stack-protector",
@@ -981,6 +983,274 @@ class Installer {
     Log(L"Compiled in " + Num(uint64_t(secs.count())) + L" s");
     return true;
   }
+
+#ifdef __APPLE__
+  //--- iPhone ----------------------------------------------------------------
+  // The iPhone build (docs/IOS_PORT.md, "Release"): iOS can neither compile code nor translate
+  // shaders, so this Mac does both from the player's installed game. Same codegen and reference
+  // check as the install, compiled for arm64 iOS into gtav_game.dylib next to the shipped iOS
+  // shell (package ios/GTAV.app, no game code); every shader the game has made on this Mac (and
+  // those the phone saved, iphone/shader_cache) translated for the phone; packed as GTAV.ipa,
+  // unsigned (Sideloadly or AltStore sign it with the player's Apple ID). Out: <home>/iphone/.
+ public:
+  bool RunIphone(std::wstring* error) {
+    error_ = error;
+    ios_ = true;
+    std::error_code ec;
+    fs::create_directories(data_ / L"logs", ec);
+    log_.open(data_ / L"logs" / L"iphone.log", std::ios::app);
+    Log(L"---- iPhone build");
+    if (!IsInstalled(home_)) return SetError(L"Set up the game on this Mac first (Install), then build for iPhone.");
+    const fs::path shell = root_ / L"ios" / L"GTAV.app";
+    for (const wchar_t* f : {L"gtav", L"librexruntime.dylib", L"librexgpu-xenos.dylib", L"libMoltenVK.dylib",
+                             L"Info.plist"}) {
+      if (!fs::exists(shell / f, ec)) return SetError(std::wstring(L"The app has no iPhone files (ios/GTAV.app/") + f + L").");
+    }
+    if (!fs::exists(root_ / L"tools" / L"game_dll" / L"libSystem_ios.tbd", ec))
+      return SetError(L"The app has no iPhone files (tools/game_dll/libSystem_ios.tbd).");
+    std::wstring err;
+    if (!SyncRuntime(root_, home_, &err)) return SetError(err);  // the shader tools in <home>/tools
+    const fs::path out = home_ / L"iphone", app = out / L"Payload" / L"GTAV.app";
+    // Built before from this same package: only the shaders (new ones the phone saved) are redone.
+    std::string a, b;
+    uint64_t sa = 0, sb = 0;
+    const bool app_current = fs::exists(out / L"GTAV.ipa", ec) && fs::exists(app / L"gtav_game.dylib", ec) &&
+                             HashFile(app / L"gtav", &a, &sa) && HashFile(shell / L"gtav", &b, &sb) && a == b;
+    if (app_current) {
+      Log(L"GTAV.ipa is current: translating new shaders only");
+      if (!IphoneShaders(out / L"Documents" / L"spirv")) return Fail();
+      std::ofstream(out / L"Documents" / L"args.txt") << kIphoneArgs;
+      ui_.Progress(1.0);
+      ui_.Stage(L"Done: the shaders in iphone/Documents/spirv are up to date (copy spirv to the phone).");
+      return true;
+    }
+    if (!expected_.Load(root_ / L"tools" / L"game_dll" / L"expected.txt", error)) return false;
+    if (!Codegen() || !CheckGenerated() || !Compile()) return Fail();
+
+    fs::remove_all(out / L"Payload", ec);
+    fs::create_directories(app, ec);
+    fs::copy(shell, app, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+    if (ec) return SetError(L"Could not copy the iPhone app: " + Widen(ec.message()));
+    if (!LinkIphone(app / L"gtav_game.dylib")) return Fail();
+    if (!IphoneShaders(out / L"Documents" / L"spirv")) return Fail();
+    std::ofstream(out / L"Documents" / L"args.txt") << kIphoneArgs;
+
+    ui_.Stage(L"Packing GTAV.ipa...");
+    fs::remove(out / L"GTAV.ipa", ec);
+    Child zip;
+    // No resource forks or ._ AppleDouble files (non-APFS game folders): they break app signatures.
+    if (!zip.Start({L"/usr/bin/ditto", L"-c", L"-k", L"--norsrc", L"--noextattr", L"--noacl", L"--keepParent",
+                    (out / L"Payload").wstring(),
+                    (out / L"GTAV.ipa").wstring()},
+                   out, data_ / L"logs" / L"ipa.log") ||
+        zip.Poll(INFINITE) != 0)
+      return SetError(L"Could not pack GTAV.ipa");
+    fs::remove_all(data_ / L"build", ec);
+    Log(L"---- iPhone build finished: " + (out / L"GTAV.ipa").wstring());
+    ui_.Progress(1.0);
+    ui_.Stage(L"Done: iphone/GTAV.ipa and iphone/Documents in the game folder (see the README).");
+    return true;
+  }
+
+ private:
+  // Documents/args.txt on the phone: the game folder's data/ subfolders copied into Documents.
+  static constexpr char kIphoneArgs[] =
+      "--game_data_root=game\n--user_data_root=user\n--update_data_root=update\n"
+      "--gpu_plugin=xenos --headless=true\n"
+      "--gtav_native=on --gpu_skip_rendering=true --gpu_skip_rendering_lag_ms=6\n"
+      "--vsync=false --gtav_native_vsync=true --gtav_fps_limit=30\n"
+      "--audio_device_frames=256\n"
+      "--log_level=info --log_file=logs/gtav.log --log_max_file_size_mb=16 --log_max_files=2\n"
+      "--gtav_native_texture_budget_mb=192\n"
+      "--window_presenter=false\n"
+      "--gtav_native_fetch_resolves=false\n";
+
+  bool LinkIphone(const fs::path& out) {
+    ui_.Stage(L"Linking gtav_game.dylib for iPhone...");
+    fs::path build = data_ / L"build";
+    fs::path gd = root_ / L"tools" / L"game_dll";
+    fs::path rsp = build / L"link_ios.rsp";
+    {
+      std::ofstream f(rsp);
+      for (auto& o : objects_) f << "\"" << o.string() << "\"\n";
+      std::ifstream u(gd / L"interface" / L"gtav_game.undefs");
+      for (std::string line; std::getline(u, line);)
+        if (!line.empty()) f << "-U " << line << "\n";
+    }
+    fs::path log = data_ / L"logs" / L"link_ios.log";
+    // As Link() for macOS, for iOS 17: libSystem_ios.tbd, the iOS shell's librexruntime.dylib.
+    Args cmd = {(root_ / L"tools" / L"llvm" / L"bin" / L"ld64.lld").wstring(), L"-arch", L"arm64",
+                L"-platform_version", L"ios", L"17.0", L"17.0", L"-dylib", L"-install_name",
+                L"@rpath/gtav_game.dylib", L"-dead_strip_dylibs", L"-O1", L"-exported_symbols_list",
+                (gd / L"interface" / L"gtav_game.exports").wstring(), (gd / L"libSystem_ios.tbd").wstring(),
+                (root_ / L"ios" / L"GTAV.app" / L"librexruntime.dylib").wstring(), L"-o", out.wstring(),
+                L"@" + rsp.wstring()};
+    Child c;
+    if (!c.Start(cmd, build, log)) return SetError(L"Could not start ld64.lld");
+    if (c.Poll(INFINITE) != 0) return SetError(L"Linking failed:\n" + Widen(Tail(log, 1500)));
+    Log(L"Built gtav_game.dylib for iPhone");
+    return true;
+  }
+
+  // Shader constants from uniform buffers instead of device-address loads (tools/android/
+  // ubo_constants.py, which this follows exactly: the phone's GPU win). Empty on a load it cannot map.
+  static std::string UboConstants(std::string text) {
+    auto sub = [](const std::string& in, const std::regex& re, auto&& fn) {
+      std::string outs;
+      auto last = in.cbegin();
+      for (std::sregex_iterator it(in.cbegin(), in.cend(), re), end; it != end; ++it) {
+        outs.append(last, (*it)[0].first);
+        outs += fn(*it);
+        last = (*it)[0].second;
+      }
+      outs.append(last, in.cend());
+      return outs;
+    };
+    auto alu = [](const std::string& stage) { return stage == "Vertex" ? std::string("g_VSC") : std::string("g_PSC"); };
+    static const std::regex alu_off(
+        R"(vk::RawBufferLoad<float4>\(g_PushConstants\.(Vertex|Pixel)ShaderConstants \+ (\d+), 0x10\))");
+    static const std::regex alu_idx(
+        R"(vk::RawBufferLoad<float4>\(g_PushConstants\.(Vertex|Pixel)ShaderConstants \+ (\(.*?\)) \* 16, 0x10\))");
+    static const std::regex shared(
+        R"(vk::RawBufferLoad<(uint|float|int)>\(g_PushConstants\.SharedConstants \+ (\d+)(?: \+ (\d+))?\))");
+    static const std::regex color(
+        R"(vk::RawBufferLoad<float4>\(g_PushConstants\.SharedConstants \+ (\d+) \+ \(INDEX\) \* 16\))");
+    static const std::regex left_alu(R"(RawBufferLoad<[^>]*>\(g_PushConstants\.(Vertex|Pixel)ShaderConstants)");
+    static const std::regex left_shared(R"(RawBufferLoad<[^>]*>\(g_PushConstants\.SharedConstants \+ \d)");
+    text = sub(text, alu_off, [&](const std::smatch& m) {
+      return alu(m[1]) + ".c[" + std::to_string(std::stoul(m[2]) / 16) + "]";
+    });
+    text = sub(text, alu_idx, [&](const std::smatch& m) { return alu(m[1]) + ".c[" + m[2].str() + "]"; });
+    text = sub(text, shared, [](const std::smatch& m) {
+      unsigned long off = std::stoul(m[2]) + (m[3].matched ? std::stoul(m[3]) : 0);
+      std::string cast = m[1] == "uint" ? "" : m[1] == "float" ? "asfloat" : "asint";
+      return cast + "(g_SC.u[" + std::to_string(off / 16) + "][" + std::to_string(off % 16 / 4) + "])";
+    });
+    text = sub(text, color, [](const std::smatch& m) {
+      return "asfloat(g_SC.u[" + std::to_string(std::stoul(m[1]) / 16) + " + (INDEX)])";
+    });
+    for (size_t at; (at = text.find("(uint)(")) != std::string::npos;) text.replace(at, 7, "(");
+    if (std::regex_search(text, left_alu) || std::regex_search(text, left_shared)) return {};
+    static const std::string anchor = "[[vk::push_constant]] ConstantBuffer<PushConstants> g_PushConstants;";
+    if (size_t at = text.find(anchor); at != std::string::npos && text.find("g_VSC;") == std::string::npos)
+      text.insert(at + anchor.size(),
+                  "\n\nstruct XenosAluConstants { float4 c[256]; };\n"
+                  "struct XenosSharedConstants { uint4 u[112]; };\n"
+                  "[[vk::binding(0, 4)]] ConstantBuffer<XenosAluConstants> g_VSC;\n"
+                  "[[vk::binding(1, 4)]] ConstantBuffer<XenosAluConstants> g_PSC;\n"
+                  "[[vk::binding(2, 4)]] ConstantBuffer<XenosSharedConstants> g_SC;\n");
+    return text;
+  }
+
+  static std::string ReadText(const fs::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    std::stringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+  }
+
+  // Every shader in data/shader_cache (made by the game on this Mac) and iphone/shader_cache (saved
+  // by the phone: copy the phone's Documents/shader_cache there) -> SPIR-V for the phone, as
+  // tools/ios/make_spirv.sh does with the same XenosRecomp and dxc the Mac game uses.
+  bool IphoneShaders(const fs::path& spirv) {
+    ui_.Stage(L"Translating the shaders for iPhone...");
+    const fs::path tools = home_ / L"tools", work = data_ / L"build" / L"spirv_ios";
+    std::error_code ec;
+    fs::create_directories(spirv, ec);
+    fs::create_directories(work, ec);
+    // Device-address float2 loads are split into scalars (UboConstants maps scalar loads only).
+    std::string common = ReadText(tools / L"shader_common.h");
+    static const std::regex f2(R"(vk::RawBufferLoad<float2>\((g_PushConstants\.SharedConstants \+ )(\d+)\))");
+    common = std::regex_replace(common, f2, "float2(vk::RawBufferLoad<float>($1$2), vk::RawBufferLoad<float>($1$2 + 4))");
+    if (common.empty() || common.find("RawBufferLoad<float2>") != std::string::npos)
+      return SetError(L"Unexpected shader_common.h in " + tools.wstring());
+    std::ofstream(work / L"shader_common.h", std::ios::binary) << common;
+
+    std::map<std::string, fs::path> bins;  // name -> container
+    for (const fs::path& dir : {home_ / L"iphone" / L"shader_cache", data_ / L"shader_cache"}) {
+      for (auto it = fs::directory_iterator(dir, ec); !ec && it != fs::directory_iterator(); it.increment(ec)) {
+        if (it->path().extension() == ".bin") bins[it->path().stem().string()] = it->path();
+      }
+      ec.clear();
+    }
+    if (bins.empty())
+      return SetError(L"No shaders yet: play on this Mac for a while first (the game saves every shader "
+                      L"it meets in data/shader_cache), then build for iPhone again.");
+    Log(L"Translating " + Num(bins.size()) + L" shaders");
+    // The sky dome rendered white with uniform-buffer constants on the iPhone (cause not found).
+    static const std::set<std::string> kNoUbo = {"ps_6A340C638FB8D4C2", "vs_5338696E6825DEA1"};
+    std::vector<std::pair<std::string, fs::path>> items(bins.begin(), bins.end());
+    std::atomic<size_t> next{0}, done{0}, failed{0}, made{0};
+    std::atomic<bool> stop{false};
+    auto dxc = [&](const fs::path& hlsl, const fs::path& out, bool pixel, const fs::path& log) {
+      Args cmd = {(tools / L"dxc").wstring(), L"-T", pixel ? L"ps_6_0" : L"vs_6_0", L"-HV", L"2021",
+                  L"-all-resources-bound", L"-spirv", L"-fvk-use-dx-layout", L"-Wno-ignored-attributes",
+                  L"-Qstrip_debug"};
+      if (!pixel) cmd.push_back(L"-fvk-invert-y");
+      fs::path tmp = out;
+      tmp += ".tmp";
+      cmd.insert(cmd.end(), {L"-Fo", tmp.wstring(), hlsl.wstring()});
+      Child c;
+      if (!c.Start(cmd, work, log) || c.Poll(INFINITE) != 0) return false;
+      std::error_code e;
+      fs::rename(tmp, out, e);
+      return !e;
+    };
+    auto one = [&](const std::string& name, const fs::path& bin) {
+      const bool pixel = name.rfind("ps_", 0) == 0;
+      const fs::path out = spirv / (name + ".spv"), hlsl = work / (name + ".hlsl"), log = work / (name + ".log");
+      std::error_code e;
+      if (fs::exists(out, e) && (name != "ps_D258EBE32001470C" || fs::exists(spirv / (name + "_tiles.spv"), e)))
+        return true;
+      made++;
+      Child xr;
+      if (!xr.Start({(tools / L"XenosRecomp").wstring(), bin.wstring(), hlsl.wstring(),
+                     (work / L"shader_common.h").wstring()},
+                    work, log) ||
+          xr.Poll(INFINITE) != 0)
+        return false;
+      std::string text = ReadText(hlsl);
+      if (!kNoUbo.count(name)) text = UboConstants(text);
+      if (text.empty()) return false;
+      std::ofstream(hlsl, std::ios::binary | std::ios::trunc) << text;
+      if (!pixel && text.find("= vfetchIndirect(") != std::string::npos) std::ofstream(spirv / (name + ".indirect"));
+      // Variant (shader_compiler.cpp kVariants): every sun-lighting tile takes the penumbra path.
+      if (name == "ps_D258EBE32001470C") {
+        const std::string find = "r0.y = select(r0.y > 0.0, c255.x, c255.y);";
+        size_t at = text.find(find);
+        if (at == std::string::npos) return false;
+        std::string t = text;
+        t.replace(at, find.size(), "r0.y = c255.x;");
+        fs::path th = work / (name + "_tiles.hlsl");
+        std::ofstream(th, std::ios::binary) << t;
+        if (!dxc(th, spirv / (name + "_tiles.spv"), true, log)) return false;
+      }
+      bool ok = dxc(hlsl, out, pixel, log);
+      fs::remove(hlsl, e);
+      if (ok) fs::remove(log, e);
+      return ok;
+    };
+    std::vector<std::thread> workers;
+    for (int i = 0; i < std::max(1, JobCount()); i++)
+      workers.emplace_back([&] {
+        for (size_t i; !stop && (i = next++) < items.size();) {
+          if (!one(items[i].first, items[i].second)) failed++;
+          done++;
+        }
+      });
+    while (done < items.size() && !stop) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      if (ui_.Cancelled()) stop = true;
+      ui_.Progress(kCompileEnd + (1.0 - kCompileEnd) * double(done) / double(items.size()));
+    }
+    for (auto& w : workers) w.join();
+    if (stop) return false;
+    Log(L"Shaders: " + Num(items.size()) + L", " + Num(made - failed) + L" newly translated, " + Num(failed) +
+        L" failed (logs in " + work.wstring() + L")");
+    if (failed > items.size() / 50) return SetError(Num(failed) + L" shaders could not be translated (see " + work.wstring() + L").");
+    return true;
+  }
+#endif
 
 #ifdef __APPLE__
   bool Link() {
@@ -1100,6 +1370,7 @@ class Installer {
   std::vector<std::wstring> mismatches_;
   std::vector<fs::path> objects_;
   uint64_t copy_total_ = 0, copied_ = 0;
+  bool ios_ = false;  // RunIphone: Compile for arm64 iOS
 };
 
 }  // namespace
@@ -1264,6 +1535,13 @@ bool RunInstall(const fs::path& root, const fs::path& home, const InstallInputs&
   Installer inst(root, home, in, ui);
   return inst.Run(error);
 }
+
+#ifdef __APPLE__
+bool RunIphoneBuild(const fs::path& root, const fs::path& home, InstallUi& ui, std::wstring* error) {
+  Installer inst(root, home, InstallInputs{}, ui);
+  return inst.RunIphone(error);
+}
+#endif
 
 bool LaunchGame(const fs::path& root, std::wstring* error, const std::vector<std::wstring>& extra) {
   fs::path data = root / L"data";
