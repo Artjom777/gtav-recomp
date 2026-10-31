@@ -73,7 +73,7 @@ REXCVAR_DEFINE_INT32(gtav_native_dump_rt_skip, 0, "GTAV",
 // Without a write watch (Android: kernel 5.10) large textures are spot-checked between full
 // checks; the game streaming new data into a texture showed as stale gray blocks for up to that
 // many frames while moving.
-#if GTAV_MOBILE
+#ifdef __ANDROID__  // (iOS keeps the Mac's 30: the phone is short of CPU time)
 REXCVAR_DEFINE_INT32(gtav_native_texture_recheck_frames, 4, "GTAV",
                      "Frames between full re-checks of a large texture (spot checks in between)");
 #else
