@@ -1,8 +1,8 @@
 diff --git a/libavcodec/wmaprodec.c b/libavcodec/wmaprodec.c
-index 704c0a4..d8ad3a5 100644
+index 704c0a4..85ae853 100644
 --- a/libavcodec/wmaprodec.c
 +++ b/libavcodec/wmaprodec.c
-@@ -2025,6 +2025,28 @@ static av_cold int xmaframes_decode_init(AVCodecContext* avctx)
+@@ -2025,6 +2025,33 @@ static av_cold int xmaframes_decode_init(AVCodecContext* avctx)
      return decode_init(s, avctx, 0);
  }
  
@@ -15,23 +15,28 @@ index 704c0a4..d8ad3a5 100644
 +static void xmaframes_flush(AVCodecContext *avctx)
 +{
 +    WMAProDecodeCtx *s = avctx->priv_data;
++    const size_t packet_state = offsetof(WMAProDecodeCtx, pgb);
++    const size_t keep_from = offsetof(WMAProDecodeCtx, nb_channels);
++    const size_t zero_from = offsetof(WMAProDecodeCtx, channels_for_cur_subframe);
++    const size_t channels = offsetof(WMAProDecodeCtx, channel);
 +    int i;
 +
-+    flush(s);
++    /** everything decoding changes is zero in a new context (priv_data is zeroed) except what
++        decode_init sets: nb_channels, packet_loss, skip_frame (0) and prev_block_len. A partial
++        reset (wmapro's flush: half the output buffer) left louder pops between sounds. */
++    memset((uint8_t *)s + packet_state, 0, keep_from - packet_state);
++    memset((uint8_t *)s + zero_from, 0, channels - zero_from);
 +    for (i = 0; i < s->nb_channels; i++) {
++        memset(&s->channel[i], 0, sizeof(s->channel[i]));
 +        s->channel[i].prev_block_len = s->samples_per_frame;
-+        s->channel[i].reuse_sf = 0;
 +    }
-+    s->num_saved_bits = 0;
-+    s->frame_offset = 0;
-+    s->frame_num = 0;
-+    s->skip_frame = 0;
++    s->packet_loss = 1;
 +}
 +
  static av_cold int xmaframes_decode_end(AVCodecContext* avctx)
  {
      WMAProDecodeCtx *s = avctx->priv_data;
-@@ -2152,6 +2174,7 @@ AVCodec ff_xmaframes_decoder = {
+@@ -2152,6 +2179,7 @@ AVCodec ff_xmaframes_decoder = {
      .init           = xmaframes_decode_init,
      .close          = xmaframes_decode_end,
      .decode         = xmaframes_decode_packet,
