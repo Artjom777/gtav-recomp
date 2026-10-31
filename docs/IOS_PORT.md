@@ -99,7 +99,16 @@ Game / plume:
 - safe_read.h: vm_read_overwrite.
 - gtav/CMakeLists.txt: GTAV_IOS, imported host rex::rexglue for the codegen rule, no tools/ staging.
 
-## Release plan (draft, 2026-10-31; not built yet)
+## Release plan (draft, 2026-10-31)
+
+Built and checked on the Mac (2026-10-31, not yet run on the phone):
+- Shell: `cmake ... -DGTAV_GAME_DLL=ON -B build/ios-shell` -> gtav_fast (3 MB, no game code; the
+  stub gtav_game.dylib is built for iOS via GTAV_STUB_SDK=iphoneos in gen_interface.py).
+- Game library: `build_game_dll.py <llvm-bin> <copy of generated> build/ios-shell/game_interface
+  <out> --ios --runtime <ios librexruntime.dylib>` with the release's bundled LLVM 19.1.7
+  (clang++ / ld64.lld links to clang-19 / lld): 406 TUs in 286 s -j4, 115 MB, platform iOS, links
+  against tools/game_dll/libSystem_ios.tbd (no Xcode SDK needed).
+- Package: `GTAV_GAME_DYLIB=<out>/gtav_game.dylib tools/ios/make_app.sh`.
 
 Constraint: like the other releases, nothing Rockstar-derived may be published, and iOS can
 neither compile code nor load unsigned code. So the player's **Mac** does the building, as the
