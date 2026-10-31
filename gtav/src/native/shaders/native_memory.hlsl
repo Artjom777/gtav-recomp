@@ -11,6 +11,7 @@ struct MemoryPush {
     uint64_t Address;    // destination buffer device address (written as two 32-bit words, low first)
     uint BppLog2;        // 2 or 3
     uint Mode;           // packing (bits 0-7) | endian << 8 | linear (not tiled) << 16
+    float Scale;         // texels of the texture per guest texel (render scale below 1)
 };
 
 [[vk::push_constant]] ConstantBuffer<MemoryPush> g_Push;
@@ -38,7 +39,8 @@ uint Swap(uint w, uint endian) {
 void CSResolveToMemory(uint3 id : SV_DispatchThreadID) {
     if (id.x >= g_Push.Width || id.y >= g_Push.Height)
         return;
-    float4 v = g_Textures[g_Push.TextureIndex].Load(int3(id.xy, 0));
+    int2 texel = g_Push.Scale == 1.0 ? int2(id.xy) : int2((float2(id.xy) + 0.5) * g_Push.Scale);
+    float4 v = g_Textures[g_Push.TextureIndex].Load(int3(texel, 0));
     uint64_t address = g_Push.Address;  // no 64-bit shift: Adreno's compiler asserts on those
     bool untiled = ((g_Push.Mode >> 16) & 1) != 0;
     address += untiled ? ((id.y * ((g_Push.PitchBlocks + 31) & ~31u) + id.x) << g_Push.BppLog2)

@@ -145,6 +145,9 @@ REXCVAR_DEFINE_BOOL(gtav_native_skip_depth_restore, true, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_native_point_float32, GTAV_POINT_FLOAT32_DEFAULT, "GTAV",
                     "Native renderer: nearest filtering for 32-bit float and depth (24_8) texture fetches (GPUs "
                     "without linear filtering for R32F / D32)");
+REXCVAR_DEFINE_DOUBLE(gtav_native_render_scale, 1.0, "GTAV",
+                      "Native renderer: render the full-width (1280) targets at this fraction of their size "
+                      "(0.5-1; read at start). Needs SPIR-V made with the pixel scale constant (make_spirv.sh)");
 REXCVAR_DEFINE_BOOL(gtav_native_zero_new_targets, true, "GTAV",
                     "Native renderer: new render targets and resolve destinations start zeroed (Adreno hands out "
                     "recycled memory: grey blocks where the game never writes)");
@@ -854,11 +857,23 @@ void DisplayTexel(const DecodedTexture& t, uint32_t x, uint32_t y, uint8_t rgb[3
 // Graphics pipelines created off the render thread: a first-seen pipeline costs 30-200 ms of
 // driver compile, which stalled the whole frame. The draw is skipped until its pipeline is ready
 // (a frame or two); the persistent pipeline cache makes later runs near-instant either way.
+// --gtav_native_render_scale: pipelines drawing into scaled targets carry this spec bit (it also
+// keys them apart) and get spec constant 1 = 1 / scale, which the shaders' vPos is multiplied by.
+constexpr uint32_t kSpecScaled = 1u << 8;
+float g_pixel_scale_inv = 1.0f;
+uint32_t SpecConstants(uint32_t spec, RenderSpecConstant out[2]) {
+  out[0] = RenderSpecConstant(0, spec);
+  if (!(spec & kSpecScaled)) return 1;
+  out[1] = RenderSpecConstant(1, std::bit_cast<uint32_t>(g_pixel_scale_inv));
+  return 2;
+}
+
 struct PipelineJob {
   RenderGraphicsPipelineDesc desc;
   std::vector<RenderInputElement> elements;
   std::vector<RenderInputSlot> slots;
   RenderSpecConstant spec{0, 0};
+  RenderSpecConstant specs[2];
   std::unique_ptr<RenderPipeline> result;
   std::atomic<bool> done{false};
 };
@@ -1145,8 +1160,9 @@ class PipelineWarmer {
         desc.inputElementsCount = uint32_t(elements.size());
         desc.inputSlots = slots.data();
         desc.inputSlotsCount = uint32_t(slots.size());
-        desc.specConstants = &spec;
-        desc.specConstantsCount = 1;
+        RenderSpecConstant specs[2];
+        desc.specConstantsCount = SpecConstants(spec.value, specs);
+        desc.specConstants = specs;
         pipeline = device_->createGraphicsPipeline(desc);
       }
       {
@@ -1245,8 +1261,9 @@ struct RenderTarget {
   bool float_data = false;  // last drawn as 2_10_10_10_FLOAT (7e3); see StorageFormat
   std::unique_ptr<RenderTexture> texture;
   RenderFormat format;
-  uint32_t width, height, msaa;
+  uint32_t width, height, msaa;  // guest size (the texture is width * scale by height * scale)
   bool depth;
+  float scale = 1.0f;       // --gtav_native_render_scale (full-width single-sampled targets)
   uint32_t descriptor = 0;  // sampled view (single-sample color targets only)
   uint64_t written = 0;     // order of the last draw/clear into it (MsaaAlias)
   std::unique_ptr<RenderFramebuffer> alias_fb;  // MsaaAlias copies into it; retired with the texture
@@ -1265,6 +1282,7 @@ struct ResolvedTexture {
   uint32_t width, height, descriptor;
   bool render_target = false;
   bool depth_copy = false;  // R32F copy of a depth resolve (only for depth-format fetches)
+  float scale = 1.0f;       // of the source target: the texture is width * scale by height * scale
   uint64_t serial = 0;  // last write order
   // Cube faces and mip levels (resolves with a destination level/face): 6 layers for cubes,
   // the fetch constant's mip count, one render view + framebuffer per written (face, level).
@@ -1738,6 +1756,18 @@ struct Backend::Impl {
   // rows of a target past the drawn area) was otherwise uninitialized memory: zeros on desktop
   // drivers, but recycled contents on Adreno (grey and mosaic blocks on car paint, glass and
   // ground decals). MSAA and depth targets are left alone (the game clears those).
+  // Render scale: target sizes and coordinates in host texels (rounded edges, so neighbouring
+  // rects stay adjacent). 1 when off.
+  float rs = 1.0f;
+  static uint32_t Sz(uint32_t v, float s) { return s == 1.0f ? v : std::max(1u, uint32_t(std::lround(v * s))); }
+  static int32_t Sc(int32_t v, float s) { return s == 1.0f ? v : int32_t(std::lround(v * s)); }
+  static RenderRect ScaleRect(const RenderRect& r, float s) {
+    return s == 1.0f ? r : RenderRect(Sc(r.left, s), Sc(r.top, s), Sc(r.right, s), Sc(r.bottom, s));
+  }
+  static RenderViewport ScaleViewport(const RenderViewport& v, float s) {
+    return s == 1.0f ? v : RenderViewport(v.x * s, v.y * s, v.width * s, v.height * s, v.minDepth, v.maxDepth);
+  }
+
   static constexpr uint64_t kZeroBytes = 16ull << 20;
   std::unique_ptr<RenderBuffer> zero_fill;
   void ZeroTexture(RenderCommandList* list, RenderTexture* texture, RenderFormat format, uint32_t width,
@@ -2062,7 +2092,7 @@ struct Backend::Impl {
   }
 
   void MsaaAlias(RenderCommandList* list, uint32_t base, uint32_t format, uint32_t pitch, RenderTarget* t) {
-    if (t->msaa || t->depth || pitch < 2 || (pitch & 1)) return;
+    if (t->msaa || t->depth || pitch < 2 || (pitch & 1) || t->scale != 1.0f) return;
     uint64_t key = uint64_t(base) | uint64_t(StorageFormat(format)) << 12 | uint64_t(pitch / 2) << 17 | uint64_t(2) << 31;
     auto it = targets.find(key);
     if (it == targets.end() || !it->second.texture || it->second.written <= t->written) return;
@@ -2120,7 +2150,7 @@ struct Backend::Impl {
     auto o = tile_resolves.find(other);
     if (o == tile_resolves.end() || !o->second.top || o->second.bottom || o->second.pitch != pitch) return;
     RenderTarget* src = o->second.target;
-    if (src == t || src->msaa || src->format != t->format || Is64bpp(o->second.format)) return;
+    if (src == t || src->msaa || src->format != t->format || Is64bpp(o->second.format) || src->scale != t->scale) return;
     uint32_t rows = std::min(src->height, t->height);
     if (rows <= tile_split) return;
     tile_alias_done.insert(t);
@@ -2131,9 +2161,11 @@ struct Backend::Impl {
     }
     Transition(grow_list, src->texture.get(), RenderTextureLayout::COPY_SOURCE);
     Transition(grow_list, t->texture.get(), RenderTextureLayout::COPY_DEST);
-    RenderBox box(0, int32_t(tile_split), int32_t(std::min(src->width, t->width)), int32_t(rows));
+    const float ts = t->scale;
+    RenderBox box(0, Sc(int32_t(tile_split), ts), int32_t(Sz(std::min(src->width, t->width), ts)), int32_t(Sz(rows, ts)));
     grow_list->copyTextureRegion(RenderTextureCopyLocation::Subresource(t->texture.get()),
-                                 RenderTextureCopyLocation::Subresource(src->texture.get()), 0, tile_split, 0, &box);
+                                 RenderTextureCopyLocation::Subresource(src->texture.get()), 0,
+                                 uint32_t(Sc(int32_t(tile_split), ts)), 0, &box);
   }
   RenderTarget* bound_depth = nullptr;
 
@@ -2301,6 +2333,9 @@ struct Backend::Impl {
 
   bool Init(RenderDevice* dev) {
     device = dev;
+    rs = float(std::clamp(REXCVAR_GET(gtav_native_render_scale), 0.5, 1.0));
+    g_pixel_scale_inv = 1.0f / rs;
+    if (rs != 1.0f) REXLOG_INFO("[native] render scale {:.3f} (full-width targets)", rs);
     upload.device = dev;
     for (auto& p : parked) p.upload.device = dev;
     RenderDescriptorSetBuilder set;
@@ -2399,7 +2434,7 @@ struct Backend::Impl {
       RenderPipelineLayoutBuilder cb;
       cb.begin(false, false);
       cb.addDescriptorSet(textures);
-      cb.addPushConstant(0, 0, 32, RenderShaderStageFlag::COMPUTE);
+      cb.addPushConstant(0, 0, 36, RenderShaderStageFlag::COMPUTE);
       cb.end();
       memory_layout = cb.create(device);
       memory_cs = device->createShader(g_native_resolve_memory_cs, sizeof(g_native_resolve_memory_cs),
@@ -2645,14 +2680,17 @@ struct Backend::Impl {
     t.height = height;
     t.msaa = msaa;
     t.depth = depth;
+    t.scale = rs != 1.0f && !msaa && pitch >= 1280 ? rs : 1.0f;
     RenderMultisampling ms(SampleCount(msaa));
-    t.texture = device->createTexture(depth ? RenderTextureDesc::DepthTarget(t.width, t.height, t.format, ms)
-                                            : RenderTextureDesc::ColorTarget(t.width, t.height, t.format, ms));
-    if (!depth && !msaa) ZeroTexture(grow_list, t.texture.get(), t.format, t.width, t.height);
+    const uint32_t tw = Sz(t.width, t.scale), th = Sz(t.height, t.scale);
+    t.texture = device->createTexture(depth ? RenderTextureDesc::DepthTarget(tw, th, t.format, ms)
+                                            : RenderTextureDesc::ColorTarget(tw, th, t.format, ms));
+    if (!depth && !msaa) ZeroTexture(grow_list, t.texture.get(), t.format, tw, th);
     if (old_texture && grow_list) {
       Transition(grow_list, old_texture.get(), RenderTextureLayout::COPY_SOURCE);
       Transition(grow_list, t.texture.get(), RenderTextureLayout::COPY_DEST);
-      RenderBox box(0, 0, int32_t(std::min(old_width, t.width)), int32_t(std::min(old_height, t.height)));
+      RenderBox box(0, 0, int32_t(Sz(std::min(old_width, t.width), t.scale)),
+                    int32_t(Sz(std::min(old_height, t.height), t.scale)));
       grow_list->copyTextureRegion(RenderTextureCopyLocation::Subresource(t.texture.get()),
                                    RenderTextureCopyLocation::Subresource(old_texture.get()), 0, 0, 0, &box);
       layouts.erase(old_texture.get());
@@ -3050,10 +3088,10 @@ struct Backend::Impl {
     list->setPipeline(pipeline.get());
     const float push[4] = {color.r, color.g, color.b, color.a};
     list->setGraphicsPushConstants(0, push, 0, sizeof(push));
-    RenderViewport vp(0.0f, 0.0f, float(t->width), float(t->height));
+    RenderViewport vp(0.0f, 0.0f, float(Sz(t->width, t->scale)), float(Sz(t->height, t->scale)));
     RenderViewport vps[4] = {vp, vp, vp, vp};
     list->setViewports(vps, std::max(n, 1u));
-    const RenderRect whole{0, 0, int32_t(t->width), int32_t(t->height)};
+    const RenderRect whole{0, 0, int32_t(Sz(t->width, t->scale)), int32_t(Sz(t->height, t->scale))};
     for (uint32_t r = 0; r < (rects ? count : 1u); r++) {
       const RenderRect& rc = rects ? rects[r] : whole;
       RenderRect scs[4] = {rc, rc, rc, rc};
@@ -3378,8 +3416,9 @@ struct Backend::Impl {
     desc.inputSlots = slots.data();
     desc.inputSlotsCount = uint32_t(slots.size());
     RenderSpecConstant sc(0, spec);
-    desc.specConstants = &sc;
-    desc.specConstantsCount = 1;
+    RenderSpecConstant scs[2];
+    desc.specConstantsCount = SpecConstants(spec, scs);
+    desc.specConstants = scs;
     // Warm-up records: only pipelines whose shaders are the SPIR-V files of their hashes. Not while
     // the pixel shader is still being translated: the draw then goes out depth-only under the same
     // key, and a record of that (ps 0) made every later run draw those surfaces unlit (grey world).
@@ -3405,7 +3444,8 @@ struct Backend::Impl {
       job->desc = desc;
       job->desc.inputElements = job->elements.data();
       job->desc.inputSlots = job->slots.data();
-      job->desc.specConstants = &job->spec;
+      job->desc.specConstantsCount = SpecConstants(spec, job->specs);
+      job->desc.specConstants = job->specs;
       pending_pipelines[key] = job;
       pipeline_compiler.Enqueue(device, job);
       if (!WaitForJob(*job)) return nullptr;
@@ -4071,6 +4111,7 @@ struct Backend::Impl {
       std::memcpy(&sc[140 + 4 * i], v, sizeof(v));
     }
     uint32_t spec = (regs::Read(r, regs::RB_COLORCONTROL) & 8) ? 2u : 0u;
+    if ((count ? color[0]->scale : depth ? depth->scale : 1.0f) != 1.0f) spec |= kSpecScaled;
 
     // Vertex streams.
     const LayoutMemo& decl = Layout(d);
@@ -4388,6 +4429,10 @@ struct Backend::Impl {
     uint32_t nvp = std::max(bind_count, 1u);
     RenderRect scissor(0, 0, int32_t(w), int32_t(h));
     if (REXCVAR_GET(gtav_native_scissor)) scissor = GuestScissor(r, w, h);
+    if (const float ts = count ? color[0]->scale : depth->scale; ts != 1.0f) {
+      vp = ScaleViewport(vp, ts);
+      scissor = ScaleRect(scissor, ts);
+    }
     if (ds.viewports != nvp || std::memcmp(&ds.vp, &vp, sizeof(vp)) != 0 ||
         std::memcmp(&ds.scissor, &scissor, sizeof(scissor)) != 0) {
       RenderViewport vps[4] = {vp, vp, vp, vp};
@@ -4584,7 +4629,7 @@ struct Backend::Impl {
       rects.clear();
       for (const auto& w : wanted) {
         RenderRect q(w.left, w.top, std::min(w.right, int32_t(t->width)), std::min(w.bottom, int32_t(t->height)));
-        if (q.right > q.left && q.bottom > q.top) rects.push_back(q);
+        if (q.right > q.left && q.bottom > q.top) rects.push_back(ScaleRect(q, t->scale));
       }
       *out = rects.data(), *n = uint32_t(rects.size());
       return !rects.empty();
@@ -4637,14 +4682,15 @@ struct Backend::Impl {
   // address for guests that fetch it through an 8888 view (GTA V's SSAO reads the stencil so).
   void WriteDepthPack(RenderCommandList* list, RenderTarget* src, uint32_t base, const uint32_t* words, uint32_t dw,
                       uint32_t dh, uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2, uint32_t px, uint32_t py) {
+    const float s = src->scale;
     uint64_t variant = uint64_t(base) | uint64_t(uint32_t(RenderFormat::R8G8B8A8_UNORM) & 0xFF) << 32 |
-                       uint64_t(1) << 40 | uint64_t(Hash(&dw, 4, dh) & 0x7FFFFF) << 41;
+                       uint64_t(1) << 40 | uint64_t(Hash(&dw, 4, dh) & 0x3FFFFF) << 41 | uint64_t(s != 1.0f) << 63;
     auto& dst = resolved[variant];
     auto& variants = resolved_by_address[base];
     if (std::find(variants.begin(), variants.end(), variant) == variants.end()) variants.push_back(variant);
     dst.serial = ++resolve_serial;
     if (!dst.texture) {
-      dst.texture = device->createTexture(RenderTextureDesc::ColorTarget(dw, dh, RenderFormat::R8G8B8A8_UNORM));
+      dst.texture = device->createTexture(RenderTextureDesc::ColorTarget(Sz(dw, s), Sz(dh, s), RenderFormat::R8G8B8A8_UNORM));
       dst.view = dst.texture->createTextureView(RenderTextureViewDesc::Texture2D(RenderFormat::R8G8B8A8_UNORM));
       const RenderTexture* color = dst.texture.get();
       RenderFramebufferDesc fb(&color, 1);
@@ -4653,7 +4699,8 @@ struct Backend::Impl {
       dst.width = dw;
       dst.height = dh;
       dst.render_target = true;
-      ZeroTexture(list, dst.texture.get(), dst.format, dw, dh);
+      dst.scale = s;
+      ZeroTexture(list, dst.texture.get(), dst.format, Sz(dw, s), Sz(dh, s));
       dst.descriptor = AllocDescriptor();
       texture_set->setTexture(dst.descriptor, dst.texture.get(), RenderTextureLayout::SHADER_READ, dst.view.get());
     }
@@ -4664,8 +4711,10 @@ struct Backend::Impl {
     PassStamp(list, "depth resolve copy");
     pass_end = "depth resolve copy";
     bound_fb = nullptr;
-    list->setViewports(RenderViewport(float(px), float(py), float(x2 - x1), float(y2 - y1)));
-    list->setScissors(RenderRect(int32_t(px), int32_t(py), int32_t(px + x2 - x1), int32_t(py + y2 - y1)));
+    const int32_t sx1 = Sc(int32_t(x1), s), sy1 = Sc(int32_t(y1), s), sx2 = Sc(int32_t(x2), s),
+                  sy2 = Sc(int32_t(y2), s), spx = Sc(int32_t(px), s), spy = Sc(int32_t(py), s);
+    list->setViewports(RenderViewport(float(spx), float(spy), float(sx2 - sx1), float(sy2 - sy1)));
+    list->setScissors(RenderRect(spx, spy, spx + sx2 - sx1, spy + sy2 - sy1));
     list->setGraphicsPipelineLayout(layout.get());
     list->setPipeline(depth_pack_pipeline.get());
     list->setGraphicsDescriptorSet(texture_set.get(), 0);
@@ -4673,8 +4722,8 @@ struct Backend::Impl {
     list->setGraphicsDescriptorSet(texture_set.get(), 2);
     list->setGraphicsDescriptorSet(sampler_set.get(), 3);
     float one = 1.0f;
-    int32_t push[6] = {int32_t(src->descriptor), int32_t(src->stencil_descriptor), int32_t(x1) - int32_t(px),
-                       int32_t(y1) - int32_t(py), 0, (words[1] & 0x3F) == 23 ? 1 : 0};
+    int32_t push[6] = {int32_t(src->descriptor), int32_t(src->stencil_descriptor), sx1 - spx, sy1 - spy, 0,
+                       (words[1] & 0x3F) == 23 ? 1 : 0};
     std::memcpy(&push[4], &one, 4);
     list->setGraphicsPushConstants(0, push, 0, sizeof(push));
     list->drawInstanced(3, 1, 0, 0);
@@ -4803,8 +4852,8 @@ struct Backend::Impl {
     list->setComputePipelineLayout(memory_layout.get());
     list->setPipeline(memory_pipeline.get());
     list->setComputeDescriptorSet(texture_set.get(), 0);
-    uint32_t push[8] = {r.descriptor, r.width, r.height, g.pitch, uint32_t(gpu), uint32_t(gpu >> 32), g.bpp_log2,
-                        g.mode | g.endian << 8 | uint32_t(g.linear) << 16};
+    uint32_t push[9] = {r.descriptor, r.width, r.height, g.pitch, uint32_t(gpu), uint32_t(gpu >> 32), g.bpp_log2,
+                        g.mode | g.endian << 8 | uint32_t(g.linear) << 16, std::bit_cast<uint32_t>(r.scale)};
     list->setComputePushConstants(0, push, 0, sizeof(push));
     list->dispatch((r.width + 7) / 8, (r.height + 7) / 8, 1);
   }
@@ -5188,7 +5237,8 @@ struct Backend::Impl {
         layouts.erase(held.get());
         dead_textures.push_back(std::move(held));
       }
-      held = device->createTexture(RenderTextureDesc::Texture2D(front.width, front.height, 1, front.format));
+      held = device->createTexture(
+          RenderTextureDesc::Texture2D(Sz(front.width, front.scale), Sz(front.height, front.scale), 1, front.format));
       held_view = held->createTextureView(RenderTextureViewDesc::Texture2D(front.format));
       if (!held_descriptor) held_descriptor = AllocDescriptor();
       texture_set->setTexture(held_descriptor, held.get(), RenderTextureLayout::SHADER_READ, held_view.get());
@@ -5196,7 +5246,7 @@ struct Backend::Impl {
     }
     Transition(list, front.texture.get(), RenderTextureLayout::COPY_SOURCE);
     Transition(list, held.get(), RenderTextureLayout::COPY_DEST);
-    RenderBox box(0, 0, int32_t(front.width), int32_t(front.height));
+    RenderBox box(0, 0, int32_t(Sz(front.width, front.scale)), int32_t(Sz(front.height, front.scale)));
     list->copyTextureRegion(RenderTextureCopyLocation::Subresource(held.get()),
                             RenderTextureCopyLocation::Subresource(front.texture.get()), 0, 0, 0, &box);
     Transition(list, held.get(), RenderTextureLayout::SHADER_READ);
@@ -5270,8 +5320,9 @@ struct Backend::Impl {
       return;
     }
     uint32_t shape[3] = {dh, mips, layers};
+    const float s = src->scale;  // the destination keeps the source's render scale
     uint64_t variant = uint64_t(base) | uint64_t(uint32_t(dst_format) & 0xFF) << 32 | uint64_t(shader_copy) << 40 |
-                       uint64_t(Hash(shape, sizeof(shape), dw) & 0x7FFFFF) << 41;
+                       uint64_t(Hash(shape, sizeof(shape), dw) & 0x3FFFFF) << 41 | uint64_t(s != 1.0f) << 63;
     auto& dst = resolved[variant];
     resolved_latest[base] = variant;
     auto& variants = resolved_by_address[base];
@@ -5283,14 +5334,14 @@ struct Backend::Impl {
     if (!dst.texture) {
       if (mips > 1 || layers > 1) {
         dst.texture = device->createTexture(RenderTextureDesc::Texture(
-            RenderTextureDimension::TEXTURE_2D, dw, dh, 1, mips, layers, dst_format,
+            RenderTextureDimension::TEXTURE_2D, Sz(dw, s), Sz(dh, s), 1, mips, layers, dst_format,
             RenderTextureFlag::RENDER_TARGET | (cube ? RenderTextureFlag::CUBE : RenderTextureFlag::NONE)));
       } else {
-        RenderTextureDesc desc = shader_copy ? RenderTextureDesc::ColorTarget(dw, dh, dst_format)
-                                             : RenderTextureDesc::Texture2D(dw, dh, 1, dst_format);
+        RenderTextureDesc desc = shader_copy ? RenderTextureDesc::ColorTarget(Sz(dw, s), Sz(dh, s), dst_format)
+                                             : RenderTextureDesc::Texture2D(Sz(dw, s), Sz(dh, s), 1, dst_format);
         // Storage use costs the texture its lossless compression on Apple GPUs (every later read
         // and the copy got slower): only small destinations, where the pass saved matters more.
-        const bool storage = (fetch_resolves || compute_resolves) && shader_copy && !depth_resolve &&
+        const bool storage = (fetch_resolves || compute_resolves) && shader_copy && !depth_resolve && s == 1.0f &&
                              FetchStorable(dst_format) && fetch_dest_next < kFetchDests &&
                              uint64_t(dw) * dh <= uint64_t(std::max(0, REXCVAR_GET(gtav_native_storage_max_texels)));
         if (storage) desc.flags |= RenderTextureFlag::STORAGE;
@@ -5323,7 +5374,8 @@ struct Backend::Impl {
       dst.depth_copy = depth_resolve;
       dst.width = dw;
       dst.height = dh;
-      ZeroTexture(list, dst.texture.get(), dst_format, dw, dh, mips, layers);
+      dst.scale = s;
+      ZeroTexture(list, dst.texture.get(), dst_format, Sz(dw, s), Sz(dh, s), mips, layers);
       dst.descriptor = AllocDescriptor();
       texture_set->setTexture(dst.descriptor, dst.texture.get(), RenderTextureLayout::SHADER_READ, dst.view.get());
     }
@@ -5362,7 +5414,8 @@ struct Backend::Impl {
       src_descriptor = scratch.descriptor;
     }
     bool in_pass = false;
-    if (shader_copy && !depth_resolve && FetchResolve(list, r, src, int(source), dst, dst_format, x1, y1, x2, y2, px, py)) {
+    if (shader_copy && !depth_resolve && s == 1.0f &&
+        FetchResolve(list, r, src, int(source), dst, dst_format, x1, y1, x2, y2, px, py)) {
       in_pass = true;  // copied inside the source's render pass, which goes on
       if (seqdiag) {
         seq_note += fmt::format(" [in-pass #{}{} after {} draws, pass:", fetch_candidates - 1,
@@ -5373,7 +5426,7 @@ struct Backend::Impl {
                         : std::string(" -");
         seq_note += bound_depth ? fmt::format(" depth {}x{}]", bound_depth->width, bound_depth->height) : "]";
       }
-    } else if (shader_copy && !depth_resolve && compute_resolves && !dumping && dst.storage_index != ~0u &&
+    } else if (shader_copy && !depth_resolve && compute_resolves && !dumping && dst.storage_index != ~0u && s == 1.0f &&
                dst.mips == 1 && dst.layers == 1 && rc.dest_level == 0 && rc.dest_face == 0) {
       float scale = (IsFixed16(src->format) ? 32.0f : 1.0f) / (IsFixed16(dst_format) ? 32.0f : 1.0f);
       bool encode_7e3 = IsFixed10(uint32_t(regs::Color(r, int(source)).format)) && src->float_data;
@@ -5394,8 +5447,11 @@ struct Backend::Impl {
       if (pass_times) PassStamp(list, fmt::format("resolve copy {}x{}", x2 - x1, y2 - y1));
       pass_end = "resolve copy";
       bound_fb = nullptr;
-      list->setViewports(RenderViewport(float(px), float(py), float(x2 - x1), float(y2 - y1)));
-      list->setScissors(RenderRect(int32_t(px), int32_t(py), int32_t(px + x2 - x1), int32_t(py + y2 - y1)));
+      // Host texels: source and destination share the scale, so the copy stays 1:1.
+      const int32_t sx1 = Sc(int32_t(x1), s), sy1 = Sc(int32_t(y1), s), sx2 = Sc(int32_t(x2), s),
+                    sy2 = Sc(int32_t(y2), s), spx = Sc(int32_t(px), s), spy = Sc(int32_t(py), s);
+      list->setViewports(RenderViewport(float(spx), float(spy), float(sx2 - sx1), float(sy2 - sy1)));
+      list->setScissors(RenderRect(spx, spy, spx + sx2 - sx1, spy + sy2 - sy1));
       list->setGraphicsPipelineLayout(layout.get());
       list->setPipeline(depth_resolve ? depth_copy_pipeline.get() : ResolvePipeline(dst_format));
       list->setGraphicsDescriptorSet(texture_set.get(), 0);
@@ -5411,7 +5467,7 @@ struct Backend::Impl {
       static const bool float24_round = !std::getenv("GTAV_NATIVE_DEPTH_FLOAT24") ||
                                         std::string(std::getenv("GTAV_NATIVE_DEPTH_FLOAT24")) != "0";
       int32_t mode = depth_resolve ? (float24_round && regs::Depth(r).float24 ? 2 : 0) : (encode_7e3 ? 1 : 0);
-      int32_t push[6] = {int32_t(src_descriptor), 0, int32_t(x1) - int32_t(px), int32_t(y1) - int32_t(py), 0, mode};
+      int32_t push[6] = {int32_t(src_descriptor), 0, sx1 - spx, sy1 - spy, 0, mode};
       std::memcpy(&push[4], &scale, 4);
       list->setGraphicsPushConstants(0, push, 0, sizeof(push));
       list->drawInstanced(3, 1, 0, 0);
@@ -5472,13 +5528,13 @@ struct Backend::Impl {
       // D3DRESOLVE_CLEARDEPTHSTENCIL: clear the resolved rectangle of the depth target.
       if (rc.flags & 0x200) {
         BindTargets(list, nullptr, 0, src);
-        RenderRect rect{int32_t(x1), int32_t(y1), int32_t(x2), int32_t(y2)};
+        RenderRect rect = ScaleRect(RenderRect{int32_t(x1), int32_t(y1), int32_t(x2), int32_t(y2)}, s);
         list->clearDepthStencil(true, true, rc.clear_z, 0, &rect, 1);
       }
       return;
     }
     if (rc.flags & 0x100) {
-      RenderRect rect{int32_t(x1), int32_t(y1), int32_t(x2), int32_t(y2)};
+      RenderRect rect = ScaleRect(RenderRect{int32_t(x1), int32_t(y1), int32_t(x2), int32_t(y2)}, s);
       if (in_pass && bound_fb) {  // the source's pass is still open: clear there
         for (uint32_t i = 0; i < 4; i++)
           if (bound_color[i] == src) {
@@ -5770,7 +5826,9 @@ void Backend::FrameComplete(uint32_t slot) {
     pool->queryResults();
     const uint64_t* samples = pool->getResults();
     for (size_t i = 0; i < records.size(); i++)
-      if (records[i].serial) PublishQueryResult(records[i].query, records[i].serial, samples[i]);
+      if (records[i].serial)  // in guest pixels (most queries draw into scaled targets)
+        PublishQueryResult(records[i].query, records[i].serial,
+                           impl_->rs == 1.0f ? samples[i] : uint64_t(double(samples[i]) / (impl_->rs * impl_->rs)));
     records.clear();
   }
   p.upload.Reset();
