@@ -134,6 +134,20 @@ REXCVAR_DEFINE_BOOL(gtav_native_skip_depth_restore, true, "GTAV",
 #else
 #define GTAV_DRAW_CLEARS_DEFAULT true
 #endif
+// Adreno (S23 FE) has no linear filtering for 32-bit float formats or D32: sampling one through a
+// bilinear sampler is undefined there and came out as light 16x16 squares along depth edges (the
+// sun-shadow tiles read the R32F depth copies). Xenos cannot filter 32-bit float textures either.
+#ifdef __ANDROID__
+#define GTAV_POINT_FLOAT32_DEFAULT true
+#else
+#define GTAV_POINT_FLOAT32_DEFAULT false
+#endif
+REXCVAR_DEFINE_BOOL(gtav_native_point_float32, GTAV_POINT_FLOAT32_DEFAULT, "GTAV",
+                    "Native renderer: nearest filtering for 32-bit float and depth (24_8) texture fetches (GPUs "
+                    "without linear filtering for R32F / D32)");
+REXCVAR_DEFINE_BOOL(gtav_native_zero_new_targets, true, "GTAV",
+                    "Native renderer: new render targets and resolve destinations start zeroed (Adreno hands out "
+                    "recycled memory: grey blocks where the game never writes)");
 REXCVAR_DEFINE_BOOL(gtav_native_pass_gpu_times, false, "GTAV",
                     "Native renderer diagnostic: GPU timestamps between render passes, logged every 300 frames "
                     "as ms per frame by kind of pass");
@@ -1708,9 +1722,41 @@ struct Backend::Impl {
       case RenderFormat::R16G16_FLOAT:
       case RenderFormat::R16G16_SNORM:
       case RenderFormat::R32_FLOAT: return 4;
-      case RenderFormat::R16G16B16A16_UNORM: return 8;
+      case RenderFormat::R16G16B16A16_UNORM:
+      case RenderFormat::R16G16B16A16_SNORM: return 8;
+      case RenderFormat::R16G16_UNORM: return 4;
+      case RenderFormat::R16_FLOAT:
+      case RenderFormat::R16_UNORM:
+      case RenderFormat::R8G8_UNORM: return 2;
+      case RenderFormat::R8_UNORM: return 1;
       default: return 0;
     }
+  }
+
+  // New render targets and resolve destinations start out zeroed (--gtav_native_zero_new_targets).
+  // Whatever the game never writes (mips of its reflection maps it does not resolve into, the
+  // rows of a target past the drawn area) was otherwise uninitialized memory: zeros on desktop
+  // drivers, but recycled contents on Adreno (grey and mosaic blocks on car paint, glass and
+  // ground decals). MSAA and depth targets are left alone (the game clears those).
+  static constexpr uint64_t kZeroBytes = 16ull << 20;
+  std::unique_ptr<RenderBuffer> zero_fill;
+  void ZeroTexture(RenderCommandList* list, RenderTexture* texture, RenderFormat format, uint32_t width,
+                   uint32_t height, uint32_t mips = 1, uint32_t layers = 1) {
+    if (!list || !REXCVAR_GET(gtav_native_zero_new_targets)) return;
+    const uint32_t bpt = BytesPerTexel(format);
+    if (!bpt || uint64_t(width) * height * bpt > kZeroBytes) return;
+    if (!zero_fill) {
+      zero_fill = device->createBuffer(RenderBufferDesc::UploadBuffer(kZeroBytes));
+      std::memset(zero_fill->map(), 0, size_t(kZeroBytes));
+      zero_fill->unmap();
+    }
+    Transition(list, texture, RenderTextureLayout::COPY_DEST);
+    for (uint32_t l = 0; l < layers; l++)
+      for (uint32_t m = 0; m < mips; m++) {
+        const uint32_t w = std::max(width >> m, 1u), h = std::max(height >> m, 1u);
+        list->copyTextureRegion(RenderTextureCopyLocation::Subresource(texture, m, l),
+                                RenderTextureCopyLocation::PlacedFootprint(zero_fill.get(), format, w, h, 1, w));
+      }
   }
 
   void DumpResolve(RenderCommandList* list, const ResolvedTexture& t, uint32_t address, uint32_t flags,
@@ -2602,6 +2648,7 @@ struct Backend::Impl {
     RenderMultisampling ms(SampleCount(msaa));
     t.texture = device->createTexture(depth ? RenderTextureDesc::DepthTarget(t.width, t.height, t.format, ms)
                                             : RenderTextureDesc::ColorTarget(t.width, t.height, t.format, ms));
+    if (!depth && !msaa) ZeroTexture(grow_list, t.texture.get(), t.format, t.width, t.height);
     if (old_texture && grow_list) {
       Transition(grow_list, old_texture.get(), RenderTextureLayout::COPY_SOURCE);
       Transition(grow_list, t.texture.get(), RenderTextureLayout::COPY_DEST);
@@ -2876,6 +2923,26 @@ struct Backend::Impl {
     s.maxLOD = base_map ? s.minLOD + 0.25f : float((words[4] >> 6) & 15);
     if (s.maxLOD < s.minLOD) s.maxLOD = s.minLOD;
     s.mipLODBias = float(int32_t(words[4] << 10) >> 22) / 32.0f;
+    if (REXCVAR_GET(gtav_native_point_float32)) {
+      switch (words[1] & 0x3F) {
+        case 22:  // k_24_8
+        case 23:  // k_24_8_FLOAT
+        case 33:  // k_32
+        case 34:  // k_32_32
+        case 35:  // k_32_32_32_32
+        case 36:  // k_32_FLOAT
+        case 37:  // k_32_32_FLOAT
+        case 38:  // k_32_32_32_32_FLOAT
+        case 57:  // k_32_32_32_FLOAT
+          s.magFilter = s.minFilter = RenderFilter::NEAREST;
+          s.mipmapMode = RenderMipmapMode::NEAREST;
+          s.anisotropyEnabled = false;
+          s.maxAnisotropy = 1;
+          break;
+        default:
+          break;
+      }
+    }
     return Sampler(s);
   }
 
@@ -4586,6 +4653,7 @@ struct Backend::Impl {
       dst.width = dw;
       dst.height = dh;
       dst.render_target = true;
+      ZeroTexture(list, dst.texture.get(), dst.format, dw, dh);
       dst.descriptor = AllocDescriptor();
       texture_set->setTexture(dst.descriptor, dst.texture.get(), RenderTextureLayout::SHADER_READ, dst.view.get());
     }
@@ -5255,6 +5323,7 @@ struct Backend::Impl {
       dst.depth_copy = depth_resolve;
       dst.width = dw;
       dst.height = dh;
+      ZeroTexture(list, dst.texture.get(), dst_format, dw, dh, mips, layers);
       dst.descriptor = AllocDescriptor();
       texture_set->setTexture(dst.descriptor, dst.texture.get(), RenderTextureLayout::SHADER_READ, dst.view.get());
     }

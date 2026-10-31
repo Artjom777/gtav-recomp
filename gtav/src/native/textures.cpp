@@ -384,6 +384,15 @@ bool DecodeGuestTexture(const uint32_t words[6], DecodedTexture* out) {
     }
   }
   out->swizzle = Swizzle(info.format, fetch.swizzle);
+#ifdef __ANDROID__
+  // Adreno cannot sample R16G16B16A16_UNORM at all (no SAMPLED_IMAGE format feature): store the
+  // same 0..1 values as SNORM (sampled and filtered there), 15 bits of the 16.
+  if (out->format == RenderFormat::R16G16B16A16_UNORM) {
+    auto* v = reinterpret_cast<uint16_t*>(out->data.data());
+    for (size_t i = 0, n = out->data.size() / 2; i < n; i++) v[i] >>= 1;
+    out->format = RenderFormat::R16G16B16A16_SNORM;
+  }
+#endif
   return true;
 }
 
