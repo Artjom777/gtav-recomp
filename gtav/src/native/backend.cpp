@@ -965,7 +965,8 @@ void PipelineFields(IO& io, RenderGraphicsPipelineDesc& d, std::vector<RenderInp
 // match the description the renderer builds now, so code changes never pick up stale state.
 class PipelineWarmer {
  public:
-  static constexpr uint32_t kMagic = 0x31504C47;  // "GLP1"
+  // "GLP2": GLP1 files could hold pipelines recorded without their pixel shader; they are dropped.
+  static constexpr uint32_t kMagic = 0x32504C47;
 
   void Start(RenderDevice* device, const RenderPipelineLayout* layout, const RenderShader* gs,
              std::filesystem::path file, std::string spirv_dir) {
@@ -3312,8 +3313,10 @@ struct Backend::Impl {
     RenderSpecConstant sc(0, spec);
     desc.specConstants = &sc;
     desc.specConstantsCount = 1;
-    // Warm-up records: only pipelines whose shaders are the SPIR-V files of their hashes.
-    if (vs && ps != diag_flat_ps.get() && !TileOverride(ps_hash)) {
+    // Warm-up records: only pipelines whose shaders are the SPIR-V files of their hashes. Not while
+    // the pixel shader is still being translated: the draw then goes out depth-only under the same
+    // key, and a record of that (ps 0) made every later run draw those surfaces unlit (grey world).
+    if (vs && ps != diag_flat_ps.get() && !TileOverride(ps_hash) && (ps || !ps_hash)) {
       PipelineBytesWriter w;
       uint8_t has_gs = desc.geometryShader != nullptr;
       PipelineFields(w, desc, elements, slots, sc, has_gs);

@@ -79,8 +79,9 @@ def distinct_ok(data, off):
 
 
 def public_tables():
-    """Standard tables computed from their definitions: CRC-32 (both byte orders) and the AES
-    S-box and inverse S-box. Every runtime that checks or decrypts data carries them."""
+    """Standard tables computed from their definitions: CRC-32 (both byte orders, alone and as
+    zlib's eight braided tables) and the AES S-box and inverse S-box. Every runtime that checks or
+    decrypts data carries them."""
     crc = []
     for n in range(256):
         c = n
@@ -105,7 +106,15 @@ def public_tables():
     sbox[0] = 0x63
     for i, v in enumerate(sbox):
         inv[v] = i
-    return [b"".join(c.to_bytes(4, o) for c in crc) for o in ("little", "big")] + [bytes(sbox), bytes(inv)]
+    # zlib (1.2.x, BYFOUR) keeps eight CRC tables back to back: table k+1 = one more byte through
+    # table 0. The next table starts with 0, so a lone table followed by zero bytes (dxc) matches
+    # the start of zlib's block (the game) for 4 bytes past the first table.
+    braided = [crc]
+    for _ in range(7):
+        braided.append([(v >> 8) ^ crc[v & 0xFF] for v in braided[-1]])
+    zlib = [b"".join(c.to_bytes(4, o) for t in braided for c in t) for o in ("little", "big")]
+    return [b"".join(c.to_bytes(4, o) for c in crc) for o in ("little", "big")] + zlib + \
+        [bytes(sbox), bytes(inv)]
 
 
 def spirv_preamble(data):

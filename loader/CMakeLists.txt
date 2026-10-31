@@ -1,6 +1,7 @@
 # gtav launcher: first-run setup (the player's own discs + TU27 -> data\ and gtav_game.dll) and
 # game launcher. Static C runtime, so it starts on a PC without the Visual C++ runtime and can
 # tell the player to install it.
+# macOS: GTAV.app with an AppKit setup window (src/main_mac.mm) that builds gtav_game.dylib.
 # Linux: a terminal launcher (src/main_linux.cpp) that builds gtav_game.so; static libstdc++ and
 # libgcc, so it needs only glibc.
 cmake_minimum_required(VERSION 3.25)
@@ -18,6 +19,20 @@ if(WIN32)
         src/launcher.manifest)  # visual styles, DPI awareness, long paths
     target_compile_definitions(gtav_launcher PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
     target_link_libraries(gtav_launcher PRIVATE comctl32 ole32 shell32 bcrypt)
+elseif(APPLE)
+    # GTAV.app: the launcher is the bundle's executable; the package (gtav_fast, dylibs, rexglue,
+    # tools/) goes to Contents/Resources/gtav (tools/release/make_release_macos.py).
+    enable_language(OBJCXX)
+    add_executable(gtav_launcher MACOSX_BUNDLE
+        src/main_mac.mm
+        src/install.cpp
+        src/sources.cpp)
+    set_target_properties(gtav_launcher PROPERTIES
+        OUTPUT_NAME GTAV
+        MACOSX_BUNDLE_INFO_PLIST ${CMAKE_CURRENT_SOURCE_DIR}/src/Info.plist.in
+        XCODE_ATTRIBUTE_CLANG_ENABLE_OBJC_ARC YES)
+    target_compile_options(gtav_launcher PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
+    target_link_libraries(gtav_launcher PRIVATE "-framework Cocoa" "-framework UniformTypeIdentifiers")
 else()
     add_executable(gtav_launcher
         src/main_linux.cpp

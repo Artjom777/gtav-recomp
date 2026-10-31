@@ -32,7 +32,16 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#if defined(__aarch64__)
+// arm64 (macOS): the simde headers themselves (MIT, shipped in fs/include), the same SSE-on-NEON
+// code the SDK build runs. They need only clang's resource headers (arm_neon.h).
+#include <simde/x86/avx.h>
+#include <simde/x86/avx2.h>
+#include <simde/x86/sse.h>
+#include <simde/x86/sse4.1.h>
+#else
 #include <immintrin.h>
+#endif
 
 #ifdef _WIN32
 #define GTAVFS_IMPORT __declspec(dllimport)
@@ -83,6 +92,7 @@ inline double sqrt(double v) noexcept { return __builtin_sqrt(v); }
 inline float sqrt(float v) noexcept { return __builtin_sqrtf(v); }
 extern "C" GTAVFS_IMPORT float log2f(float);
 
+#if !defined(__aarch64__)
 //=============================================================================
 // SIMD: simde names used by the generated code, on native x86-64-v3 intrinsics.
 // (simde on an x86-64-v3 target compiles each of these to exactly the native intrinsic.)
@@ -196,6 +206,7 @@ typedef __m128d simde__m128d;
 #define simde_mm_unpacklo_epi32 _mm_unpacklo_epi32
 #define simde_mm_xor_ps _mm_xor_ps
 #define simde_mm_xor_si128 _mm_xor_si128
+#endif  // !__aarch64__
 
 //=============================================================================
 // Function type and mapping (SDK ppc/func.h)
@@ -270,6 +281,26 @@ constexpr float kPack2101010_Min2 = __builtin_bit_cast(float, 0x40400000u);
 constexpr float kPack2101010_Max2 = __builtin_bit_cast(float, 0x40400003u);
 
 namespace rex::platform {
+#if defined(__aarch64__)
+struct FPSCRPlatform {
+  // FPCR: RMode bits 22-23, FZ (19) and FZ16 (24); guest nearest/zero/+inf/-inf.
+  static constexpr size_t RoundShift = 22;
+  static constexpr size_t RoundMaskVal = 3 << RoundShift;
+  static constexpr size_t FlushMask = (1 << 19) | (1 << 24);
+  static constexpr size_t GuestToHost[] = {0 << RoundShift, 3 << RoundShift, 1 << RoundShift,
+                                           2 << RoundShift};
+  // Trap enables (IOE, DZE, OFE, UFE, IXE, IDE): cleared, ARM's default.
+  static constexpr u32 ExceptionMask = (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11) | (1 << 12) |
+                                       (1 << 15);
+  static inline u32 getcsr() noexcept {
+    u64 csr;
+    __asm__ __volatile__("mrs %0, fpcr" : "=r"(csr));
+    return csr;
+  }
+  static inline void setcsr(u32 csr) noexcept { __asm__ __volatile__("msr fpcr, %0" : : "r"(u64(csr))); }
+  static inline void InitHostExceptions(u32& csr) noexcept { csr &= ~ExceptionMask; }
+};
+#else
 struct FPSCRPlatform {
   static constexpr size_t RoundShift = 13;
   static constexpr size_t RoundMaskVal = _MM_ROUND_MASK;
@@ -281,6 +312,7 @@ struct FPSCRPlatform {
   static inline void setcsr(u32 csr) noexcept { _mm_setcsr(csr); }
   static inline void InitHostExceptions(u32& csr) noexcept { csr |= ExceptionMask; }
 };
+#endif
 }  // namespace rex::platform
 
 namespace rex::ppc {
@@ -708,10 +740,20 @@ inline simde__m128i simde_mm_vsl(simde__m128i a, simde__m128i b) {
   int shift = simde_mm_extract_epi8(b, 15) & 0x7;
   if (shift == 0)
     return a;
+#if defined(__aarch64__)
+  // NEON immediate shifts need a constant count: variable vshlq_u64 (negative = right shift).
+  uint64x2_t va = vreinterpretq_u64_s64(simde__m128i_to_neon_i64(a));
+  uint64x2_t low_shifted = vshlq_u64(va, vdupq_n_s64(shift));
+  uint64x2_t high_carry = vshlq_u64(va, vdupq_n_s64(shift - 64));
+  uint64x2_t r = vsetq_lane_u64(vgetq_lane_u64(low_shifted, 0), vdupq_n_u64(0), 0);
+  r = vsetq_lane_u64(vgetq_lane_u64(low_shifted, 1) | vgetq_lane_u64(high_carry, 0), r, 1);
+  return simde__m128i_from_neon_i64(vreinterpretq_s64_u64(r));
+#else
   simde__m128i low_shifted = simde_mm_slli_epi64(a, shift);
   simde__m128i high_carry = simde_mm_srli_epi64(a, 64 - shift);
   high_carry = simde_mm_slli_si128(high_carry, 8);
   return simde_mm_or_si128(low_shifted, high_carry);
+#endif
 }
 
 inline simde__m128i simde_mm_vslo(simde__m128i a, simde__m128i b) {
@@ -821,10 +863,19 @@ extern PPCFuncMapping PPCFuncMappings[];
 #define GTAVFS_IS_HOOKED(name) GTAVFS_IS_HOOKED_(GTAVFS_HOOKED_##name)
 #define GTAVFS_CAT(a, b) GTAVFS_CAT_(a, b)
 #define GTAVFS_CAT_(a, b) a##b
+#if defined(__APPLE__)
+// Mach-O has no __attribute__((alias)); an assembler equate gives <name> the same address.
+// (It cannot be overridden, which is fine here: hooked functions never get one.)
+#define GTAVFS_DEFINE_0(name)                                      \
+  __asm__(".globl _" #name "\n.set _" #name ", ___imp__" #name); \
+  extern "C" REX_FUNC(name);                                       \
+  REX_EXTERN(__imp__##name)
+#else
 #define GTAVFS_DEFINE_0(name)                          \
   __attribute__((alias("__imp__" #name), noinline)) \
   extern "C" REX_FUNC(name);                         \
   REX_EXTERN(__imp__##name)
+#endif
 #define GTAVFS_DEFINE_1(name) REX_EXTERN(__imp__##name)
 
 #define DECLARE_REX_FUNC(name) \

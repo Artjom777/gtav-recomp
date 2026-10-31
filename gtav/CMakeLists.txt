@@ -102,6 +102,19 @@ if(GTAV_GAME_DLL)
             VERBATIM)
         target_link_options(gtav PRIVATE "LINKER:/DEF:${GTAV_INTERFACE_DIR}/gtav_fast.def"
                             "LINKER:${GTAV_INTERFACE_DIR}/gtav_game.lib")
+    elseif(APPLE)
+        # macOS: link against a stub gtav_game.dylib (@rpath = the exe folder); -export_dynamic
+        # keeps the hooks and the bridge, which only the game library calls, in the export trie.
+        find_program(GTAV_LLVM_NM NAMES llvm-nm nm REQUIRED)
+        get_filename_component(GTAV_LLVM_BIN "${GTAV_LLVM_NM}" DIRECTORY)
+        add_custom_command(TARGET gtav PRE_LINK
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../tools/game_dll/gen_interface.py
+                    ${GTAV_LLVM_BIN} ${CMAKE_BINARY_DIR}/CMakeFiles/gtav.dir ${GTAV_INTERFACE_DIR}
+                    $<TARGET_FILE:rex::runtime> ${CMAKE_CXX_COMPILER}
+            VERBATIM)
+        target_link_options(gtav PRIVATE "${GTAV_INTERFACE_DIR}/stub/gtav_game.dylib"
+                            "LINKER:-export_dynamic")
+        set_target_properties(gtav PROPERTIES OUTPUT_NAME gtav_fast)
     else()
         find_program(GTAV_LLVM_NM NAMES llvm-nm llvm-nm-20 llvm-nm-19 REQUIRED)
         get_filename_component(GTAV_LLVM_BIN "${GTAV_LLVM_NM}" DIRECTORY)
@@ -234,6 +247,8 @@ endif()
 set(GTAV_DXC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/XenosRecomp/thirdparty/dxc-bin)
 if(WIN32)
     set(GTAV_DXC ${GTAV_DXC_DIR}/bin/x64/dxc.exe)
+elseif(APPLE)
+    set(GTAV_DXC ${CMAKE_COMMAND} -E env DYLD_LIBRARY_PATH=${GTAV_DXC_DIR}/lib/arm64 ${GTAV_DXC_DIR}/bin/arm64/dxc-macos)
 else()
     set(GTAV_DXC ${CMAKE_COMMAND} -E env LD_LIBRARY_PATH=${GTAV_DXC_DIR}/lib/x64 ${GTAV_DXC_DIR}/bin/x64/dxc-linux)
 endif()
@@ -242,7 +257,7 @@ set(GTAV_BLIT_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/native_blit.hl
 set(GTAV_RECTLIST_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/native_rectlist.hlsl)
 set(GTAV_MEMORY_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/native_memory.hlsl)
 set(GTAV_MENU_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/native_menu.hlsl)
-# No dxc for macOS here: copy prebuilt headers (compiled by dxc on Linux) from GTAV_PREBUILT_NATIVE_SHADERS.
+# Optional: copy prebuilt headers from GTAV_PREBUILT_NATIVE_SHADERS instead of running dxc.
 set(GTAV_PREBUILT_NATIVE_SHADERS "" CACHE PATH "Directory of prebuilt native shader headers (skips dxc)")
 if(GTAV_PREBUILT_NATIVE_SHADERS)
     file(GLOB _gtav_prebuilt ${GTAV_PREBUILT_NATIVE_SHADERS}/*.h)
@@ -338,5 +353,21 @@ if(NOT WIN32 AND NOT APPLE AND NOT ANDROID)
         COMMAND chmod +x ${GTAV_TOOLS_DIR}/dxc
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 ${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/XenosRecomp/XenosRecomp/shader_common.h ${GTAV_TOOLS_DIR}/shader_common.h
+        VERBATIM)
+elseif(APPLE)
+    # macOS: tools/XenosRecomp and tools/dxc (dxc-macos) find tools/lib/libdxcompiler.dylib through
+    # an @executable_path/lib rpath (re-signed ad hoc after install_name_tool).
+    set(GTAV_XR_BIN ${CMAKE_CURRENT_SOURCE_DIR}/../build/xenosrecomp-mac/XenosRecomp/XenosRecomp CACHE FILEPATH
+        "XenosRecomp binary for the background shader compiler")
+    set(GTAV_TOOLS_DIR $<TARGET_FILE_DIR:gtav>/tools)
+    add_custom_command(TARGET gtav POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${GTAV_TOOLS_DIR}/lib
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${GTAV_DXC_DIR}/lib/arm64/libdxcompiler.dylib ${GTAV_TOOLS_DIR}/lib/libdxcompiler.dylib
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/XenosRecomp/XenosRecomp/shader_common.h ${GTAV_TOOLS_DIR}/shader_common.h
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../tools/release/macho_tool.py
+                ${GTAV_XR_BIN} ${GTAV_TOOLS_DIR}/XenosRecomp
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../tools/release/macho_tool.py
+                ${GTAV_DXC_DIR}/bin/arm64/dxc-macos ${GTAV_TOOLS_DIR}/dxc
         VERBATIM)
 endif()

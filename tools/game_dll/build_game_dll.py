@@ -12,7 +12,7 @@ usage: build_game_dll.py LLVM_BIN GENERATED_DIR INTERFACE_DIR OUT_DIR [-j N]
   GENERATED_DIR  codegen output (gtav_recomp.*.cpp, gtav_init.cpp, gtav_funcs*.h); its gtav_pch.h
                  is replaced by gtav/fs/gtav_pch.h, so pass a copy, not the dev tree
   INTERFACE_DIR  gtav_hooks.h, gtav_game.def, gtav_fast.def, rexruntime.def, ucrtbase.def
-                 (Linux: gtav_hooks.h, gtav_game.exports)
+                 (Linux: gtav_hooks.h, gtav_game.exports; macOS: also gtav_game.undefs)
 """
 import argparse
 import concurrent.futures
@@ -35,7 +35,17 @@ CXXFLAGS_LINUX = ["--target=x86_64-linux-gnu", "-nostdinc++", "-nostdlibinc", "-
                   "-fno-threadsafe-statics", "-fno-math-errno", "-w"]
 LDFLAGS_LINUX = ["-shared", "-soname", "gtav_game.so", "-Bsymbolic", "-z", "now", "-z", "relro",
                  "-z", "noexecstack", "--hash-style=gnu", "-O1"]
+# macOS arm64: no C runtime of our own (fs_crt.cpp is x86); memcpy & co. and log2f come from
+# libSystem through libSystem.tbd, kernel imports from librexruntime.dylib, and the hooks and the
+# bridge are -U (dynamic lookup) symbols that bind to gtav_fast at load time.
+CXXFLAGS_MACOS = ["--target=arm64-apple-macos15", "-nostdinc++", "-nostdlibinc", "-fno-stack-protector",
+                  "-O2", "-std=gnu++23",
+                  "-mcpu=apple-m1", "-fno-exceptions", "-fno-rtti", "-fno-threadsafe-statics",
+                  "-fno-math-errno", "-w"]
+LDFLAGS_MACOS = ["-arch", "arm64", "-platform_version", "macos", "15.0", "15.0", "-dylib",
+                 "-install_name", "@rpath/gtav_game.dylib", "-dead_strip_dylibs", "-O1"]
 LINUX = sys.platform.startswith("linux")
+MACOS = sys.platform == "darwin"
 
 
 def find_tool(llvm_bin, names):
@@ -53,9 +63,15 @@ def main():
     ap.add_argument("interface")
     ap.add_argument("out")
     ap.add_argument("-j", type=int, default=os.cpu_count())
+    ap.add_argument("--runtime", help="macOS: librexruntime.dylib to link the kernel imports against")
+    ap.add_argument("--simde", help="macOS: folder holding simde/ (default: the SDK's thirdparty)")
     a = ap.parse_args()
 
-    if LINUX:
+    if MACOS:
+        clang = find_tool(a.llvm_bin, ["clang++", "clang"])
+        lld = find_tool(a.llvm_bin, ["ld64.lld", "ld"])
+        cxxflags, ext = CXXFLAGS_MACOS, ".o"
+    elif LINUX:
         clang = find_tool(a.llvm_bin, ["clang++", "clang++-20", "clang++-19"])
         lld = find_tool(a.llvm_bin, ["ld.lld", "ld.lld-20", "ld.lld-19"])
         cxxflags, ext = CXXFLAGS_LINUX, ".o"
@@ -72,9 +88,12 @@ def main():
 
     sources = sorted(os.path.join(a.generated, f) for f in os.listdir(a.generated)
                      if f.startswith("gtav_recomp.") and f.endswith(".cpp"))
-    sources += [os.path.join(a.generated, "gtav_init.cpp"), os.path.join(FS, "game_dll.cpp"),
-                os.path.join(FS, "fs_crt.cpp")]
+    sources += [os.path.join(a.generated, "gtav_init.cpp"), os.path.join(FS, "game_dll.cpp")]
+    if not MACOS:
+        sources.append(os.path.join(FS, "fs_crt.cpp"))
     inc = ["-isystem", os.path.join(FS, "include"), "-I", a.generated]
+    if MACOS:
+        inc[2:2] = ["-isystem", a.simde or os.path.join(ROOT, "rexglue-sdk", "thirdparty", "simde")]
 
     def compile_one(src):
         obj = os.path.join(obj_dir, os.path.basename(src) + ext)
@@ -95,6 +114,23 @@ def main():
             objs.append(obj)
             if done % 25 == 0 or done == len(sources):
                 print(f"compiled {done}/{len(sources)} ({time.time() - t0:.0f} s)", flush=True)
+
+    if MACOS:
+        rsp = os.path.join(a.out, "link.rsp")
+        with open(rsp, "w") as f:
+            f.write("\n".join(f'"{o}"' for o in objs))
+        undefs = [l.strip() for l in open(os.path.join(a.interface, "gtav_game.undefs")) if l.strip()]
+        urs = os.path.join(a.out, "undefs.rsp")
+        with open(urs, "w") as f:
+            f.write("\n".join(f"-U {u}" for u in undefs))
+        t = time.time()
+        subprocess.run([lld] + LDFLAGS_MACOS +
+                       ["-exported_symbols_list", os.path.join(a.interface, "gtav_game.exports"),
+                        os.path.join(ROOT, "tools", "game_dll", "libSystem.tbd"), a.runtime,
+                        "-o", os.path.join(a.out, "gtav_game.dylib"), f"@{urs}", f"@{rsp}"],
+                       check=True)
+        print(f"linked gtav_game.dylib in {time.time() - t:.0f} s, total {time.time() - t0:.0f} s")
+        return
 
     if LINUX:
         rsp = os.path.join(a.out, "link.rsp")

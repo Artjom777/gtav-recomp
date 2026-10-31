@@ -1,4 +1,4 @@
-# Clean-room releases (Windows and Linux)
+# Clean-room releases (Windows, Linux and macOS)
 
 Written 2026-10-29 after the first Windows release (tag `v0.1.0-windows`). This file says how the
 Windows release is built and checked, and what the Linux session needs to do to ship the same
@@ -179,6 +179,89 @@ Developer side:
   (every binary starts, the bundled clang/lld compile and link freestanding with no system
   headers): Ubuntu 24.04 passes; Debian 12 fails on GLIBCXX_3.4.32 as expected.
 - Corresponding source: `make_source_archive.sh` (its `SOURCE.txt` now covers Linux too).
+
+## How the macOS release works (built 2026-10-30)
+
+Same promise and the same reference data: `tools/release/expected.txt`, `gtav/gtav_manifest.toml`
+and `tools/game_dll/codegen.partition.json`. **Mac codegen is byte-identical too**: all 811 `gen`
+lines matched a run of the Mac `rexglue` (176 s), so one `expected.txt` serves all three platforms.
+Package: `gtav-recomp-macos-arm64.zip` holding `GTAV.app`, `README.txt` and `LICENSES/`. Apple
+silicon only, macOS 15 or newer (the bundled dxc needs 15). **Signed ad hoc, not notarized** (owner
+decision: a Developer ID would tie the release to the owner's Apple account, which Apple can revoke);
+the README tells players to use Open Anyway or `xattr -dr com.apple.quarantine`.
+
+Player side (`loader/src/main_mac.mm`, AppKit; `install.cpp` / `sources.cpp` shared):
+- The signed bundle must stay unmodified, and a quarantined app may be translocated to a random
+  read-only path, so the package (`GTAV.app/Contents/Resources/gtav`, install.cpp's *root*) is
+  read-only. Everything made goes to the **game folder** (*home*, default
+  `~/Library/Application Support/GTAV Recomp`, chosen in the window, kept in NSUserDefaults):
+  `data/` and `gtav_game.dylib`. `SyncRuntime()` copies `gtav_fast`, the dylibs, `vulkan/` and the
+  shader tools (`tools/shaders/*` -> `<home>/tools/`) there before every launch (size + mtime), so
+  `gtav_fast` finds `gtav_game.dylib` through its `@executable_path` rpath. On Windows and Linux
+  home = root.
+- Window: Disc 1 / Disc 2 / TU / game folder rows with Choose... (NSOpenPanel), Install/Cancel,
+  Play, progress bar and log; questions are NSAlerts. Opening the app when installed syncs, starts
+  the game (posix_spawn, own session, stdout in `data/logs/gtav_stdout.txt`) and quits; hold
+  Option for the window. `GTAV.app/Contents/MacOS/GTAV --unattended [--home DIR] [--root PKG]` is
+  the usual test contract (`<home>/data/launcher.ini`, `data/logs/unattended.txt`).
+- Preflight: macOS 15, package complete; `CheckGameFolder()`: creatable and case-insensitive
+  (`pathconf(_PC_CASE_SENSITIVE)`). Jobs: `hw.memsize` minus 3 GB, 1 GB per clang.
+- Compile with the bundled clang 19.1.7: `--target=arm64-apple-macos15 -nostdinc++ -nostdlibinc
+  -fno-stack-protector -O2 -std=gnu++23 -mcpu=apple-m1 -fno-exceptions -fno-rtti
+  -fno-threadsafe-statics -fno-math-errno` (Apple clang enables the stack protector by default:
+  `___stack_chk_guard` would be undefined). No `fs_crt.cpp` (x86 asm): memcpy & co. come from
+  libSystem. 409 files in ~5 min on an 8 GB M1 with 4 jobs.
+- `fs/gtav_pch.h` on arm64: includes the **simde** headers (MIT; the release ships them in
+  `tools/game_dll/fs/include/simde`, they need only clang's `arm_neon.h`) instead of mapping the
+  simde names to x86 intrinsics; `FPSCRPlatform` uses FPCR (SDK `platform/fpscr.h`); `simde_mm_vsl`
+  takes the SDK's NEON branch (an immediate shift needs a constant count). Mach-O has no
+  `__attribute__((alias))`: unhooked `<name>` is an assembler equate (`.set _name, ___imp__name`),
+  same address, no thunk.
+- Link `gtav_game.dylib` with the bundled `ld64.lld`: `-arch arm64 -platform_version macos 15.0
+  15.0 -dylib -install_name @rpath/gtav_game.dylib -exported_symbols_list gtav_game.exports`
+  against `tools/game_dll/libSystem.tbd` (our five-name text stub, so no Apple SDK is needed) and
+  the package's `librexruntime.dylib` (kernel imports). Mach-O cannot link against an executable,
+  so the 2930 hooks and 9 bridge functions are `-U` (dynamic lookup) symbols listed in
+  `gtav_game.undefs`; dyld binds them to `gtav_fast` (built with `-export_dynamic`) at load time.
+
+Developer side:
+- `gtav/CMakeLists.txt` `GTAV_GAME_DLL=ON` on macOS: output `gtav_fast`; the pre-link step
+  (`gen_interface.py`, macOS mode, strips Mach-O's leading underscores) writes `gtav_hooks.h`,
+  `gtav_game.exports`, `gtav_game.undefs` and a stub `gtav_game.dylib` (`brk #1` per export).
+  Same sets as Windows/Linux (2930 hooks, 2931 imports, 9 bridge). Native shaders are compiled with
+  `dxc-macos` now (no `GTAV_PREBUILT_NATIVE_SHADERS` needed); a POST_BUILD step puts
+  `tools/{XenosRecomp,dxc,lib/libdxcompiler.dylib,shader_common.h}` next to the exe, with
+  `tools/release/macho_tool.py` (arm64 slice, rpath `@executable_path/lib`, ad-hoc re-sign).
+- `tools/game_dll/build_game_dll.py` macOS mode (`--runtime librexruntime.dylib`, `--simde DIR`;
+  takes Xcode's `ld` if there is no `ld64.lld`).
+- `tools/release/build_release_macos.sh OUT LLVM_DIR LICENSES_DIR [--zip]` builds everything
+  shipped for macOS 15 with `-ffile-prefix-map` (no build paths; the SDK's Vulkan loader also gets
+  `SYSCONFDIR=/etc`, it embedded the install prefix) into `rexglue-sdk/out/install/mac-rel`,
+  `build/xenosrecomp-mac`, `build/gtav-fast`, `build/launcher-mac`, then runs
+  `make_release_macos.py` (refuses binaries that need a library outside macOS + the package, have
+  an absolute rpath or need macOS > 15; signs every Mach-O ad hoc, inside out).
+- LLVM: the official `LLVM-19.1.7-macOS-ARM64.tar.xz` (19.1.5, used on Windows/Linux, has no
+  macOS arm64 build): `clang-19` -> `clang++`, `lld` -> `ld64.lld`, `lib/clang/19/include`.
+  Licenses: `LLVM.txt` (llvm/LICENSE.TXT at llvmorg-19.1.7), `DirectXShaderCompiler.txt`.
+- Shaders: the dxc in `thirdparty/XenosRecomp/thirdparty/dxc-bin/bin/arm64/dxc-macos` +
+  `lib/arm64/libdxcompiler.dylib` works on macOS (no dxc build needed). A boot of the split game
+  with an empty SPIR-V folder translated 2349 game shaders on the Mac, 0 failures.
+- Taint scan: `tools/release/scan_release_macos.sh RELEASE_DIR [GEN_DIR [SOURCE...]]` (the
+  decrypted image comes from `scripts/extract_basefile.py`, kept outside the repo; controls: SDK
+  sources/templates, XenosRecomp, simde, clang's headers; macOS has no system-library files).
+  First package (2026-10-30, sources: decrypted image, TU xexp, update.rpf, the generated tree,
+  the 2349 shaders a boot made): **PASS, 0 failing** (longest runs: codegen templates 112 B in
+  rexglue, SDK 72 B, SPIR-V boilerplate 32 B). It first failed on libdxcompiler.dylib: the
+  CRC-32 table plus 4 zero bytes (1028 B) that zlib's braided tables in the game also have;
+  `taint_scan.py` now counts zlib's eight braided CRC tables as public.
+- End-to-end (2026-10-30, M1 8 GB): the packaged `GTAV.app --unattended` from the owner's two ISOs
+  + the TU27 STFS file into a game folder on a USB HFS+ drive: every file matched `expected.txt`
+  (no questions), 811/811 gen hashes, 406 files compiled in 266 s with 5 jobs (62% memory free),
+  ld64.lld link, ~14 min in all, 15 GB folder. The installed game booted muted and hidden with an
+  empty SPIR-V folder: 28,500 frames, 3605 shaders made by its own tools, 0 failures, 0 missing
+  (it waits on the first-boot screen of a fresh profile, as on Windows).
+- The Mac SDK tree is exactly v0.10.0 + `rexglue-sdk-gtav-linux.patch` (checked 2026-10-30), so the
+  corresponding-source archive needs no new patch. `make_source_archive.sh` no longer needs GNU tar.
 
 ## Licensing and source (decided 2026-10-29)
 
