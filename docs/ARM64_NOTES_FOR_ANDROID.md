@@ -30,6 +30,12 @@ machine). Everything here was measured on an 8 GB M1 MacBook (MoltenVK 1.4.1, na
 - Thread QoS (macOS only, SDK threading_posix.cpp + renderer/submit threads): on Android the
   equivalent is thread priority / `setpriority`, and big.LITTLE placement matters even more.
 
+- **CPU target:** the Mac game build was configured with `-march=armv8-a` (SDK preset default),
+  which overrides Apple clang's `apple-m1` default: plain ARMv8.0, no LSE atomics. Rebuilt with
+  `-DCMAKE_C_FLAGS=-mcpu=apple-m1 -DCMAKE_CXX_FLAGS=-mcpu=apple-m1` (2026-10-30): loading ~3%
+  faster in both A/B pairs, fps slightly up (`tools/native/bin_ab.sh`). The SDK runtime the same way (mac preset now `-mcpu=apple-m1`): loading another ~11% faster (2.6-2.7 s in both pairs, `tools/native/lib_ab.sh`). Android: build for at least
+  `-march=armv8.2-a` (LSE) or the phone's `-mcpu`, not the armv8-a preset.
+
 ## 3. Tile GPUs: what costs and what helped (applies to Adreno / Mali too)
 
 **A render pass costs ~50 us on the M1 no matter how small** (tools/native/metal_pass_bench.mm,
@@ -50,14 +56,32 @@ Kept (A/B in the same run, see section 6):
 | plume: no TOP/BOTTOM_OF_PIPE next to real stages (MoltenVK maps them to every stage); render-target transitions wait at the fragment stage only | gtav_native_exact_barriers, gtav_native_fragment_barriers (true) | -0.3 ms |
 | whole-destination resolve copies use LOAD_OP_DONT_CARE | gtav_native_resolve_discard (true) | ~0 (kept, cheaper on bandwidth) |
 
+| colour clears as draws in the draws' pipeline layout, not vkCmdClearAttachments (MoltenVK restarted the Metal render pass at each clear: ~34 extra encoders a frame) | gtav_native_draw_clears (true) | -2.0..2.2 ms |
+| GTA V's EDRAM depth-restore strips skipped (25 passes into targets nothing reads) | gtav_native_skip_depth_restore (true) | -0.8 ms |
+
+Finding encoders: `tools/native/mst_labels.py` joins MoltenVK's encoder labels ("vkCmdBeginRenderPass",
+"Metal renderpass restart", "vkCmdResolveImage (... stage)", "Post-render-pass occlusion query
+accumulation", ...) from a Metal System Trace with the GPU intervals: count, busy and the idle gap
+before each kind per frame. A clear at the start of a pass cost a whole encoder; a clear as a draw
+costs nothing extra. Other MoltenVK extras per frame: vkCmdResolveImage = 2-3 encoders (the
+reflection cubemap's 6 MSAA faces), occlusion queries = an accumulation compute encoder each.
+
 Tried and not kept:
 - Render targets per frame in flight (frames overlap on the GPU): `gtav_native_slot_targets`
   (false) — no change, doubles target memory.
 - In-pass resolves (input attachment + image store inside the source pass, pass kept open):
-  `GTAV_NATIVE_FETCH_RESOLVE=1` + `gtav_native_fetch_resolves`; storage use only for small
-  destinations (`gtav_native_storage_max_texels`, 640x360) because STORAGE costs the texture its
-  lossless compression (~1 ms). Net ~-1 ms GPU, **but the phone screen renders black** in that
-  mode. Off by default; worth fixing on Android where passes cost more.
+  **now on by default on macOS** (2026-10-30 evening; `GTAV_NATIVE_FETCH_RESOLVE=0` turns them off).
+  Storage use only for small destinations (`gtav_native_storage_max_texels`, 640x360) because
+  STORAGE costs the texture its lossless compression (~1 ms). The black phone screen / blown-out
+  sky / black top tile came from passes with **more than one draw** before the resolve: there the
+  framebuffer read returned black although the draws had rendered (a green `clearColor` just before
+  the read was seen, so fetch itself works; no pass restart in between). Not understood (MoltenVK /
+  Apple raster order?). `gtav_native_fetch_max_draws` (default 1) keeps in-pass resolves to
+  one-draw passes: ~43 of ~46 a frame (the post-processing chains), correct by eye in five scenes.
+  Live A/B in a heavy scene: 35.9 -> 37.9 fps, GPU -1.5 ms. Diagnostics: `gtav_native_fetch_range`
+  (lo:hi of the frame's candidates, bisecting), `gtav_native_fetch_debug` (1 magenta, 2 source+red,
+  3 alpha 1, 4 green clear before the read), `gtav_native_seqdiag=1` with GTAV_NATIVE_PASS_STATS
+  (the next frame's command sequence with pass starts and each in-pass resolve's attachments).
 - Compute resolves (earlier session): fewer passes but STORAGE made it slower.
 
 ## 4. CPU (render thread) on arm64
@@ -74,6 +98,16 @@ rect-list expansion ~10%, fence-copy pushes ~11% (memory pressure: see 5).
   before the SDK's handler (its "stale protection" recovery would swallow our faults) and must
   cover host syscalls writing guest memory (HostPathFile `pread` -> EFAULT); not done yet.
 - Per-draw timing (`prof.Mark`, 6 clock reads a draw) now runs on every 8th frame only.
+- Hash worker threads (`gtav_native_hash_threads`, now 3 by default on macOS): the frame's small
+  textures/buffers are hashed on workers before recording: record -2.4 ms a frame (live A/B).
+- Plume ends the render pass for every occlusion query begin/end (`beginOcclusionQuery`): a few
+  invisible extra passes a frame (~6 queries). Keeping queries inside the pass needs the query to
+  end before the pass does (Vulkan rule); not done.
+- The game waits on the renderer at GPU fences (`gtav_native_fence_wait`, macOS): ~7.7 ms of
+  waiting per frame in heavy views, i.e. the game and the renderer partly serialize. Waiting per
+  draw instead of per frame (`gtav_native_fence_wait_draw`, off) let the command processor reach
+  the fences of the frame still being built, which are copied: ~3x the copied bytes and no gain
+  (measured while the Mac was swapping hard; worth re-measuring after a reboot).
 
 ## 5. Memory (the 8 GB Mac swapped; phones have less)
 

@@ -57,7 +57,13 @@ REXCVAR_DEFINE_BOOL(gtav_native_exact_cache, false, "GTAV",
                     "(no sampled-hash shortcut for large ones)");
 // Off by default: the hash is taken at the start of the frame, so data the game rewrites before
 // the draw is recorded keeps last frame's upload for one frame (foliage popping, owner 10-29).
-REXCVAR_DEFINE_INT32(gtav_native_hash_threads, 0, "GTAV",
+// macOS (no write watch): 3 workers took ~2.4 ms a frame off recording in the open world.
+#ifdef __APPLE__
+#define GTAV_HASH_THREADS_DEFAULT 3
+#else
+#define GTAV_HASH_THREADS_DEFAULT 0
+#endif
+REXCVAR_DEFINE_INT32(gtav_native_hash_threads, GTAV_HASH_THREADS_DEFAULT, "GTAV",
                      "Worker threads that hash the frame's small textures and buffers before it is recorded "
                      "when there is no write watch (0: hash on the render thread)");
 REXCVAR_DEFINE_INT32(gtav_native_dump_rt_count, 150, "GTAV",
@@ -88,6 +94,20 @@ REXCVAR_DEFINE_BOOL(gtav_native_slot_targets, false, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_native_defer_writebacks, true, "GTAV",
                     "Native renderer: write small resolves back to guest memory at the end of the frame instead of "
                     "right after each resolve (fewer render passes)");
+REXCVAR_DEFINE_BOOL(gtav_native_skip_depth_restore, true, "GTAV",
+                    "Native renderer: skip GTA V's depth restore strips (EDRAM aliasing trick; native "
+                    "depth targets keep their contents)");
+REXCVAR_DEFINE_BOOL(gtav_native_draw_clears, true, "GTAV",
+                    "Native renderer: colour clears as draws instead of vkCmdClearAttachments (MoltenVK restarts "
+                    "the Metal render pass for a clear at its start)");
+#ifdef __APPLE__
+#define GTAV_DIRECT_CONVERT_DEFAULT true
+#else
+#define GTAV_DIRECT_CONVERT_DEFAULT false
+#endif
+REXCVAR_DEFINE_BOOL(gtav_native_direct_convert, GTAV_DIRECT_CONVERT_DEFAULT, "GTAV",
+                    "Native renderer: vertex conversions write straight into upload memory (cached on Apple GPUs) "
+                    "instead of through a scratch buffer (write-combined memory elsewhere)");
 REXCVAR_DEFINE_BOOL(gtav_native_fragment_barriers, true, "GTAV",
                     "Native renderer: render target transitions wait at the fragment stage only");
 REXCVAR_DEFINE_INT32(gtav_native_skip_resolves, 0, "GTAV",
@@ -97,7 +117,16 @@ REXCVAR_DEFINE_BOOL(gtav_native_resolve_discard, true, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_native_defer_clears, true, "GTAV",
                     "Native renderer: apply resolve clears in the target's next render pass instead of a pass of their own");
 REXCVAR_DEFINE_BOOL(gtav_native_fetch_resolves, true, "GTAV",
-                    "Native renderer: in-pass colour resolves when available (GTAV_NATIVE_FETCH_RESOLVE=1)");
+                    "Native renderer: in-pass colour resolves when available (macOS; GTAV_NATIVE_FETCH_RESOLVE=0 at start: off)");
+REXCVAR_DEFINE_INT32(gtav_native_fetch_debug, 0, "GTAV",
+                     "Diagnostic: in-pass resolves store 1 magenta, 2 source + red, 3 source with alpha 1, 4 a green clear");
+REXCVAR_DEFINE_INT32(gtav_native_seqdiag, 0, "GTAV",
+                     "Diagnostic (GTAV_NATIVE_PASS_STATS): log the command sequence of the next frame when set to 1");
+REXCVAR_DEFINE_INT32(gtav_native_fetch_max_draws, 1, "GTAV",
+                     "Native renderer: in-pass resolves only when the source's pass has at most this many draws "
+                     "(after more, framebuffer fetch on MoltenVK read black: phone screen, half-res sky pass)");
+REXCVAR_DEFINE_STRING(gtav_native_fetch_range, "", "GTAV",
+                      "Diagnostic: in-pass resolves only for this frame's candidates lo:hi (ordinal, hi exclusive)");
 REXCVAR_DEFINE_INT32(gtav_native_storage_max_texels, 640 * 360, "GTAV",
                      "Native renderer: in-pass/compute resolves only into destinations up to this many texels");
 REXCVAR_DEFINE_BOOL(gtav_native_compute_resolves, false, "GTAV",
@@ -125,6 +154,7 @@ REXCVAR_DEFINE_BOOL(gtav_native_tile_penumbra_all, true, "GTAV",
 
 namespace plume {
 extern bool g_colorInputAttachments;  // plume-gtav.patch
+extern uint32_t g_statRenderPasses;   // plume-gtav.patch
 }
 
 namespace gtav::native {
@@ -1935,7 +1965,9 @@ struct Backend::Impl {
   std::map<std::string, uint32_t> pass_reasons;
   void PassBegin(const char* why) {
     if (pass_stats) pass_reasons[why]++;
+    if (seqdiag) seq_passes += fmt::format("  [pass: {}]\n", why);
   }
+  std::string seq_passes;
   bool seqdiag = false;
   std::string seq_note;
 
@@ -2101,7 +2133,7 @@ struct Backend::Impl {
       REXLOG_INFO("[native] compute colour resolves: {}", compute_resolves ? "on" : "unavailable");
     }
     // In-pass colour resolves (tile GPUs): see native_resolve_fetch.frag and FetchResolve.
-    if (!rect_gs && plume::g_colorInputAttachments && std::getenv("GTAV_NATIVE_FETCH_RESOLVE")) {
+    if (!rect_gs && plume::g_colorInputAttachments) {
       RenderDescriptorSetBuilder input, dest;
       input.begin();
       input.addInputAttachment(0);
@@ -2127,6 +2159,11 @@ struct Backend::Impl {
       fetch_resolves = fetch_dest_set && fetch_layout && fetch_vs && fetch_ps[0] && fetch_ps[1] && fetch_ps[2] &&
                        fetch_ps[3];
       REXLOG_INFO("[native] in-pass colour resolves: {}", fetch_resolves ? "on" : "unavailable");
+    }
+    {  // ClearAttachment: colour clears as draws (see native_clear.frag), in the draws' layout
+      clear_vs = device->createShader(g_native_resolve_fetch_vs, sizeof(g_native_resolve_fetch_vs), "main",
+                                      RenderShaderFormat::SPIRV);
+      clear_ps = device->createShader(g_native_clear_ps, sizeof(g_native_clear_ps), "main", RenderShaderFormat::SPIRV);
     }
     RenderGraphicsPipelineDesc dc;
     dc.pipelineLayout = layout.get();
@@ -2334,6 +2371,9 @@ struct Backend::Impl {
   std::vector<uint8_t> convert_scratch;
   template <class F>
   void ConvertInto(uint8_t* dst, uint64_t size, const F& convert) {
+    // Apple GPUs share cached memory with the CPU (Metal shared storage, not write-combined): the
+    // conversion writes there directly instead of through the scratch copy.
+    if (REXCVAR_GET(gtav_native_direct_convert)) return convert(dst);
     if (convert_scratch.size() < size) convert_scratch.resize(size_t(size));
     convert(convert_scratch.data());
     std::memcpy(dst, convert_scratch.data(), size_t(size));
@@ -2598,14 +2638,93 @@ struct Backend::Impl {
     }
     list->setFramebuffer(fb.get());
     bound_fb = fb.get();
+    pass_draws = 0;
     for (uint32_t i = 0; i < 4; i++) bound_color[i] = i < count ? color[i] : nullptr;
     bound_depth = depth;
     for (uint32_t i = 0; i < count && !pending_clears.empty(); i++) {
       auto it = pending_clears.find(color[i]);
       if (it == pending_clears.end()) continue;
-      for (const auto& c : it->second) list->clearColor(i, c.color, &c.rect, 1);
+      for (const auto& c : it->second) ClearAttachment(list, i, c.color, &c.rect, 1);
       pending_clears.erase(it);
     }
+  }
+
+  // Colour clear of bound attachment `index` as a draw (--gtav_native_draw_clears): MoltenVK turned a
+  // vkCmdClearAttachments at the start of a render pass into a restart of the Metal render pass with
+  // clear load actions, an extra encoder (~16 us of GPU gap) per clear, ~30 a frame.
+  std::unique_ptr<RenderShader> clear_vs, clear_ps;
+  std::unordered_map<uint64_t, std::unique_ptr<RenderPipeline>> clear_pipelines;
+  uint32_t stat_draw_clears = 0;
+  void ClearAttachment(RenderCommandList* list, uint32_t index, const RenderColor& color, const RenderRect* rects,
+                       uint32_t count) {
+    RenderTarget* t = index < 4 ? bound_color[index] : nullptr;
+    if (!REXCVAR_GET(gtav_native_draw_clears) || !clear_vs || !clear_ps || !bound_fb || !t ||
+        dumping) {
+      list->clearColor(index, color, rects, count);
+      return;
+    }
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < 4; i++)
+      if (bound_color[i]) n = i + 1;
+    struct {
+      RenderFormat formats[4];
+      RenderFormat depth;
+      uint32_t count, index, samples;
+    } key{};
+    for (uint32_t i = 0; i < n; i++) key.formats[i] = bound_color[i] ? bound_color[i]->format : RenderFormat::UNKNOWN;
+    key.depth = bound_depth ? bound_depth->format : RenderFormat::UNKNOWN;
+    key.count = n;
+    key.index = index;
+    key.samples = bound_color[0] ? bound_color[0]->msaa : 0;
+    auto& pipeline = clear_pipelines[Hash(&key, sizeof(key))];
+    if (!pipeline) {
+      RenderGraphicsPipelineDesc desc;
+      desc.pipelineLayout = layout.get();  // the draws' layout: their descriptor sets stay bound
+      desc.vertexShader = clear_vs.get();
+      desc.pixelShader = clear_ps.get();
+      desc.renderTargetCount = n;
+      for (uint32_t i = 0; i < n; i++) {
+        desc.renderTargetFormat[i] = key.formats[i];
+        desc.renderTargetBlend[i] = RenderBlendDesc::Copy();
+        if (i != index) desc.renderTargetBlend[i].renderTargetWriteMask = 0;
+      }
+      desc.depthTargetFormat = key.depth;
+      desc.multisampling = RenderMultisampling(SampleCount(key.samples));
+      pipeline = device->createGraphicsPipeline(desc);
+      if (!pipeline) {
+        list->clearColor(index, color, rects, count);
+        return;
+      }
+    }
+    auto& ds = draw_state;
+    if (!ds.sets) {
+      list->setGraphicsPipelineLayout(layout.get());
+      list->setGraphicsDescriptorSet(texture_set.get(), 0);
+      list->setGraphicsDescriptorSet(texture_set.get(), 1);
+      list->setGraphicsDescriptorSet(texture_set.get(), 2);
+      list->setGraphicsDescriptorSet(sampler_set.get(), 3);
+      ds.sets = true;
+    }
+    list->setPipeline(pipeline.get());
+    const float push[4] = {color.r, color.g, color.b, color.a};
+    list->setGraphicsPushConstants(0, push, 0, sizeof(push));
+    RenderViewport vp(0.0f, 0.0f, float(t->width), float(t->height));
+    RenderViewport vps[4] = {vp, vp, vp, vp};
+    list->setViewports(vps, std::max(n, 1u));
+    const RenderRect whole{0, 0, int32_t(t->width), int32_t(t->height)};
+    for (uint32_t r = 0; r < (rects ? count : 1u); r++) {
+      const RenderRect& rc = rects ? rects[r] : whole;
+      RenderRect scs[4] = {rc, rc, rc, rc};
+      list->setScissors(scs, std::max(n, 1u));
+      list->drawInstanced(3, 1, 0, 0);
+    }
+    // The next draw sets its pipeline, viewports, scissor and depth bias again; descriptor sets and
+    // vertex buffers stay bound (same layout).
+    ds.pipeline = nullptr;
+    ds.viewports = 0;
+    ds.scissor = RenderRect{};
+    ds.bias_set = false;
+    stat_draw_clears++;
   }
 
   // D3DRESOLVE_CLEARRENDERTARGET clears of a resolve's source, applied in the next render pass
@@ -3284,6 +3403,17 @@ struct Backend::Impl {
         dst = a.cpu;
         ref = RenderBufferReference(a.buffer, a.offset);
       }
+      rect_elems.clear();
+      for (uint32_t n = 0; n < vl.element_count; n++) {
+        if (vl.elements[n].slotIndex != s) continue;
+        const RenderFormat f = vl.info[n].host;
+        const uint32_t floats = f == RenderFormat::R32_FLOAT            ? 1
+                                : f == RenderFormat::R32G32_FLOAT       ? 2
+                                : f == RenderFormat::R32G32B32_FLOAT    ? 3
+                                : f == RenderFormat::R32G32B32A32_FLOAT ? 4
+                                                                        : 0;
+        rect_elems.push_back({vl.host_offset[n], floats, f});
+      }
       ConvertInto(dst, size, [&](uint8_t* out) {
         const uint8_t* src = rect_conv[s].data();
         for (uint32_t q = 0; q < rects; q++, out += 6 * stride) {
@@ -3301,15 +3431,24 @@ struct Backend::Impl {
           const uint8_t* order[5] = {corner, va, vb, vb, va};
           for (int k = 0; k < 5; k++) std::memcpy(out + k * stride, order[k], stride);
           uint8_t* fourth = out + 5 * stride;
-          for (uint32_t n = 0; n < vl.element_count; n++) {
-            if (vl.elements[n].slotIndex != s) continue;
-            uint32_t o = vl.host_offset[n];
+          for (const auto& e : rect_elems) {
+            if (e.floats) {  // 32-bit float components: no format dispatch
+              for (uint32_t i = 0; i < e.floats; i++) {
+                float x, y, z;
+                std::memcpy(&x, va + e.offset + 4 * i, 4);
+                std::memcpy(&y, vb + e.offset + 4 * i, 4);
+                std::memcpy(&z, corner + e.offset + 4 * i, 4);
+                const float r = x + y - z;
+                std::memcpy(fourth + e.offset + 4 * i, &r, 4);
+              }
+              continue;
+            }
             float x[4] = {}, y[4] = {}, z[4] = {}, r[4] = {};
-            uint32_t comps = ReadHostElement(vl.info[n].host, va + o, x);
-            ReadHostElement(vl.info[n].host, vb + o, y);
-            ReadHostElement(vl.info[n].host, corner + o, z);
+            uint32_t comps = ReadHostElement(e.format, va + e.offset, x);
+            ReadHostElement(e.format, vb + e.offset, y);
+            ReadHostElement(e.format, corner + e.offset, z);
             for (uint32_t i = 0; i < comps; i++) r[i] = x[i] + y[i] - z[i];
-            if (comps) WriteHostElement(vl.info[n].host, fourth + o, r);
+            if (comps) WriteHostElement(e.format, fourth + e.offset, r);
           }
         }
       });
@@ -3317,6 +3456,11 @@ struct Backend::Impl {
     }
   }
   std::vector<uint8_t> rect_corner;
+  struct RectElement {
+    uint32_t offset, floats;  // floats: 32-bit float components (fast path), 0: by format
+    RenderFormat format;
+  };
+  std::vector<RectElement> rect_elems;  // RectExpand: the elements of the stream being expanded
 
   void DrawImpl(RenderCommandList* list, const FramePacket& f, const DrawCommand& d, void*) {
     prof.Start();
@@ -3348,6 +3492,13 @@ struct Backend::Impl {
         !live.empty() && live.find(fmt::format("{:016X}", d.vs_hash)) != std::string::npos)
       return;
     if (!skip_vs.empty() && skip_vs.find(fmt::format("{:016X}", d.vs_hash)) != std::string::npos) return;
+    // GTA V restores its depth buffer after EDRAM reuse by drawing 23 strips of 32 rows whose
+    // colour targets alias the depth surface (bases 000, 020, ... with depth at the base before).
+    // Native targets never lose their contents, so the restore has nothing to do here; drawn, it
+    // was 25 render passes into separate targets that nothing reads (~1 ms of GPU on the M1).
+    if (d.ps_hash == 0xF1490AFF1455E54Full && d.vs_hash == 0x5A4385B7FE6CD154ull &&
+        REXCVAR_GET(gtav_native_skip_depth_restore))
+      return;
     RenderShader* vs = Shader(d.vs_hash, false);
     RenderShader* ps = Shader(d.ps_hash, true);
     if (!vs || d.count == 0 || d.element_count == 0) {
@@ -4082,7 +4233,7 @@ struct Backend::Impl {
     const RenderRect* rc;
     uint32_t rn;
     for (uint32_t i = 0; i < count; i++)
-      if ((c.flags & (1u << i)) && rects_for(targets[i], &rc, &rn)) list->clearColor(i, col, rc, rn);
+      if ((c.flags & (1u << i)) && rects_for(targets[i], &rc, &rn)) ClearAttachment(list, i, col, rc, rn);
     if (depth && rects_for(depth, &rc, &rn)) list->clearDepthStencil(z, stencil, c.z, c.stencil & 0xFF, rc, rn);
     // The same EDRAM under another color format is another host target here, and D3D sets the new
     // surface's format only at the next draw, so the registers can still name the previous one: the
@@ -4484,7 +4635,7 @@ struct Backend::Impl {
   // and stores into the resolve texture, instead of a copy pass of its own (each pass is a Metal
   // encoder plus tile loads/stores: ~70 resolves a frame cost ~9 ms on the M1).
   static constexpr uint32_t kFetchDests = 4096;
-  bool fetch_resolves = false;      // available (GTAV_NATIVE_FETCH_RESOLVE at start)
+  bool fetch_resolves = false;      // available (macOS, unless GTAV_NATIVE_FETCH_RESOLVE=0 at start)
   bool use_fetch_resolves = true;   // --gtav_native_fetch_resolves (live)
   std::unique_ptr<RenderShader> fetch_vs, fetch_ps[4];
   std::unique_ptr<RenderDescriptorSet> fetch_dest_set;  // storage views of the resolve textures
@@ -4522,8 +4673,23 @@ struct Backend::Impl {
         if (bound_color[i] == src) k = int(i);
       }
     if (k < 0) return false;
+    if (pass_draws > uint32_t(std::max(0, REXCVAR_GET(gtav_native_fetch_max_draws)))) return false;
+    {
+      const uint32_t ordinal = fetch_candidates++;
+      const std::string& range = REXCVAR_GET(gtav_native_fetch_range);
+      if (!range.empty()) {
+        uint32_t lo = 0, hi = ~0u;
+        if (std::sscanf(range.c_str(), "%u:%u", &lo, &hi) < 1 || ordinal < lo || ordinal >= hi) return false;
+      }
+    }
     float scale = (IsFixed16(src->format) ? 32.0f : 1.0f) / (IsFixed16(dst_format) ? 32.0f : 1.0f);
     uint32_t mode = IsFixed10(uint32_t(regs::Color(r, source).format)) && src->float_data ? 1 : 0;
+    const int32_t fetch_debug = REXCVAR_GET(gtav_native_fetch_debug);
+    if (fetch_debug >= 1 && fetch_debug <= 3) mode = 1 + uint32_t(fetch_debug);
+    if (fetch_debug == 4) {  // diagnostic: green in the source under the copy (framebuffer fetch must see it)
+      RenderRect g{int32_t(x1), int32_t(y1), int32_t(x2), int32_t(y2)};
+      list->clearColor(uint32_t(k), RenderColor(0, 1, 0, 1), &g, 1);
+    }
     auto& input = fetch_input_sets[src->texture.get()];
     if (!input) {
       RenderDescriptorSetBuilder b;  // (a builder's desc points into itself: not copyable)
@@ -4580,7 +4746,10 @@ struct Backend::Impl {
     RenderRect scs[4] = {sc, sc, sc, sc};
     list->setViewports(vps, std::max(n, 1u));
     list->setScissors(scs, std::max(n, 1u));
+    const uint32_t passes_before = plume::g_statRenderPasses;
     list->drawInstanced(3, 1, 0, 0);
+    fetch_restarted = plume::g_statRenderPasses != passes_before;
+    if (fetch_restarted) stat_fetch_restarted++;
     // The pass goes on (the guest often draws on into the source): the barrier that makes the
     // stores visible comes with the texture's first use (Transition from GENERAL to SHADER_READ).
     layouts[dst.texture.get()] = RenderTextureLayout::GENERAL;
@@ -4589,6 +4758,10 @@ struct Backend::Impl {
     return true;
   }
   uint32_t stat_fetch_resolves = 0;
+  uint32_t fetch_candidates = 0;  // per frame, for --gtav_native_fetch_range
+  uint32_t pass_draws = 0;        // draws since BindTargets started the bound pass
+  bool fetch_restarted = false;   // the last in-pass resolve began a new Vulkan render pass
+  uint32_t stat_fetch_restarted = 0;
 
   // Colour resolve as a compute dispatch (see native_resolve_compute.comp): no render pass of its
   // own, and it sits next to the resolve's guest memory writeback dispatch.
@@ -4825,6 +4998,15 @@ struct Backend::Impl {
     bool in_pass = false;
     if (shader_copy && !depth_resolve && FetchResolve(list, r, src, int(source), dst, dst_format, x1, y1, x2, y2, px, py)) {
       in_pass = true;  // copied inside the source's render pass, which goes on
+      if (seqdiag) {
+        seq_note += fmt::format(" [in-pass #{}{} after {} draws, pass:", fetch_candidates - 1,
+                                fetch_restarted ? " RESTARTED" : "", pass_draws);
+        for (auto* c : bound_color)
+          seq_note += c ? fmt::format(" {}{}x{}f{}{}", c == src ? "*" : "", c->width, c->height, uint32_t(c->format),
+                                      c->msaa ? " msaa" : "")
+                        : std::string(" -");
+        seq_note += bound_depth ? fmt::format(" depth {}x{}]", bound_depth->width, bound_depth->height) : "]";
+      }
     } else if (shader_copy && !depth_resolve && compute_resolves && !dumping && dst.storage_index != ~0u &&
                dst.mips == 1 && dst.layers == 1 && rc.dest_level == 0 && rc.dest_face == 0) {
       float scale = (IsFixed16(src->format) ? 32.0f : 1.0f) / (IsFixed16(dst_format) ? 32.0f : 1.0f);
@@ -4933,7 +5115,7 @@ struct Backend::Impl {
       if (in_pass && bound_fb) {  // the source's pass is still open: clear there
         for (uint32_t i = 0; i < 4; i++)
           if (bound_color[i] == src) {
-            list->clearColor(i, RenderColor(rc.clear_color[0], rc.clear_color[1], rc.clear_color[2], rc.clear_color[3]),
+            ClearAttachment(list, i, RenderColor(rc.clear_color[0], rc.clear_color[1], rc.clear_color[2], rc.clear_color[3]),
                              &rect, 1);
             return;
           }
@@ -4969,6 +5151,7 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   s.take_notes = REXCVAR_GET(gtav_native_flicker_catch);
   s.t_shader = s.t_pipeline = s.t_texture = s.t_resolve = 0;
   s.tile_split = 0;
+  s.fetch_candidates = 0;
   s.tile_resolves.clear();
   s.tile_alias_done.clear();
   write_watch::Harvest();  // before this frame's texture and buffer lookups
@@ -5001,7 +5184,8 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
     s.dump_raw_f36.clear();
     s.snapshot_budget = 3;
   }
-  s.seqdiag = s.pass_stats && f.index && f.index % 3000 == 0;
+  s.seqdiag = s.pass_stats && f.index && (f.index % 3000 == 0 || REXCVAR_GET(gtav_native_seqdiag));
+  if (REXCVAR_GET(gtav_native_seqdiag)) rex::cvar::SetFlagByName("gtav_native_seqdiag", "0");
   std::string seq;
   uint32_t seq_draws = 0;
   auto flush_draws = [&] {
@@ -5012,8 +5196,12 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
     switch (c.kind) {
       case CommandKind::kDraw:
         s.Draw(list, f, f.draws[c.index]);
+        s.pass_draws++;
         DrawsRecorded(c.index + 1);
-        if (s.seqdiag) seq_draws++;
+        if (s.seqdiag) {
+          if (!s.seq_passes.empty()) flush_draws(), seq += s.seq_passes, s.seq_passes.clear();
+          seq_draws++;
+        }
         break;
       case CommandKind::kClear:
         s.Clear(list, f, f.clears[c.index]);
@@ -5022,7 +5210,7 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
       case CommandKind::kResolve:
         s.seq_note.clear();
         s.Resolve(list, f, f.resolves[c.index]);
-        if (s.seqdiag) flush_draws(), seq += "  " + s.seq_note + "\n";
+        if (s.seqdiag) flush_draws(), seq += s.seq_passes + "  " + s.seq_note + "\n", s.seq_passes.clear();
         break;
       case CommandKind::kQuery: s.Query(list, f.queries[c.index]); break;
     }
@@ -5061,7 +5249,10 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
       s.rect_hits = s.rect_misses = 0;
       for (auto& c : s.conv_bytes) c = 0;
       for (auto& c : s.conv_draws) c = 0;
-      if (s.fetch_resolves) REXLOG_INFO("[native]   in-pass resolves per frame: {:.1f}", s.stat_fetch_resolves / n);
+      if (s.fetch_resolves)
+        REXLOG_INFO("[native]   in-pass resolves per frame: {:.1f} ({:.1f} began a new Vulkan pass)",
+                    s.stat_fetch_resolves / n, s.stat_fetch_restarted / n);
+      s.stat_fetch_restarted = 0;
       if (s.compute_resolves) REXLOG_INFO("[native]   compute resolves per frame: {:.1f}", s.stat_compute_resolves / n);
       s.stat_compute_resolves = 0;
       {

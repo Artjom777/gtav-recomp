@@ -29,6 +29,10 @@ uint Float32To7e3(float f) {
 
 void main() {
     vec4 v = subpassLoad(g_Source) * g_Push.Scale;
+    // diagnostics (--gtav_native_fetch_debug): 2 magenta, 3 source + red, 4 source with alpha 1
+    if (g_Push.Mode == 2u) v = vec4(1.0, 0.0, 1.0, 1.0);
+    if (g_Push.Mode == 3u) v.r += 0.5;
+    if (g_Push.Mode == 4u) v.a = 1.0;
     if (g_Push.Mode == 1u)
         v = vec4(Float32To7e3(v.r) / 1023.0, Float32To7e3(v.g) / 1023.0, Float32To7e3(v.b) / 1023.0, clamp(v.a, 0.0, 1.0));
     imageStore(g_Dest[g_Push.DestIndex], ivec2(gl_FragCoord.xy) + g_Push.DestMinusSource, v);
