@@ -100,7 +100,64 @@ Game / plume:
 - safe_read.h: vm_read_overwrite.
 - gtav/CMakeLists.txt: GTAV_IOS, imported host rex::rexglue for the codegen rule, no tools/ staging.
 
-## Release plan (draft, 2026-10-31)
+## Performance and memory (perf run 2026-10-31, iPhone 13 mini)
+
+Measured with the game's own log lines (`memory at frame`, `record ms per frame`, `GPU frame`,
+`caches:`), live `menu_set` cvars and `--gtav_native_pass_gpu_times`:
+- **Memory was the problem.** Two open-world runs were killed by jetsam after ~6 min (footprint
+  2.2 GB of a ~2.35 GB limit with increased-memory-limit; Metal 1.4 GB in 256 MB steps). Fixed:
+  plume gives images their own allocations and uses 32 MB VMA blocks on iOS (MoltenVK made each
+  256 MB block holding a buffer a 256 MB MTLBuffer, on top of every image's own MTLTexture); the
+  vertex/index buffer cache has a budget (`gtav_native_buffer_budget_mb`, 96 MB on phones; it had
+  none: 18,000 buffers in minutes); texture budget 192 MB (args.txt); below 600 MB headroom
+  (`gtav_native_low_memory_mb`) both caches shrink to half. After: an hour of play, footprint
+  1.5-1.7 GB, Metal ~0.9 GB, malloc ~0.85 GB.
+- Memory pressure is also what made the CPU slow: guest memory is a file mapping, iOS evicts its
+  pages, and the texture/buffer hash checks fault them back in (texture checks 15-117 ms a frame
+  under pressure, 1-4 ms after the fix).
+- GPU: ~28 ms a frame in the city (30 fps cap holds), 34-38 ms in the busiest scenes. Biggest
+  passes: the 1280x720 G-buffer (4 colour + depth) ~10 ms, a 1-target 720p pass with depth ~5 ms,
+  the MSAA 160x720 pass ~3 ms; ~160-190 render passes a frame. No VK_KHR_fragment_shading_rate on
+  MoltenVK (coarse shading unavailable); a render scale below 720p needs every shader changed.
+- Tools: `gtav_native_texture_sample_frames` (large-texture spot checks every N frames, A/B knob),
+  hitch log only past 50 ms on phones, logs rotate at 16 MB (`devicectl copy from` stalls on files
+  past ~20 MB; when the phone's file service wedges, replug the cable).
+
+## Release (built and tested on the Mac 2026-10-31; the ipa not yet sideloaded)
+
+Constraint as for every release: nothing Rockstar-derived is published, and iOS can neither
+compile code nor translate shaders, so the player's **Mac** builds the phone's game library and
+shaders from its installed game (loader/src/install.cpp `RunIphone`):
+- Package: `GTAV.app/Contents/Resources/gtav/ios/GTAV.app` (the iOS shell from
+  `tools/ios/make_shell.sh`: gtav built with `GTAV_GAME_DLL=ON`, SDK runtime, MoltenVK, Info.plist;
+  unsigned, no game code) and `tools/game_dll/libSystem_ios.tbd`. Release build:
+  `IOS_SHELL=1 tools/release/build_release_macos.sh ...` (iOS SDK + shell for A14 with
+  -ffile-prefix-map; make_release_macos.py `--ios-shell` checks the iOS binaries) - not yet run.
+- Player: "Build for iPhone" in the setup window (Option at launch) or `GTAV --iphone [--home D]`:
+  codegen + reference check as for the install, compile for `arm64-apple-ios17.0 -mcpu=apple-a14`,
+  ld64.lld against libSystem_ios.tbd and the shell's librexruntime.dylib, shaders from
+  `data/shader_cache` (+ `iphone/shader_cache` copied back from the phone) through XenosRecomp, the
+  UBO rewrite (tools/android/ubo_constants.py ported to C++; its 3,653 outputs are byte-identical
+  to make_spirv.sh) and dxc, then `iphone/GTAV.ipa` (unsigned, for Sideloadly / AltStore) and
+  `iphone/Documents/{args.txt,spirv}`. The player copies those and data/{game,update,user} into
+  the app's Documents in Finder (README_MACOS.txt "iPhone"). A second run with a current ipa
+  only translates new shaders (seconds).
+- On the phone, shaders without SPIR-V are skipped and saved to Documents/shader_cache
+  (`gtav_native_save_missing_shaders`) for the next Mac run.
+- Test (2026-10-31, M1 8 GB): shipped v0.1.0-macos package + iOS shell, game folder linked to the
+  clean-room install: 9 min, 811/811 gen hashes, 406 files in 271 s, 3,604 shaders, 0 failures.
+- The release layout (shell + gtav_game.dylib from build_game_dll.py --ios) boots on the phone
+  (dyld binds the 2930 hooks, Vulkan up); its first run ended with signal 9 after ~10 min, cause
+  not read yet (the phone's file service had wedged).
+
+Open:
+- Free Apple IDs cannot get `increased-memory-limit` / `extended-virtual-addressing`: measure the
+  limit without them (sign with fewer entitlements: footprint + available in `memory at frame`)
+  against the 1.5-1.7 GB footprint, and whether the guest address space reserves without EVA.
+- Sideload the packaged ipa end to end (Sideloadly), and a fresh Documents (logs/ created?).
+- Minimum device: A14 (iPhone 12) is the build target; only the A15 was tested.
+
+## Release plan (original draft, 2026-10-31)
 
 Built and checked on the Mac (2026-10-31, not yet run on the phone):
 - Shell: `cmake ... -DGTAV_GAME_DLL=ON -B build/ios-shell` -> gtav_fast (3 MB, no game code; the
