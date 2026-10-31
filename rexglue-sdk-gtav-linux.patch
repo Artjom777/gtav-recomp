@@ -508,17 +508,22 @@ index 20a2cd8..0897aac 100644
      }
    }
 diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
-index 11b83be..3565b95 100644
+index 11b83be..e2bb4c2 100644
 --- a/src/audio/xma_context.cpp
 +++ b/src/audio/xma_context.cpp
-@@ -9,12 +9,15 @@
+@@ -9,12 +9,20 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
  
 +#include <chrono>
++#include <condition_variable>
 +#include <mutex>
  #include <algorithm>
  #include <cstring>
++#include <map>
++#include <thread>
++#include <utility>
++#include <vector>
  
  #include <rex/audio/xma/context.h>
  #include <rex/audio/xma/decoder.h>
@@ -527,7 +532,7 @@ index 11b83be..3565b95 100644
  #include <rex/dbg.h>
  #include <rex/logging.h>
  #include <rex/memory/ring_buffer.h>
-@@ -36,10 +39,36 @@ extern "C" {
+@@ -36,10 +44,130 @@ extern "C" {
  // Credits for most of this code goes to:
  // https://github.com/koolkdev/libertyv/blob/master/libav_wrapper/xma2dec.c
  
@@ -540,6 +545,10 @@ index 11b83be..3565b95 100644
 +REXCVAR_DEFINE_BOOL(xma_flush_streams, false, "Audio",
 +                    "Experiment: a new XMA stream flushes the decoder instead of reopening it (rebuilding its "
 +                    "tables); more audio bursts in tests");
++REXCVAR_DEFINE_INT32(xma_fresh_contexts, 3, "Audio",
++                     "Decoder contexts per format kept opened ahead on a background thread: a new XMA stream "
++                     "takes one instead of reopening its own (same fresh state, without rebuilding the codec "
++                     "tables on the audio thread); 0 = reopen in place");
 +REXCVAR_DEFINE_BOOL(xma_trace, false, "Audio", "Log loud decoded XMA frames and starved-input resets");
 +REXCVAR_DEFINE_STRING(xma_dump_raw, "", "Audio", "Write every decoded XMA frame (with context and rate) to this file");
 +REXCVAR_DEFINE_BOOL(xma_starved_reset, true, "Audio",
@@ -559,12 +568,102 @@ index 11b83be..3565b95 100644
 +  }
 +  return peak;
 +}
++
++// Freshly opened decoder contexts by (sample rate, channels), made on a background thread, and
++// contexts to free there. Opening builds the codec's MDCT/sine/VLC tables (~20% of the game's
++// audio thread on a phone); a pre-opened context is the same fresh state as a reopen.
++class FreshContexts {
++ public:
++  static FreshContexts& Get() {
++    static FreshContexts* instance = new FreshContexts();  // lives for the process
++    return *instance;
++  }
++  // A fresh opened context for the format, or nullptr (the caller opens one). Asks for more.
++  AVCodecContext* Take(const AVCodec* codec, int sample_rate, int channels) {
++    const int want = REXCVAR_GET(xma_fresh_contexts);
++    if (want <= 0) return nullptr;
++    std::lock_guard lock(mutex_);
++    codec_ = codec;
++    auto& pool = pools_[{sample_rate, channels}];
++    AVCodecContext* context = nullptr;
++    if (!pool.empty()) {
++      context = pool.back();
++      pool.pop_back();
++    }
++    Start();
++    cv_.notify_one();
++    return context;
++  }
++  void Free(AVCodecContext* context) {
++    if (!context) return;
++    std::lock_guard lock(mutex_);
++    if (!started_) {
++      avcodec_free_context(&context);
++      return;
++    }
++    to_free_.push_back(context);
++    cv_.notify_one();
++  }
++
++ private:
++  void Start() {  // mutex_ held
++    if (started_) return;
++    started_ = true;
++    std::thread([this] { Run(); }).detach();
++  }
++  void Run() {
++    std::unique_lock lock(mutex_);
++    for (;;) {
++      cv_.wait(lock, [&] { return !to_free_.empty() || Missing() != nullptr; });
++      while (!to_free_.empty()) {
++        AVCodecContext* context = to_free_.back();
++        to_free_.pop_back();
++        lock.unlock();
++        avcodec_free_context(&context);
++        lock.lock();
++      }
++      while (auto* key = Missing()) {
++        const auto format = *key;
++        const AVCodec* codec = codec_;
++        lock.unlock();
++        AVCodecContext* context = avcodec_alloc_context3(codec);
++        if (context) {
++          context->sample_rate = format.first;
++          context->channels = format.second;
++          context->flags2 |= AV_CODEC_FLAG2_SKIP_MANUAL;
++          if (avcodec_open2(context, codec, NULL) < 0) avcodec_free_context(&context);
++        }
++        lock.lock();
++        if (!context) {
++          failed_ = true;  // (never seen) the callers open their own from now on
++          break;
++        }
++        pools_[format].push_back(context);
++      }
++    }
++  }
++  const std::pair<int, int>* Missing() {  // mutex_ held: a format below its count
++    const size_t want = size_t(std::max(REXCVAR_GET(xma_fresh_contexts), 0));
++    if (failed_) return nullptr;
++    for (auto& [format, pool] : pools_)
++      if (pool.size() < want) return &format;
++    return nullptr;
++  }
++
++  std::mutex mutex_;
++  std::condition_variable cv_;
++  std::map<std::pair<int, int>, std::vector<AVCodecContext*>> pools_;
++  std::vector<AVCodecContext*> to_free_;
++  const AVCodec* codec_ = nullptr;
++  bool started_ = false;
++  bool failed_ = false;
++};
 +}  // namespace
 +
  const uint32_t XmaContext::kBitsPerPacketHeader;
  const uint32_t XmaContext::kOutputMaxSizeBytes;
  
-@@ -50,6 +79,9 @@ XmaContext::~XmaContext() {
+@@ -50,6 +178,9 @@ XmaContext::~XmaContext() {
    if (av_context_) {
      avcodec_free_context(&av_context_);
    }
@@ -574,7 +673,7 @@ index 11b83be..3565b95 100644
    if (av_frame_) {
      av_frame_free(&av_frame_);
    }
-@@ -117,6 +149,9 @@ bool XmaContext::Work() {
+@@ -117,6 +248,9 @@ bool XmaContext::Work() {
      }
      Consume(&output_rb, &data);
      data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
@@ -584,7 +683,7 @@ index 11b83be..3565b95 100644
      StoreContextMerged(data, initial_data, context_ptr);
      return true;
    }
-@@ -133,17 +168,42 @@ bool XmaContext::Work() {
+@@ -133,17 +267,42 @@ bool XmaContext::Work() {
    }
  
    while (remaining_subframe_blocks_in_output_buffer_ >= minimum_subframe_decode_count) {
@@ -630,7 +729,7 @@ index 11b83be..3565b95 100644
      data.output_buffer_valid = 0;
    }
  
-@@ -192,13 +252,16 @@ void XmaContext::ClearLocked(XMA_CONTEXT_DATA* data) {
+@@ -192,13 +351,16 @@ void XmaContext::ClearLocked(XMA_CONTEXT_DATA* data) {
  void XmaContext::ResetDecoderState() {
    // A freed or re-initialized context is a new logical stream, so the previous
    // wave's MDCT overlap-add tail must not survive into frame 0 of the next one.
@@ -654,7 +753,7 @@ index 11b83be..3565b95 100644
    }
    raw_frame_.fill(0);
    decoded_frame_.fill(0);
-@@ -476,7 +539,22 @@ int XmaContext::PrepareDecoder(int sample_rate, bool is_two_channel) {
+@@ -476,7 +638,30 @@ int XmaContext::PrepareDecoder(int sample_rate, bool is_two_channel) {
        av_context_->channels != static_cast<int>(channels)) {
      REXAPU_NOISY_DEBUG("XmaContext {}: Codec reinit: rate {} -> {}, channels {} -> {}", id(),
                         av_context_->sample_rate, sample_rate, av_context_->channels, channels);
@@ -672,13 +771,21 @@ index 11b83be..3565b95 100644
 +      auto& slot = spare_contexts_[next_spare_++ % spare_contexts_.size()];
 +      if (slot) avcodec_free_context(&slot);
 +      slot = av_context_;
++    } else if (!REXCVAR_GET(xma_flush_streams)) {
++      if (AVCodecContext* fresh = FreshContexts::Get().Take(av_codec_, sample_rate, int(channels))) {
++        FreshContexts::Get().Free(av_context_);
++        av_context_ = fresh;
++        return 1;
++      }
++      FreshContexts::Get().Free(av_context_);
++      av_context_ = nullptr;
 +    } else {
 +      avcodec_free_context(&av_context_);
 +    }
      av_context_ = avcodec_alloc_context3(av_codec_);
  
      av_context_->sample_rate = sample_rate;
-@@ -670,6 +748,35 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+@@ -670,6 +855,35 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
    if (decoded) {
      ConvertFrame(reinterpret_cast<const uint8_t**>(&av_frame_->data), bool(data->is_stereo),
                   decoded_frame_.data());
@@ -1499,7 +1606,7 @@ index 5cfea05..6ca9d62 100644
    // This is a _sorted_ (ascending due_) list of active timers managed by a
    // dedicated thread
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index a744375..a30f459 100644
+index a744375..7b670a6 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
 @@ -10,11 +10,21 @@
@@ -1524,7 +1631,7 @@ index a744375..a30f459 100644
  #include <fmt/format.h>
  
  #include <rex/cvar.h>
-@@ -80,6 +90,55 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
+@@ -80,6 +90,64 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
                      "pipelines are being prepared.")
      .lifecycle(rex::cvar::Lifecycle::kHotReload);
  
@@ -1572,6 +1679,15 @@ index a744375..a30f459 100644
 +// --gpu_skip_rendering_lag_ms the command processor only executes up to write pointers the CPU
 +// set at least that long ago (a game waiting on the GPU waits at most that long).
 +REXCVAR_DECLARE(bool, gpu_skip_rendering);  // defined by the backend's command processor
++#if defined(__ANDROID__)
++#define GPU_IDLE_SPINS_DEFAULT 8
++#else
++#define GPU_IDLE_SPINS_DEFAULT 500
++#endif
++REXCVAR_DEFINE_INT32(gpu_idle_spins, GPU_IDLE_SPINS_DEFAULT, "GPU",
++                     "Command processor: sched_yield spins while idle before sleeping on the write pointer (each "
++                     "spin also reads the clock; with gpu_skip_rendering_lag_ms the idle comes back every kick, "
++                     "~70% of a core on a phone at 500)");
 +REXCVAR_DEFINE_INT32(gpu_skip_rendering_lag_ms, 0, "GPU",
 +                     "Command processor latency behind the CPU's kicks (title-side renderer)");
 +static std::mutex g_kick_mutex;
@@ -1580,7 +1696,7 @@ index a744375..a30f459 100644
  namespace rex::graphics {
  
  using namespace rex::graphics::xenos;
-@@ -101,6 +160,17 @@ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
+@@ -101,6 +169,17 @@ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
  
  }  // namespace
  
@@ -1598,7 +1714,7 @@ index a744375..a30f459 100644
  CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
                                     system::KernelState* kernel_state)
      : memory_(graphics_system->memory()),
-@@ -111,9 +181,13 @@ CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
+@@ -111,9 +190,13 @@ CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
        write_ptr_index_event_(rex::thread::Event::CreateAutoResetEvent(false)),
        write_ptr_index_(0) {
    assert_not_null(write_ptr_index_event_);
@@ -1613,7 +1729,7 @@ index a744375..a30f459 100644
  
  bool CommandProcessor::Initialize() {
    // Initialize the gamma ramps to their default (linear) values - taken from
-@@ -210,7 +284,25 @@ void CommandProcessor::WorkerThreadMain() {
+@@ -210,7 +293,25 @@ void CommandProcessor::WorkerThreadMain() {
        fn();
      }
  
@@ -1640,7 +1756,7 @@ index a744375..a30f459 100644
      if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
        SCOPE_profile_cpu_i("gpu", "rex::graphics::CommandProcessor::Stall");
        // We've run out of commands to execute.
-@@ -218,17 +310,26 @@ void CommandProcessor::WorkerThreadMain() {
+@@ -218,17 +319,26 @@ void CommandProcessor::WorkerThreadMain() {
        // event is too high.
        PrepareForWait();
        uint32_t loop_count = 0;
@@ -1654,8 +1770,9 @@ index a744375..a30f459 100644
 +          idle_reported = true;
 +        }
          // If we spin around too much, revert to a "low-power" state.
-         if (loop_count > 500) {
+-        if (loop_count > 500) {
 -          const int wait_time_ms = 5;
++        if (loop_count > uint32_t(std::max(REXCVAR_GET(gpu_idle_spins), 0))) {
 +          const int wait_time_ms =
 +              (idle_hook && !idle_reported) || REXCVAR_GET(gpu_skip_rendering_lag_ms) > 0 ? 1 : 5;
            rex::thread::Wait(write_ptr_index_event_.get(), true,
@@ -1669,7 +1786,7 @@ index a744375..a30f459 100644
        } while (worker_running_ && pending_fns_.empty() &&
                 (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
        ReturnFromWait();
-@@ -313,6 +414,11 @@ void CommandProcessor::ShutdownContext() {}
+@@ -313,6 +423,11 @@ void CommandProcessor::ShutdownContext() {}
  
  void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
    read_ptr_index_ = 0;
@@ -1681,7 +1798,7 @@ index a744375..a30f459 100644
    primary_buffer_ptr_ = ptr;
    primary_buffer_size_ = uint32_t(1) << (size_log2 + 3);
  }
-@@ -328,6 +434,10 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_s
+@@ -328,6 +443,10 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_s
  }
  
  void CommandProcessor::UpdateWritePointer(uint32_t value) {
@@ -1692,7 +1809,7 @@ index a744375..a30f459 100644
    write_ptr_index_ = value;
    write_ptr_index_event_->Set();
  }
-@@ -355,7 +465,15 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+@@ -355,7 +474,15 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
  
    // Volatile for the WAIT_REG_MEM loop.
    const_cast<volatile uint32_t&>(regs.values[index]) = value;
@@ -1709,7 +1826,7 @@ index a744375..a30f459 100644
      REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
    }
  
-@@ -702,6 +820,12 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
+@@ -702,6 +829,12 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
  
    uint32_t base_index = (packet & 0x7FFF);
    uint32_t write_one_reg = (packet >> 15) & 0x1;
@@ -1722,7 +1839,7 @@ index a744375..a30f459 100644
    for (uint32_t m = 0; m < count; m++) {
      uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
      uint32_t target_index = write_one_reg ? base_index : base_index + m;
-@@ -1213,6 +1337,8 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
+@@ -1213,6 +1346,8 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
    }
    auto endianness = static_cast<xenos::Endian>(address & 0x3);
    address &= ~0x3;
@@ -1731,7 +1848,7 @@ index a744375..a30f459 100644
    data_value = GpuSwap(data_value, endianness);
    memory::store(memory_->TranslatePhysical(address), data_value);
    return true;
-@@ -1524,6 +1650,9 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
+@@ -1524,6 +1659,9 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
    uint32_t size_dwords = start_size & 0xFFFF;  // dwords
    assert_true(start == 0);
  
@@ -1741,7 +1858,7 @@ index a744375..a30f459 100644
    auto shader =
        LoadShader(shader_type, addr, memory_->TranslatePhysical<uint32_t*>(addr), size_dwords);
    switch (shader_type) {
-@@ -1554,6 +1683,10 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD_IMMEDIATE(memory::RingBuffer*
+@@ -1554,6 +1692,10 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD_IMMEDIATE(memory::RingBuffer*
    assert_true(start == 0);
    assert_true(reader->read_count() >= size_dwords * 4);
    assert_true(count - 2 >= size_dwords);
@@ -1752,7 +1869,7 @@ index a744375..a30f459 100644
    auto shader = LoadShader(shader_type, uint32_t(reader->read_ptr()),
                             reinterpret_cast<uint32_t*>(reader->read_ptr()), size_dwords);
    switch (shader_type) {
-@@ -1594,11 +1727,11 @@ bool CommandProcessor::ExecutePacketType3_VIZ_QUERY(memory::RingBuffer* reader,
+@@ -1594,11 +1736,11 @@ bool CommandProcessor::ExecutePacketType3_VIZ_QUERY(memory::RingBuffer* reader,
      // On hardware this clears the internal state of the scan converter (which
      // is different to the register)
      WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, VIZQUERY_START);

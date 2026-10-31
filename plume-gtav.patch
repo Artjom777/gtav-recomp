@@ -1,5 +1,5 @@
 diff --git a/plume_render_interface.h b/plume_render_interface.h
-index 2048557..cd49ff7 100644
+index 2048557..6df11cb 100644
 --- a/plume_render_interface.h
 +++ b/plume_render_interface.h
 @@ -127,6 +127,8 @@ namespace plume {
@@ -11,7 +11,7 @@ index 2048557..cd49ff7 100644
          virtual void setGraphicsRootDescriptor(RenderBufferReference bufferReference, uint32_t rootDescriptorIndex) = 0;
          virtual void setRaytracingPipelineLayout(const RenderPipelineLayout *pipelineLayout) = 0;
          virtual void setRaytracingPushConstants(uint32_t rangeIndex, const void *data, uint32_t offset = 0, uint32_t size = 0) = 0;
-@@ -150,6 +152,10 @@ namespace plume {
+@@ -150,6 +152,13 @@ namespace plume {
          virtual void discardTexture(const RenderTexture* texture) = 0; // D3D12 only.
          virtual void resetQueryPool(const RenderQueryPool *queryPool, uint32_t queryFirstIndex, uint32_t queryCount) = 0;
          virtual void writeTimestamp(const RenderQueryPool *queryPool, uint32_t queryIndex) = 0;
@@ -19,10 +19,13 @@ index 2048557..cd49ff7 100644
 +        // render pass, so a query may span several of them.
 +        virtual void beginOcclusionQuery(const RenderQueryPool *queryPool, uint32_t queryIndex) { }
 +        virtual void endOcclusionQuery(const RenderQueryPool *queryPool, uint32_t queryIndex) { }
++        // Per-draw fragment shading rate (1x1, 2x1, 1x2, 2x2), Vulkan with VK_KHR_fragment_shading_rate
++        // only; setFramebuffer resets it to 1x1.
++        virtual void setFragmentShadingRate(uint32_t width, uint32_t height) { }
  
          // Concrete implementation shortcuts.
          inline void barriers(RenderBarrierStages stages, const RenderBufferBarrier &barrier) {
-@@ -241,6 +247,8 @@ namespace plume {
+@@ -241,6 +250,8 @@ namespace plume {
          virtual std::unique_ptr<RenderCommandSemaphore> createCommandSemaphore() = 0;
          virtual std::unique_ptr<RenderFramebuffer> createFramebuffer(const RenderFramebufferDesc &desc) = 0;
          virtual std::unique_ptr<RenderQueryPool> createQueryPool(uint32_t queryCount) = 0;
@@ -92,7 +95,7 @@ index ad63e0e..3133433 100644
          RenderFramebufferDesc() = default;
  
 diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
-index 4fdc4bf..4c0c877 100644
+index 4fdc4bf..d1743c6 100644
 --- a/plume_vulkan.cpp
 +++ b/plume_vulkan.cpp
 @@ -11,6 +11,7 @@
@@ -103,7 +106,7 @@ index 4fdc4bf..4c0c877 100644
  #include <cmath>
  #include <climits>
  #include <unordered_map>
-@@ -28,6 +29,19 @@
+@@ -28,6 +29,25 @@
  // - Fix resource pools.
  
  namespace plume {
@@ -114,6 +117,12 @@ index 4fdc4bf..4c0c877 100644
 +    // GENERAL layout) and render targets get the input attachment usage, so a pipeline can read the
 +    // attachment under the fragment (framebuffer fetch on MoltenVK). Set before creating resources.
 +    bool g_colorInputAttachments = false;
++    // A clear of a whole attachment before anything else in a render pass becomes the pass's load op
++    // (LOAD_OP_CLEAR) instead of a LOAD followed by vkCmdClearAttachments: tilers (Adreno, Mali) skip
++    // reading the old contents into tile memory. g_statLoadClears counts the attachments so cleared.
++    bool g_clearLoadOps = false;
++    uint32_t g_statLoadClears = 0;
++    uint32_t g_statClearsInPass = 0, g_statClearsPartial = 0;  // clears that could not become load ops, and why
 +
 +    static std::vector<uint8_t> &pipelineCacheSeed() {
 +        static std::vector<uint8_t> seed;
@@ -123,7 +132,16 @@ index 4fdc4bf..4c0c877 100644
      // Backend constants.
  
      // Required buffer alignment for acceleration structures.
-@@ -527,6 +541,10 @@ namespace plume {
+@@ -87,6 +107,8 @@ namespace plume {
+         VK_KHR_PRESENT_ID_EXTENSION_NAME,
+         VK_KHR_PRESENT_WAIT_EXTENSION_NAME,
+         VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME,
++        VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME,
++        VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME,  // required by fragment shading rate on Vulkan 1.1
+         // Vulkan spec requires this to be enabled if supported by the driver.
+         VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME,
+     };
+@@ -527,6 +549,10 @@ namespace plume {
              return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
          case RenderDescriptorRangeType::ACCELERATION_STRUCTURE:
              return VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
@@ -134,7 +152,7 @@ index 4fdc4bf..4c0c877 100644
          default:
              assert(false && "Unknown descriptor range type.");
              return VK_DESCRIPTOR_TYPE_MAX_ENUM;
-@@ -619,6 +637,13 @@ namespace plume {
+@@ -619,6 +645,13 @@ namespace plume {
              }
          }
  
@@ -148,7 +166,7 @@ index 4fdc4bf..4c0c877 100644
          if (stages & RenderBarrierStage::COMPUTE) {
              flags |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
  
-@@ -835,7 +860,7 @@ namespace plume {
+@@ -835,7 +868,7 @@ namespace plume {
          bufferInfo.usage |= (desc.flags & RenderBufferFlag::ACCELERATION_STRUCTURE_INPUT) ? VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR : 0;
          bufferInfo.usage |= (desc.flags & RenderBufferFlag::SHADER_BINDING_TABLE) ? VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR : 0;
          
@@ -157,7 +175,7 @@ index 4fdc4bf..4c0c877 100644
          const bool useDeviceAddress = device->capabilities.bufferDeviceAddress && (desc.flags & deviceAddressMask);
          bufferInfo.usage |= useDeviceAddress ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0;
          
-@@ -930,7 +955,15 @@ namespace plume {
+@@ -930,7 +963,15 @@ namespace plume {
          info.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
          info.pNext = nullptr;
          info.buffer = vk;
@@ -174,7 +192,7 @@ index 4fdc4bf..4c0c877 100644
      }
  
      // VulkanBufferFormattedView
-@@ -986,6 +1019,7 @@ namespace plume {
+@@ -986,6 +1027,7 @@ namespace plume {
          imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
          imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
          imageInfo.usage |= (desc.flags & RenderTextureFlag::RENDER_TARGET) ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0;
@@ -182,7 +200,7 @@ index 4fdc4bf..4c0c877 100644
          imageInfo.usage |= (desc.flags & RenderTextureFlag::DEPTH_TARGET) ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : 0;
          imageInfo.usage |= (desc.flags & RenderTextureFlag::STORAGE) ? VK_IMAGE_USAGE_STORAGE_BIT : 0;
  
-@@ -1094,6 +1128,12 @@ namespace plume {
+@@ -1094,6 +1136,12 @@ namespace plume {
          viewInfo.components.b = toVk(desc.componentMapping.b);
          viewInfo.components.a = toVk(desc.componentMapping.a);
          viewInfo.subresourceRange.aspectMask = toViewAspectFlags(texture->desc.flags);
@@ -195,7 +213,7 @@ index 4fdc4bf..4c0c877 100644
          viewInfo.subresourceRange.baseMipLevel = desc.mipSlice;
          viewInfo.subresourceRange.levelCount = mipLevels;
          viewInfo.subresourceRange.baseArrayLayer = desc.arrayIndex;
-@@ -1390,7 +1430,7 @@ namespace plume {
+@@ -1390,7 +1438,7 @@ namespace plume {
          pipelineInfo.layout = pipelineLayout->vk;
          pipelineInfo.stage = stageInfo;
  
@@ -204,7 +222,18 @@ index 4fdc4bf..4c0c877 100644
          if (res != VK_SUCCESS) {
              fprintf(stderr, "vkCreateComputePipelines failed with error code 0x%X.\n", res);
              return;
-@@ -1649,7 +1689,7 @@ namespace plume {
+@@ -1617,6 +1665,10 @@ namespace plume {
+             dynamicStates.emplace_back(VK_DYNAMIC_STATE_DEPTH_BIAS);
+         }
+ 
++        if (device->fragmentShadingRateSupported) {
++            dynamicStates.emplace_back(VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR);
++        }
++
+         VkPipelineDynamicStateCreateInfo dynamicState = {};
+         dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+         dynamicState.pDynamicStates = dynamicStates.data();
+@@ -1649,7 +1701,7 @@ namespace plume {
          pipelineInfo.layout = pipelineLayout->vk;
          pipelineInfo.renderPass = renderPass;
  
@@ -213,7 +242,7 @@ index 4fdc4bf..4c0c877 100644
          if (res != VK_SUCCESS) {
              fprintf(stderr, "vkCreateGraphicsPipelines failed with error code 0x%X.\n", res);
              return;
-@@ -1705,6 +1745,16 @@ namespace plume {
+@@ -1705,6 +1757,16 @@ namespace plume {
  
          subpass.pColorAttachments = !colorReferences.empty() ? colorReferences.data() : nullptr;
          subpass.colorAttachmentCount = uint32_t(colorReferences.size());
@@ -230,7 +259,7 @@ index 4fdc4bf..4c0c877 100644
  
          if (depthTargetFormat != VK_FORMAT_UNDEFINED) {
              depthReference.attachment = uint32_t(attachments.size());
-@@ -2352,11 +2402,17 @@ namespace plume {
+@@ -2352,11 +2414,17 @@ namespace plume {
          createInfo.clipped = VK_TRUE;
          createInfo.oldSwapchain = vk;
  
@@ -249,7 +278,7 @@ index 4fdc4bf..4c0c877 100644
  
          // Store the chosen present mode to identify later whether the swapchain needs to be recreated.
          createdPresentMode = requiredPresentMode;
-@@ -2548,8 +2604,11 @@ namespace plume {
+@@ -2548,8 +2616,11 @@ namespace plume {
              imageViews.emplace_back(colorAttachmentImageView);
  
              if (i == 0) {
@@ -263,7 +292,7 @@ index 4fdc4bf..4c0c877 100644
              }
  
              VkAttachmentReference reference = {};
-@@ -2560,7 +2619,7 @@ namespace plume {
+@@ -2560,7 +2631,7 @@ namespace plume {
              VkAttachmentDescription attachment = {};
              attachment.format = toVk(colorAttachmentFormat);
              attachment.samples = VkSampleCountFlagBits(colorAttachment->desc.multisampling.sampleCount);
@@ -272,7 +301,7 @@ index 4fdc4bf..4c0c877 100644
              attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
              attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
              attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-@@ -2619,6 +2678,16 @@ namespace plume {
+@@ -2619,6 +2690,16 @@ namespace plume {
          subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
          subpass.pColorAttachments = !colorReferences.empty() ? colorReferences.data() : nullptr;
          subpass.colorAttachmentCount = uint32_t(colorReferences.size());
@@ -289,7 +318,85 @@ index 4fdc4bf..4c0c877 100644
  
          if (desc.depthAttachment != nullptr || desc.depthAttachmentView != nullptr) {
              subpass.pDepthStencilAttachment = &depthReference;
-@@ -2685,15 +2754,16 @@ namespace plume {
+@@ -2636,6 +2717,11 @@ namespace plume {
+             fprintf(stderr, "vkCreateRenderPass failed with error code 0x%X.\n", res);
+             return;
+         }
++        attachmentDescs = attachments;
++        clearColorReferences = colorReferences;
++        clearInputReferences = inputReferences;
++        clearDepthReference = depthReference;
++        hasDepthAttachment = subpass.pDepthStencilAttachment != nullptr;
+         
+         VkFramebufferCreateInfo fbInfo = {};
+         fbInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+@@ -2658,11 +2744,65 @@ namespace plume {
+             vkDestroyFramebuffer(device->vk, vk, nullptr);
+         }
+ 
++        for (auto &[mask, pass] : clearPasses) {
++            vkDestroyRenderPass(device->vk, pass, nullptr);
++        }
++
+         if (renderPass != VK_NULL_HANDLE) {
+             vkDestroyRenderPass(device->vk, renderPass, nullptr);
+         }
+     }
+ 
++    // The render pass with LOAD_OP_CLEAR for the attachments in `mask` (bit i: colour i, bit 8: depth,
++    // bit 9: stencil). Load ops do not change render pass compatibility, so it runs on this framebuffer.
++    VkRenderPass VulkanFramebuffer::clearPass(uint32_t mask) const {
++        std::lock_guard<std::mutex> lock(clearPassesMutex);
++        VkRenderPass &pass = clearPasses[mask];
++        if (pass != VK_NULL_HANDLE) {
++            return pass;
++        }
++
++        std::vector<VkAttachmentDescription> attachments = attachmentDescs;
++        const uint32_t colorCount = uint32_t(clearColorReferences.size());
++        for (uint32_t i = 0; i < colorCount; i++) {
++            if (mask & (1u << i)) {
++                attachments[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++            }
++        }
++        if (hasDepthAttachment) {
++            VkAttachmentDescription &depth = attachments[colorCount];
++            if (mask & (1u << 8)) {
++                depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++            }
++            if (mask & (1u << 9)) {
++                depth.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++            }
++        }
++
++        VkSubpassDescription subpass = {};
++        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
++        subpass.pColorAttachments = !clearColorReferences.empty() ? clearColorReferences.data() : nullptr;
++        subpass.colorAttachmentCount = colorCount;
++        subpass.pInputAttachments = !clearInputReferences.empty() ? clearInputReferences.data() : nullptr;
++        subpass.inputAttachmentCount = uint32_t(clearInputReferences.size());
++        subpass.pDepthStencilAttachment = hasDepthAttachment ? &clearDepthReference : nullptr;
++
++        VkRenderPassCreateInfo passInfo = {};
++        passInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
++        passInfo.pAttachments = attachments.data();
++        passInfo.attachmentCount = uint32_t(attachments.size());
++        passInfo.pSubpasses = &subpass;
++        passInfo.subpassCount = 1;
++        VkResult res = vkCreateRenderPass(device->vk, &passInfo, nullptr, &pass);
++        if (res != VK_SUCCESS) {
++            fprintf(stderr, "vkCreateRenderPass failed with error code 0x%X.\n", res);
++            pass = VK_NULL_HANDLE;
++            return renderPass;
++        }
++
++        return pass;
++    }
++
+     uint32_t VulkanFramebuffer::getWidth() const {
+         return width;
+     }
+@@ -2685,15 +2825,16 @@ namespace plume {
  
      // VulkanQueryPool
  
@@ -308,7 +415,7 @@ index 4fdc4bf..4c0c877 100644
          createInfo.queryCount = queryCount;
          
          VkResult res = vkCreateQueryPool(device->vk, &createInfo, nullptr, &vk);
-@@ -2711,11 +2781,17 @@ namespace plume {
+@@ -2711,11 +2852,17 @@ namespace plume {
  
      void VulkanQueryPool::queryResults() {
  	    VkResult res = vkGetQueryPoolResults(device->vk, vk, 0, uint32_t(results.size()), sizeof(uint64_t) * results.size(), results.data(), sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
@@ -327,7 +434,28 @@ index 4fdc4bf..4c0c877 100644
          // Conversion sourced from Godot Engine's Vulkan Rendering Driver.
          auto mult64to128 = [](uint64_t u, uint64_t v, uint64_t &h, uint64_t &l) {
              uint64_t u1 = (u & 0xffffffff);
-@@ -2888,7 +2964,18 @@ namespace plume {
+@@ -2800,6 +2947,8 @@ namespace plume {
+ 
+     void VulkanCommandList::begin() {
+         vkResetCommandBuffer(vk, 0);
++        pendingClearMask = 0;
++        shadingRate = 0;
+ 
+         VkCommandBufferBeginInfo beginInfo = {};
+         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+@@ -2810,6 +2959,11 @@ namespace plume {
+             fprintf(stderr, "vkBeginCommandBuffer failed with error code 0x%X.\n", res);
+             return;
+         }
++
++        if (queue->device->fragmentShadingRateSupported) {
++            // A dynamic state: it has to be set before the first draw of the command buffer.
++            setFragmentShadingRate(1, 1);
++        }
+     }
+ 
+     void VulkanCommandList::end() {
+@@ -2888,7 +3042,18 @@ namespace plume {
              return;
          }
  
@@ -346,7 +474,7 @@ index 4fdc4bf..4c0c877 100644
      }
  
      void VulkanCommandList::dispatch(uint32_t threadGroupCountX, uint32_t threadGroupCountY, uint32_t threadGroupCountZ) {
-@@ -3007,6 +3094,13 @@ namespace plume {
+@@ -3007,6 +3172,13 @@ namespace plume {
          setDescriptorSet(VK_PIPELINE_BIND_POINT_GRAPHICS, activeGraphicsPipelineLayout, descriptorSet, setIndex);
      }
  
@@ -360,7 +488,52 @@ index 4fdc4bf..4c0c877 100644
      void VulkanCommandList::setGraphicsRootDescriptor(RenderBufferReference bufferReference, uint32_t rootDescriptorIndex) {
          assert(false && "Root descriptors are not supported in Vulkan.");
      }
-@@ -3486,6 +3580,8 @@ namespace plume {
+@@ -3104,6 +3276,7 @@ namespace plume {
+ 
+     void VulkanCommandList::setFramebuffer(const RenderFramebuffer *framebuffer) {
+         endActiveRenderPass();
++        setFragmentShadingRate(1, 1);  // per pass: the caller coarsens it after binding (SetFragmentShadingRate)
+ 
+         if (framebuffer != nullptr) {
+             const VulkanFramebuffer *interfaceFramebuffer = static_cast<const VulkanFramebuffer *>(framebuffer);
+@@ -3150,6 +3323,16 @@ namespace plume {
+         assert(attachmentIndex < targetFramebuffer->colorAttachments.size());
+         assert((clearRectsCount == 0) || (clearRects != nullptr));
+ 
++        if (deferClear(clearRects, clearRectsCount)) {
++            pendingClearMask |= 1u << attachmentIndex;
++            auto &value = pendingClearValues[attachmentIndex].color.float32;
++            value[0] = colorValue.r;
++            value[1] = colorValue.g;
++            value[2] = colorValue.b;
++            value[3] = colorValue.a;
++            return;
++        }
++
+         checkActiveRenderPass();
+ 
+         thread_local std::vector<VkClearRect> rectVector;
+@@ -3170,6 +3353,19 @@ namespace plume {
+         assert(targetFramebuffer != nullptr);
+         assert((clearRectsCount == 0) || (clearRects != nullptr));
+ 
++        if ((clearDepth || clearStencil) && !targetFramebuffer->depthAttachmentReadOnly && deferClear(clearRects, clearRectsCount)) {
++            VkClearDepthStencilValue &value = pendingClearValues[8].depthStencil;
++            if (clearDepth) {
++                pendingClearMask |= 1u << 8;
++                value.depth = depthValue;
++            }
++            if (clearStencil) {
++                pendingClearMask |= 1u << 9;
++                value.stencil = stencilValue;
++            }
++            return;
++        }
++
+         checkActiveRenderPass();
+ 
+         thread_local std::vector<VkClearRect> rectVector;
+@@ -3486,6 +3682,8 @@ namespace plume {
      void VulkanCommandList::resetQueryPool(const RenderQueryPool *queryPool, uint32_t queryFirstIndex, uint32_t queryCount) {
          assert(queryPool != nullptr);
  
@@ -369,7 +542,7 @@ index 4fdc4bf..4c0c877 100644
          const VulkanQueryPool *interfaceQueryPool = static_cast<const VulkanQueryPool *>(queryPool);
          vkCmdResetQueryPool(vk, interfaceQueryPool->vk, queryFirstIndex, queryCount);
      }
-@@ -3497,6 +3593,22 @@ namespace plume {
+@@ -3497,6 +3695,22 @@ namespace plume {
          vkCmdWriteTimestamp(vk, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, interfaceQueryPool->vk, queryIndex);
      }
  
@@ -392,15 +565,77 @@ index 4fdc4bf..4c0c877 100644
      void VulkanCommandList::checkActiveRenderPass() {
          assert(targetFramebuffer != nullptr);
          
-@@ -3509,6 +3621,7 @@ namespace plume {
+@@ -3507,12 +3721,68 @@ namespace plume {
+             beginInfo.framebuffer = targetFramebuffer->vk;
+             beginInfo.renderArea.extent.width = targetFramebuffer->width;
              beginInfo.renderArea.extent.height = targetFramebuffer->height;
++            VkClearValue clearValues[9];
++            if (pendingClearMask != 0) {
++                // Attachment order: the colour attachments, then depth (see the framebuffer).
++                const uint32_t colorCount = uint32_t(targetFramebuffer->colorAttachments.size());
++                for (uint32_t i = 0; i < colorCount; i++) {
++                    clearValues[i] = pendingClearValues[i];
++                    g_statLoadClears += (pendingClearMask >> i) & 1;
++                }
++                clearValues[colorCount] = pendingClearValues[8];
++                g_statLoadClears += (pendingClearMask >> 8) & 1;
++                beginInfo.renderPass = targetFramebuffer->clearPass(pendingClearMask);
++                beginInfo.clearValueCount = colorCount + (targetFramebuffer->hasDepthAttachment ? 1 : 0);
++                beginInfo.pClearValues = clearValues;
++                pendingClearMask = 0;
++            }
              vkCmdBeginRenderPass(vk, &beginInfo, VkSubpassContents::VK_SUBPASS_CONTENTS_INLINE);
-             activeRenderPass = targetFramebuffer->renderPass;
+-            activeRenderPass = targetFramebuffer->renderPass;
++            activeRenderPass = beginInfo.renderPass;
 +            g_statRenderPasses++;
++        }
++    }
++
++    void VulkanCommandList::setFragmentShadingRate(uint32_t width, uint32_t height) {
++        const uint32_t rate = (width << 4) | height;
++        if (!queue->device->fragmentShadingRateSupported || rate == shadingRate) {
++            return;
++        }
++        shadingRate = rate;
++        const VkExtent2D size = { width, height };
++        const VkFragmentShadingRateCombinerOpKHR ops[2] = { VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR, VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR };
++        vkCmdSetFragmentShadingRateKHR(vk, &size, ops);
++    }
++
++    // A whole-attachment clear before the render pass has begun: kept for its load op (g_clearLoadOps).
++    bool VulkanCommandList::deferClear(const RenderRect *clearRects, uint32_t clearRectsCount) {
++        if (!g_clearLoadOps || targetFramebuffer == nullptr) {
++            return false;
++        }
++        if (activeRenderPass != VK_NULL_HANDLE) {
++            g_statClearsInPass++;
++            return false;
++        }
++        if (clearRectsCount > 1) {
++            g_statClearsPartial++;
++            return false;
++        }
++        if (clearRectsCount == 1) {
++            const RenderRect &r = clearRects[0];
++            if (r.left <= 0 && r.top <= 0 && r.right >= int32_t(targetFramebuffer->width) && r.bottom >= int32_t(targetFramebuffer->height)) {
++                return true;
++            }
++            g_statClearsPartial++;
++            return false;
          }
++        return true;
      }
  
-@@ -3666,7 +3779,22 @@ namespace plume {
+     void VulkanCommandList::endActiveRenderPass() {
++        if (activeRenderPass == VK_NULL_HANDLE && pendingClearMask != 0 && targetFramebuffer != nullptr) {
++            // Clears with no draw after them still happen: an empty pass that only clears.
++            checkActiveRenderPass();
++        }
++        pendingClearMask = 0;
+         if (activeRenderPass != VK_NULL_HANDLE) {
+             vkCmdEndRenderPass(vk);
+             activeRenderPass = VK_NULL_HANDLE;
+@@ -3666,7 +3936,22 @@ namespace plume {
          assert(fence != nullptr);
  
          VulkanCommandFence *interfaceFence = static_cast<VulkanCommandFence *>(fence);
@@ -424,7 +659,22 @@ index 4fdc4bf..4c0c877 100644
          if (res != VK_SUCCESS) {
              fprintf(stderr, "vkWaitForFences failed with error code 0x%X.\n", res);
              return;
-@@ -3931,6 +4059,7 @@ namespace plume {
+@@ -3914,6 +4199,14 @@ namespace plume {
+             featuresChain = &portabilityFeatures;
+         }
+ 
++        VkPhysicalDeviceFragmentShadingRateFeaturesKHR shadingRateFeatures = {};
++        const bool shadingRateFound = supportedOptionalExtensions.find(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME) != supportedOptionalExtensions.end() && supportedOptionalExtensions.find(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME) != supportedOptionalExtensions.end();
++        if (shadingRateFound) {
++            shadingRateFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR;
++            shadingRateFeatures.pNext = featuresChain;
++            featuresChain = &shadingRateFeatures;
++        }
++
+         VkPhysicalDeviceRayTracingPipelineFeaturesKHR rayTracingPipelineFeatures = {};
+         VkPhysicalDeviceAccelerationStructureFeaturesKHR accelerationStructureFeatures = {};
+         const bool rayTracingFound = (supportedOptionalExtensions.find(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) != supportedOptionalExtensions.end()) && (supportedOptionalExtensions.find(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) != supportedOptionalExtensions.end());
+@@ -3931,6 +4224,7 @@ namespace plume {
          deviceFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
          deviceFeatures.pNext = featuresChain;
          vkGetPhysicalDeviceFeatures2(physicalDevice, &deviceFeatures);
@@ -432,7 +682,23 @@ index 4fdc4bf..4c0c877 100644
  
          // Check for properties.
          if (rayTracingFound) {
-@@ -4092,6 +4221,22 @@ namespace plume {
+@@ -4001,6 +4295,15 @@ namespace plume {
+             createDeviceChain = &portabilityFeatures;
+         }
+ 
++        // Only the per-draw (pipeline/dynamic) rate is used: coarse shading for chosen passes.
++        fragmentShadingRateSupported = shadingRateFound && shadingRateFeatures.pipelineFragmentShadingRate;
++        if (fragmentShadingRateSupported) {
++            shadingRateFeatures.primitiveFragmentShadingRate = VK_FALSE;
++            shadingRateFeatures.attachmentFragmentShadingRate = VK_FALSE;
++            shadingRateFeatures.pNext = createDeviceChain;
++            createDeviceChain = &shadingRateFeatures;
++        }
++
+         // Retrieve the information for the queue families.
+         uint32_t queueFamilyCount = 0;
+         vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamilyCount, nullptr);
+@@ -4092,6 +4395,22 @@ namespace plume {
              }
          }
  
@@ -455,7 +721,7 @@ index 4fdc4bf..4c0c877 100644
          VmaVulkanFunctions vmaFunctions = {};
          vmaFunctions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
          vmaFunctions.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
-@@ -4203,12 +4348,22 @@ namespace plume {
+@@ -4203,12 +4522,22 @@ namespace plume {
          return std::make_unique<VulkanSampler>(this, desc);
      }
  
@@ -480,7 +746,7 @@ index 4fdc4bf..4c0c877 100644
      }
  
      std::unique_ptr<RenderPipeline> VulkanDevice::createRaytracingPipeline(const RenderRaytracingPipelineDesc &desc, const RenderPipeline *previousPipeline) {
-@@ -4255,6 +4410,10 @@ namespace plume {
+@@ -4255,6 +4584,10 @@ namespace plume {
          return std::make_unique<VulkanQueryPool>(this, queryCount);
      }
  
@@ -491,7 +757,7 @@ index 4fdc4bf..4c0c877 100644
      void VulkanDevice::setBottomLevelASBuildInfo(RenderBottomLevelASBuildInfo &buildInfo, const RenderBottomLevelASMesh *meshes, uint32_t meshCount, bool preferFastBuild, bool preferFastTrace) {
          assert(meshes != nullptr);
          assert(meshCount > 0);
-@@ -4463,6 +4622,11 @@ namespace plume {
+@@ -4463,6 +4796,11 @@ namespace plume {
      void VulkanDevice::release() {
          nullBuffer = nullptr; // force destruction before destroying allocator
  
@@ -503,7 +769,7 @@ index 4fdc4bf..4c0c877 100644
          if (allocator != VK_NULL_HANDLE) {
              vmaDestroyAllocator(allocator);
              allocator = VK_NULL_HANDLE;
-@@ -4666,6 +4830,26 @@ namespace plume {
+@@ -4666,6 +5004,26 @@ namespace plume {
          return instance != nullptr;
      }
  
@@ -531,10 +797,26 @@ index 4fdc4bf..4c0c877 100644
  
  #if defined(PLUME_SDL2_VULKAN_ENABLED)
 diff --git a/plume_vulkan.h b/plume_vulkan.h
-index 1d36b12..27f0050 100644
+index 1d36b12..0de1495 100644
 --- a/plume_vulkan.h
 +++ b/plume_vulkan.h
-@@ -285,8 +285,9 @@ namespace plume {
+@@ -279,14 +279,25 @@ namespace plume {
+         uint32_t getWidth() const override;
+         uint32_t getHeight() const override;
+         bool contains(const VulkanTexture *attachment) const;
++
++        // Load-op clear variants of renderPass (see g_clearLoadOps).
++        std::vector<VkAttachmentDescription> attachmentDescs;
++        std::vector<VkAttachmentReference> clearColorReferences;
++        std::vector<VkAttachmentReference> clearInputReferences;
++        VkAttachmentReference clearDepthReference = {};
++        bool hasDepthAttachment = false;
++        mutable std::mutex clearPassesMutex;
++        mutable std::unordered_map<uint32_t, VkRenderPass> clearPasses;
++        VkRenderPass clearPass(uint32_t mask) const;
+     };
+ 
+     struct VulkanQueryPool : RenderQueryPool {
          VulkanDevice *device = nullptr;
          std::vector<uint64_t> results;
          VkQueryPool vk = VK_NULL_HANDLE;
@@ -545,7 +827,19 @@ index 1d36b12..27f0050 100644
          virtual ~VulkanQueryPool() override;
          virtual void queryResults() override;
          virtual const uint64_t *getResults() const override;
-@@ -319,6 +320,7 @@ namespace plume {
+@@ -302,6 +313,11 @@ namespace plume {
+         const VulkanPipelineLayout *activeGraphicsPipelineLayout = nullptr;
+         const VulkanPipelineLayout *activeRaytracingPipelineLayout = nullptr;
+         VkRenderPass activeRenderPass = VK_NULL_HANDLE;
++        uint32_t pendingClearMask = 0;  // clears for the next pass's load ops (bit i: colour i, 8: depth, 9: stencil)
++        VkClearValue pendingClearValues[9] = {};
++        bool deferClear(const RenderRect *clearRects, uint32_t clearRectsCount);
++        uint32_t shadingRate = 0;  // (width << 4) | height of the last vkCmdSetFragmentShadingRateKHR
++        void setFragmentShadingRate(uint32_t width, uint32_t height) override;
+ 
+         VulkanCommandList(VulkanCommandQueue *queue);
+         ~VulkanCommandList() override;
+@@ -319,6 +335,7 @@ namespace plume {
          void setGraphicsPipelineLayout(const RenderPipelineLayout *pipelineLayout) override;
          void setGraphicsPushConstants(uint32_t rangeIndex, const void *data, uint32_t offset = 0, uint32_t size = 0) override;
          void setGraphicsDescriptorSet(RenderDescriptorSet *descriptorSet, uint32_t setIndex) override;
@@ -553,7 +847,7 @@ index 1d36b12..27f0050 100644
          void setGraphicsRootDescriptor(RenderBufferReference bufferReference, uint32_t rootDescriptorIndex) override;
          void setRaytracingPipelineLayout(const RenderPipelineLayout *pipelineLayout) override;
          void setRaytracingPushConstants(uint32_t rangeIndex, const void *data, uint32_t offset = 0, uint32_t size = 0) override;
-@@ -342,6 +344,8 @@ namespace plume {
+@@ -342,6 +359,8 @@ namespace plume {
          void discardTexture(const RenderTexture* texture) override;
          void resetQueryPool(const RenderQueryPool *queryPool, uint32_t queryFirstIndex, uint32_t queryCount) override;
          void writeTimestamp(const RenderQueryPool *queryPool, uint32_t queryIndex) override;
@@ -562,7 +856,7 @@ index 1d36b12..27f0050 100644
          void checkActiveRenderPass();
          void endActiveRenderPass();
          void setDescriptorSet(VkPipelineBindPoint bindPoint, const VulkanPipelineLayout *pipelineLayout, const RenderDescriptorSet *descriptorSet, uint32_t setIndex);
-@@ -404,9 +408,11 @@ namespace plume {
+@@ -404,9 +423,11 @@ namespace plume {
  
      struct VulkanDevice : RenderDevice {
          VkDevice vk = VK_NULL_HANDLE;
@@ -574,7 +868,15 @@ index 1d36b12..27f0050 100644
          VmaAllocator allocator = VK_NULL_HANDLE;
          uint32_t queueFamilyIndices[3] = {};
          std::vector<VulkanQueueFamily> queueFamilies;
-@@ -436,6 +442,7 @@ namespace plume {
+@@ -416,6 +437,7 @@ namespace plume {
+         VkPhysicalDeviceSampleLocationsPropertiesEXT sampleLocationProperties = {};
+         std::unique_ptr<RenderBuffer> nullBuffer;
+         bool loadStoreOpNoneSupported = false;
++        bool fragmentShadingRateSupported = false;
+         bool nullDescriptorSupported = false;
+ 
+         VulkanDevice(VulkanInterface *renderInterface, const std::string &preferredDeviceName);
+@@ -436,6 +458,7 @@ namespace plume {
          std::unique_ptr<RenderCommandSemaphore> createCommandSemaphore() override;
          std::unique_ptr<RenderFramebuffer> createFramebuffer(const RenderFramebufferDesc &desc) override;
          std::unique_ptr<RenderQueryPool> createQueryPool(uint32_t queryCount) override;
@@ -582,7 +884,7 @@ index 1d36b12..27f0050 100644
          void setBottomLevelASBuildInfo(RenderBottomLevelASBuildInfo &buildInfo, const RenderBottomLevelASMesh *meshes, uint32_t meshCount, bool preferFastBuild, bool preferFastTrace) override;
          void setTopLevelASBuildInfo(RenderTopLevelASBuildInfo &buildInfo, const RenderTopLevelASInstance *instances, uint32_t instanceCount, bool preferFastBuild, bool preferFastTrace) override;
          void setShaderBindingTableInfo(RenderShaderBindingTableInfo &tableInfo, const RenderShaderBindingGroups &groups, const RenderPipeline *pipeline, RenderDescriptorSet **descriptorSets, uint32_t descriptorSetCount) override;
-@@ -466,4 +473,9 @@ namespace plume {
+@@ -466,4 +489,9 @@ namespace plume {
          const std::vector<std::string> &getDeviceNames() const override;
          bool isValid() const;
      };

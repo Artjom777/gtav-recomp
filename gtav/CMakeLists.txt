@@ -53,6 +53,7 @@ set(GTAV_SOURCES
     src/native/shaders.cpp
     src/native/menu.cpp
     src/native/backend.cpp
+    src/native/deferred_list.cpp
     src/native/textures.cpp
     src/native/write_watch.cpp
     src/native/shader_compiler.cpp

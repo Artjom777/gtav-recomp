@@ -129,7 +129,19 @@ REXCVAR_DEFINE_BOOL(gtav_native_defer_writebacks, true, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_native_skip_depth_restore, true, "GTAV",
                     "Native renderer: skip GTA V's depth restore strips (EDRAM aliasing trick; native "
                     "depth targets keep their contents)");
-REXCVAR_DEFINE_BOOL(gtav_native_draw_clears, true, "GTAV",
+#ifdef __ANDROID__
+#define GTAV_DRAW_CLEARS_DEFAULT false  // vkCmdClearAttachments can become a load op (gtav_native_load_clears)
+#else
+#define GTAV_DRAW_CLEARS_DEFAULT true
+#endif
+REXCVAR_DEFINE_BOOL(gtav_native_pass_gpu_times, false, "GTAV",
+                    "Native renderer diagnostic: GPU timestamps between render passes, logged every 300 frames "
+                    "as ms per frame by kind of pass");
+REXCVAR_DEFINE_INT32(gtav_native_coarse_shading, 0, "GTAV",
+                     "Native renderer: shade the 3D passes (full-size targets with depth) at a coarser rate, "
+                     "a cheaper stand-in for a lower resolution: 0 = every pixel, 1 = 2x1 pixels, 2 = 2x2 "
+                     "(VK_KHR_fragment_shading_rate)");
+REXCVAR_DEFINE_BOOL(gtav_native_draw_clears, GTAV_DRAW_CLEARS_DEFAULT, "GTAV",
                     "Native renderer: colour clears as draws instead of vkCmdClearAttachments (MoltenVK restarts "
                     "the Metal render pass for a clear at its start)");
 #ifdef __APPLE__
@@ -2031,6 +2043,7 @@ struct Backend::Impl {
     Transition(list, t->texture.get(), RenderTextureLayout::COLOR_WRITE);
     list->setFramebuffer(fb.get());
     PassBegin("clear pass");
+    PassStamp(list, "clear pass");
     pass_end = "clear pass";
     bound_fb = nullptr;
     for (auto*& c : bound_color) c = nullptr;
@@ -2169,6 +2182,22 @@ struct Backend::Impl {
   static inline const bool pass_stats = std::getenv("GTAV_NATIVE_PASS_STATS") != nullptr;
   const char* pass_end = "frame start";
   std::map<std::string, uint32_t> pass_reasons;
+  // --gtav_native_pass_gpu_times: a timestamp after each pass change (outside any render pass: tile
+  // GPUs time a pass from its end), labelled with the pass that follows; FrameComplete sums them.
+  static constexpr uint32_t kPassStamps = 1024;
+  bool pass_times = false;
+  std::unique_ptr<RenderQueryPool> pass_pools[Backend::kFramesInFlight];
+  std::vector<std::string> pass_labels[Backend::kFramesInFlight];
+  std::unordered_map<std::string, std::pair<double, uint32_t>> pass_gpu;  // label -> ms, passes
+  uint32_t pass_gpu_frames = 0;
+  void PassStamp(RenderCommandList* list, std::string label) {
+    if (!pass_times) return;
+    auto& labels = pass_labels[slot];
+    if (labels.size() + 1 >= kPassStamps) return;
+    list->writeTimestamp(pass_pools[slot].get(), uint32_t(labels.size()));
+    labels.push_back(std::move(label));
+  }
+
   void PassBegin(const char* why) {
     if (pass_stats) pass_reasons[why]++;
     if (seqdiag) seq_passes += fmt::format("  [pass: {}]\n", why);
@@ -2874,7 +2903,15 @@ struct Backend::Impl {
       fb = device->createFramebuffer(desc);
     }
     list->setFramebuffer(fb.get());
+    if (pass_times)
+      PassStamp(list, fmt::format("targets {}x{} {}c fmt {}{}{}", count ? color[0]->width : depth ? depth->width : 0,
+                                  count ? color[0]->height : depth ? depth->height : 0, count,
+                                  count ? uint32_t(color[0]->format) : 0, depth ? " +depth" : "",
+                                  count && color[0]->msaa ? " msaa" : ""));
     bound_fb = fb.get();
+    if (const int32_t coarse = REXCVAR_GET(gtav_native_coarse_shading); coarse > 0 && depth && count &&
+        color[0]->width >= 640)
+      list->setFragmentShadingRate(2, coarse >= 2 ? 2 : 1);
     pass_draws = 0;
     for (uint32_t i = 0; i < 4; i++) bound_color[i] = i < count ? color[i] : nullptr;
     bound_depth = depth;
@@ -4553,6 +4590,7 @@ struct Backend::Impl {
     Transition(list, dst.texture.get(), RenderTextureLayout::COLOR_WRITE);
     list->setFramebuffer(dst.framebuffer.get());
     PassBegin("depth resolve copy");
+    PassStamp(list, "depth resolve copy");
     pass_end = "depth resolve copy";
     bound_fb = nullptr;
     list->setViewports(RenderViewport(float(px), float(py), float(x2 - x1), float(y2 - y1)));
@@ -4688,6 +4726,8 @@ struct Backend::Impl {
     Transition(list, r.texture.get(), RenderTextureLayout::SHADER_READ);
     list->barriers(RenderBarrierStage::COMPUTE, RenderBufferBarrier(buffer, RenderBufferAccess::WRITE));
     pass_end = "writeback compute";
+    list->setFramebuffer(nullptr);
+    PassStamp(list, "writeback compute");
     bound_fb = nullptr;
     list->setComputePipelineLayout(memory_layout.get());
     list->setPipeline(memory_pipeline.get());
@@ -5029,6 +5069,8 @@ struct Backend::Impl {
     if (src_descriptor == src->descriptor) Transition(list, src->texture.get(), RenderTextureLayout::SHADER_READ);
     Transition(list, dst.texture.get(), RenderTextureLayout::GENERAL);
     pass_end = "compute resolve";
+    list->setFramebuffer(nullptr);
+    PassStamp(list, "compute resolve");
     bound_fb = nullptr;
     list->setComputePipelineLayout(compute_resolve_layout.get());
     list->setPipeline(compute_resolve_pipeline.get());
@@ -5277,6 +5319,7 @@ struct Backend::Impl {
                          rc.dest_level == 0 && dst.discard_framebuffer && REXCVAR_GET(gtav_native_resolve_discard);
       list->setFramebuffer(whole ? dst.discard_framebuffer.get() : ResolveFramebuffer(dst, rc.dest_face, rc.dest_level));
       PassBegin("resolve copy");
+      if (pass_times) PassStamp(list, fmt::format("resolve copy {}x{}", x2 - x1, y2 - y1));
       pass_end = "resolve copy";
       bound_fb = nullptr;
       list->setViewports(RenderViewport(float(px), float(py), float(x2 - x1), float(y2 - y1)));
@@ -5400,6 +5443,12 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   s.converter = REXCVAR_GET(gtav_native_convert_threads) > 0 ? s.converter_pool.get() : nullptr;
   s.bound_fb = nullptr;
   s.pass_end = "frame start";
+  s.pass_times = REXCVAR_GET(gtav_native_pass_gpu_times) && s.pass_labels[s.slot].empty();
+  if (s.pass_times) {
+    if (!s.pass_pools[s.slot]) s.pass_pools[s.slot] = s.device->createQueryPool(Impl::kPassStamps);
+    list->resetQueryPool(s.pass_pools[s.slot].get(), 0, Impl::kPassStamps);
+    s.PassStamp(list, "frame start");
+  }
   s.grow_list = list;
   s.stat_draws = s.stat_skipped = s.stat_pipelines_created = s.stat_textures = s.stat_rewritten = 0;
   s.notes.clear();
@@ -5563,6 +5612,13 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
                 "{} targets, {} resolve targets, descriptors {} used / {} free, {} textures cached",
                 f.index, s.stat_draws, s.stat_skipped, s.stat_pipelines_created, s.pipelines.size(), s.stat_textures,
                 s.targets.size(), s.resolved.size(), s.next_descriptor, s.free_descriptors.size(), s.textures.size());
+  if (s.pass_times) {  // the end, then every query written (the pool is read whole)
+    list->setFramebuffer(nullptr);
+    s.bound_fb = nullptr;
+    s.PassStamp(list, "end");
+    for (uint32_t i = uint32_t(s.pass_labels[s.slot].size()); i < Impl::kPassStamps; i++)
+      list->writeTimestamp(s.pass_pools[s.slot].get(), i);
+  }
   // The front buffer is the last resolve into the texture passed to Swap.
   for (auto it = f.resolves.rbegin(); it != f.resolves.rend(); ++it) {
     if (it->dest_texture != f.front_buffer) continue;
@@ -5611,6 +5667,32 @@ Backend::FrameStats Backend::LastStats() const {
 
 void Backend::FrameComplete(uint32_t slot) {
   auto& p = impl_->parked[slot];
+  if (auto& labels = impl_->pass_labels[slot]; !labels.empty()) {
+    auto& s = *impl_;
+    s.pass_pools[slot]->queryResults();
+    const uint64_t* t = s.pass_pools[slot]->getResults();  // ns
+    for (size_t i = 0; i + 1 < labels.size(); i++) {
+      if (t[i + 1] < t[i] || t[i + 1] - t[i] > 1000000000ull) continue;
+      auto& e = s.pass_gpu[labels[i]];
+      e.first += (t[i + 1] - t[i]) / 1e6;
+      e.second++;
+    }
+    labels.clear();
+    if (++s.pass_gpu_frames == 300) {
+      std::vector<std::pair<double, std::string>> v;
+      double total = 0;
+      for (auto& [k, e] : s.pass_gpu) {
+        v.emplace_back(e.first, fmt::format("{} ({:.1f} passes)", k, e.second / 300.0));
+        total += e.first;
+      }
+      std::sort(v.rbegin(), v.rend());
+      REXLOG_INFO("[native] GPU by pass kind, ms per frame over 300 frames (total {:.2f}):", total / 300);
+      for (size_t i = 0; i < v.size() && i < 30; i++)
+        REXLOG_INFO("[native]   GPUPASS {:6.2f} ms  {}", v[i].first / 300, v[i].second);
+      s.pass_gpu.clear();
+      s.pass_gpu_frames = 0;
+    }
+  }
   if (auto& records = impl_->query_records[slot]; !records.empty()) {
     RenderQueryPool* pool = impl_->query_pools[slot].get();
     pool->queryResults();

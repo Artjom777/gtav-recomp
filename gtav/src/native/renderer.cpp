@@ -3,6 +3,7 @@
 #include "renderer.h"
 
 #include "backend.h"
+#include "deferred_list.h"
 #include "capture.h"
 #include "frame.h"
 #include "menu.h"
@@ -48,6 +49,17 @@ REXCVAR_DEFINE_STRING(gtav_native, "off", "GTAV", "Native renderer: off | shadow
 REXCVAR_DEFINE_BOOL(gtav_native_vsync, true, "GTAV", "Native renderer: wait for vertical sync when presenting");
 REXCVAR_DEFINE_BOOL(gtav_native_exact_barriers, true, "GTAV",
                     "Native renderer: no TOP_OF_PIPE / BOTTOM_OF_PIPE next to other barrier stages (MoltenVK waits less)");
+#ifdef __ANDROID__
+#define GTAV_LOAD_CLEARS_DEFAULT true
+#else
+#define GTAV_LOAD_CLEARS_DEFAULT false
+#endif
+REXCVAR_DEFINE_BOOL(gtav_native_record_thread, false, "GTAV",
+                    "Native renderer: a second thread turns the frame's commands into the Vulkan command buffer "
+                    "while the render thread prepares the next draws (deferred_list.h)");
+REXCVAR_DEFINE_BOOL(gtav_native_load_clears, GTAV_LOAD_CLEARS_DEFAULT, "GTAV",
+                    "Native renderer: a whole-target clear at the start of a render pass becomes its load op (tile "
+                    "GPUs skip loading the old contents)");
 REXCVAR_DEFINE_STRING(gtav_native_ab, "", "GTAV",
                       "Native renderer benchmark: name=a|b flips cvar name between a and b every 60 frames, logs averages");
 REXCVAR_DEFINE_BOOL(gtav_native_flicker_catch, false, "GTAV",
@@ -72,6 +84,8 @@ void SetVulkanPipelineCacheData(std::vector<uint8_t> data);  // plume-gtav.patch
 std::vector<uint8_t> GetVulkanPipelineCacheData(RenderDevice* device);
 extern uint32_t g_statRenderPasses, g_statBarriers;  // plume-gtav.patch
 extern bool g_exactBarrierStages;
+extern bool g_clearLoadOps;
+extern uint32_t g_statLoadClears, g_statClearsInPass, g_statClearsPartial;
 extern bool g_colorInputAttachments;
 }
 
@@ -931,6 +945,7 @@ class Renderer {
     list_ = lists_[slot].get();
     list_->begin();
     plume::g_exactBarrierStages = REXCVAR_GET(gtav_native_exact_barriers);
+    plume::g_clearLoadOps = REXCVAR_GET(gtav_native_load_clears);
     gpu_timed_[slot] = bool(gpu_times_[slot]);
     if (gpu_timed_[slot]) {
       list_->resetQueryPool(gpu_times_[slot].get(), 0, 2);
@@ -1020,8 +1035,16 @@ class Renderer {
     // GTAV_NATIVE_NO_BACKEND=1: present only a clear (bisects GPU hangs between the game's frame
     // and the swap chain path).
     static const bool no_backend = std::getenv("GTAV_NATIVE_NO_BACKEND") != nullptr;
+    plume::RenderCommandList* record_list = list_;
+    const bool deferred = REXCVAR_GET(gtav_native_record_thread);
+    if (deferred) {
+      if (!deferred_) deferred_ = std::make_unique<DeferredCommandList>([] { PinToBigCores(); });
+      deferred_->Begin(list_);
+      record_list = deferred_.get();
+    }
     plume::RenderTexture* front =
-        backend_ok_ && !no_backend ? backend_.Execute(frame, list_, &front_descriptor) : nullptr;
+        backend_ok_ && !no_backend ? backend_.Execute(frame, record_list, &front_descriptor) : nullptr;
+    if (deferred) timing_.replay_wait_sum += deferred_->Finish();
     // The frame's rendering goes to the GPU now, in a command buffer of its own; only the copy
     // into the window waits for a drawable. As one submission, the whole frame waited for the
     // swap chain image (MoltenVK: ~4 ms of GPU idle per frame on the M1).
@@ -1341,15 +1364,21 @@ class Renderer {
                     "wait for slot avg {:.2f} max {:.2f} ms",
                     presented, frame.index, dropped_.load(), timing_.record_sum / timing_.n, timing_.record_max,
                     timing_.gpu_sum / timing_.n, timing_.gpu_max);
+        if (deferred_)
+          REXLOG_INFO("[native]   record thread: replay busy {:.2f} ms per frame, render thread waited {:.2f} ms for it",
+                      deferred_->TakeBusyMs() / timing_.n, timing_.replay_wait_sum / timing_.n);
         REXLOG_INFO("[native]   avg acquire {:.2f} submit {:.2f} present {:.2f} idle {:.2f} ms; per frame {:.0f} "
-                    "render passes, {:.0f} barriers; submit thread busy {:.2f} ms; GPU frame {:.2f} ms, idle before {:.2f} ms",
+                    "render passes ({:.0f} load clears; not: {:.0f} in a pass, {:.0f} partial), {:.0f} barriers; submit thread busy {:.2f} ms; GPU frame {:.2f} ms, idle before {:.2f} ms",
                     timing_.acquire_sum / timing_.n, timing_.submit_sum / timing_.n,
                     timing_.present_sum / timing_.n, timing_.idle_sum / timing_.n,
-                    double(plume::g_statRenderPasses) / timing_.n, double(plume::g_statBarriers) / timing_.n,
+                    double(plume::g_statRenderPasses) / timing_.n, double(plume::g_statLoadClears) / timing_.n,
+                    double(plume::g_statClearsInPass) / timing_.n, double(plume::g_statClearsPartial) / timing_.n,
+                    double(plume::g_statBarriers) / timing_.n,
                     submitter_.busy_us.exchange(0) / 1000.0 / timing_.n,
                     timing_.gpu_frames ? timing_.gpu_frame_sum / timing_.gpu_frames : 0.0,
                     timing_.gpu_frames ? timing_.gpu_gap_sum / timing_.gpu_frames : 0.0);
-        plume::g_statRenderPasses = plume::g_statBarriers = 0;
+        plume::g_statRenderPasses = plume::g_statBarriers = plume::g_statLoadClears = 0;
+        plume::g_statClearsInPass = plume::g_statClearsPartial = 0;
         timing_ = {};
       }
     }
@@ -1443,6 +1472,7 @@ class Renderer {
     double gpu_frame_sum = 0, gpu_gap_sum = 0;
     uint32_t gpu_frames = 0;
     double acquire_sum = 0, submit_sum = 0, present_sum = 0, idle_sum = 0;
+    double replay_wait_sum = 0;  // --gtav_native_record_thread: the render thread waited for the replay
     uint32_t n = 0;
     void Add(double record, double gpu) {
       record_sum += record, gpu_sum += gpu, n++;
@@ -1468,6 +1498,7 @@ class Renderer {
   std::unique_ptr<plume::RenderCommandQueue> queue_cmd_;
   std::unique_ptr<plume::RenderSwapChain> swapchain_;
   std::unique_ptr<plume::RenderCommandList> lists_[Backend::kFramesInFlight];
+  std::unique_ptr<DeferredCommandList> deferred_;  // --gtav_native_record_thread
   std::unique_ptr<plume::RenderCommandList> present_lists_[Backend::kFramesInFlight];  // window copy
   std::unique_ptr<plume::RenderCommandFence> fences_[Backend::kFramesInFlight];
   std::unique_ptr<plume::RenderQueryPool> gpu_times_[Backend::kFramesInFlight];  // main list start / end
