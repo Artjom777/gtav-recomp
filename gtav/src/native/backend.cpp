@@ -100,6 +100,14 @@ REXCVAR_DEFINE_BOOL(gtav_native_skip_depth_restore, true, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_native_draw_clears, true, "GTAV",
                     "Native renderer: colour clears as draws instead of vkCmdClearAttachments (MoltenVK restarts "
                     "the Metal render pass for a clear at its start)");
+#ifdef __APPLE__
+#define GTAV_DIRECT_CONVERT_DEFAULT true
+#else
+#define GTAV_DIRECT_CONVERT_DEFAULT false
+#endif
+REXCVAR_DEFINE_BOOL(gtav_native_direct_convert, GTAV_DIRECT_CONVERT_DEFAULT, "GTAV",
+                    "Native renderer: vertex conversions write straight into upload memory (cached on Apple GPUs) "
+                    "instead of through a scratch buffer (write-combined memory elsewhere)");
 REXCVAR_DEFINE_BOOL(gtav_native_fragment_barriers, true, "GTAV",
                     "Native renderer: render target transitions wait at the fragment stage only");
 REXCVAR_DEFINE_INT32(gtav_native_skip_resolves, 0, "GTAV",
@@ -2363,6 +2371,9 @@ struct Backend::Impl {
   std::vector<uint8_t> convert_scratch;
   template <class F>
   void ConvertInto(uint8_t* dst, uint64_t size, const F& convert) {
+    // Apple GPUs share cached memory with the CPU (Metal shared storage, not write-combined): the
+    // conversion writes there directly instead of through the scratch copy.
+    if (REXCVAR_GET(gtav_native_direct_convert)) return convert(dst);
     if (convert_scratch.size() < size) convert_scratch.resize(size_t(size));
     convert(convert_scratch.data());
     std::memcpy(dst, convert_scratch.data(), size_t(size));
