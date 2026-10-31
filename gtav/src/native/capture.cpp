@@ -51,8 +51,9 @@ REXCVAR_DEFINE_INT32(gtav_native_fence_lag, 0, "GTAV",
 // On by default on macOS: the renderer there runs up to a few frames behind (record ~20-33 ms per
 // open-world frame), so the game recycled streamed meshes and textures under queued frames:
 // one-frame exploded geometry, black ground and sky (ow2: ~5 per 1000 frames, 2 in 21000 with the
-// wait, same fps). Linux keeps the copies.
-#ifdef __APPLE__
+// wait, same fps). Android's renderer runs behind the same way (record ~25 ms a frame). Linux
+// keeps the copies.
+#if defined(__APPLE__) || defined(__ANDROID__)
 #define GTAV_FENCE_WAIT_DEFAULT true
 #else
 #define GTAV_FENCE_WAIT_DEFAULT false
@@ -60,6 +61,9 @@ REXCVAR_DEFINE_INT32(gtav_native_fence_lag, 0, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_native_fence_wait, GTAV_FENCE_WAIT_DEFAULT, "GTAV",
                     "The command processor waits at a GPU fence until the renderer recorded the draws before "
                     "it (textures too) when their frame is complete, instead of copying their vertex data");
+REXCVAR_DEFINE_INT32(gtav_native_fence_wait_ms, 100, "GTAV",
+                     "Longest wait of the command processor at a GPU fence for the renderer (then it copies, "
+                     "or gives up for the frame being recorded; Mac: stalls past 100 ms left one-frame slabs)");
 REXCVAR_DEFINE_BOOL(gtav_native_fence_wait_draw, false, "GTAV",
                     "Experiment, with --gtav_native_fence_wait: wait only until the draw before the fence is "
                     "recorded, not its whole frame (the command processor then reaches the fences of the frame "
@@ -488,7 +492,7 @@ static void FenceReached(uint32_t value) {
       g_copy_stats.waits++;
       bool reached = false;
       while (!(reached = g_recording != frame || g_recorded_draws.load(std::memory_order_acquire) > draw)) {
-        if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(100)) break;
+        if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(REXCVAR_GET(gtav_native_fence_wait_ms))) break;
         lock.unlock();
         std::this_thread::sleep_for(std::chrono::microseconds(50));
         lock.lock();
@@ -512,7 +516,7 @@ static void FenceReached(uint32_t value) {
       };
       bool reached = false;
       while (!(reached = g_copy_floor > frame || recorded())) {
-        if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(100)) break;
+        if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(REXCVAR_GET(gtav_native_fence_wait_ms))) break;
         if (g_recording == frame) {
           lock.unlock();
           std::this_thread::sleep_for(std::chrono::microseconds(50));
@@ -535,7 +539,7 @@ static void FenceReached(uint32_t value) {
       uint64_t frame = p.frame;
       auto start = std::chrono::steady_clock::now();
       g_copy_stats.waits++;
-      if (!g_copy_cv.wait_for(lock, std::chrono::milliseconds(100), [&] { return g_copy_floor > frame; }))
+      if (!g_copy_cv.wait_for(lock, std::chrono::milliseconds(REXCVAR_GET(gtav_native_fence_wait_ms)), [&] { return g_copy_floor > frame; }))
         g_copy_stats.wait_timeouts++;
       g_copy_stats.wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
       if (g_copy_floor <= frame) {

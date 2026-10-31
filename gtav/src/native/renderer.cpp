@@ -105,12 +105,20 @@ const int g_mvk_precise_math = setenv("MVK_CONFIG_FAST_MATH_ENABLED", "0", 0);
 // New pipelines arrive in bursts of hundreds when an area or cutscene loads; Metal compiles them
 // with more threads this way (fewer frames shown from the hold, see gtav_native_hold_lost_frames).
 const int g_mvk_concurrent_compile = setenv("MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRENT_COMPILATION", "1", 0);
+#endif
+
+#if defined(__APPLE__) || defined(__ANDROID__)
 // Render passes declare their colour attachments as input attachments: the backend's in-pass
 // resolves read them by framebuffer fetch (FetchResolve). Before any Plume resource exists.
-// GTAV_NATIVE_FETCH_RESOLVE=0 turns them off (resolves copy in passes of their own).
+// GTAV_NATIVE_FETCH_RESOLVE=0 turns them off (resolves copy in passes of their own); on Android
+// they are opt-in (=1) until checked on Adreno.
 const bool g_plume_input_attachments = (plume::g_colorInputAttachments = [] {
   const char* e = std::getenv("GTAV_NATIVE_FETCH_RESOLVE");
+#ifdef __ANDROID__
+  return e && std::string(e) != "0";
+#else
   return !e || std::string(e) != "0";
+#endif
 }());
 #endif
 

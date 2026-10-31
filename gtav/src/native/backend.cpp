@@ -46,6 +46,10 @@
 #include <unordered_set>
 #include <bit>
 #include <set>
+#ifdef __ANDROID__
+#include <sched.h>
+#include <unistd.h>
+#endif
 #include <vector>
 
 REXCVAR_DECLARE(std::string, gtav_native_spirv_dir);
@@ -69,8 +73,9 @@ REXCVAR_DEFINE_BOOL(gtav_native_exact_cache, false, "GTAV",
                     "(no sampled-hash shortcut for large ones)");
 // Off by default: the hash is taken at the start of the frame, so data the game rewrites before
 // the draw is recorded keeps last frame's upload for one frame (foliage popping, owner 10-29).
-// macOS (no write watch): 3 workers took ~2.4 ms a frame off recording in the open world.
-#ifdef __APPLE__
+// macOS (no write watch): 3 workers took ~2.4 ms a frame off recording in the open world. Android
+// has no write watch either (kernel 5.10): workers run on the little cores there (HashPool).
+#if defined(__APPLE__) || defined(__ANDROID__)
 #define GTAV_HASH_THREADS_DEFAULT 3
 #else
 #define GTAV_HASH_THREADS_DEFAULT 0
@@ -1165,6 +1170,16 @@ class HashPool {
       workers_.emplace_back([this] {
 #ifdef _WIN32
         SetThreadDescription(GetCurrentThread(), L"Native hash");
+#elif defined(__ANDROID__)
+        // The lower half of the CPU numbers are the little cores: the big ones stay with the game
+        // and the renderer (pinned there). A slow worker costs nothing: the render thread hashes
+        // whatever is not ready when it gets there.
+        if (int n = int(sysconf(_SC_NPROCESSORS_CONF)); n >= 4) {
+          cpu_set_t set;
+          CPU_ZERO(&set);
+          for (int i = 0; i < n / 2; i++) CPU_SET(i, &set);
+          sched_setaffinity(0, sizeof(set), &set);
+        }
 #endif
         uint64_t seen = 0;
         for (;;) {

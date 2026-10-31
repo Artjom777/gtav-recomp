@@ -34,6 +34,23 @@ public class GameActivity extends SDLActivity {
         } catch (Exception e) {
             Log.w(TAG, "setenv: " + e);
         }
+        // args.txt env: lines before super.onCreate loads libmain.so: its static initializers read
+        // some variables (GTAV_NATIVE_FETCH_RESOLVE), and getArguments runs only after the load.
+        File extra = new File(getExternalFilesDir(null), "args.txt");
+        if (extra.exists()) {
+            try (BufferedReader reader = new BufferedReader(new FileReader(extra))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    line = line.trim();
+                    if (line.startsWith("env:") && line.indexOf('=') > 4) {
+                        int eq = line.indexOf('=');
+                        android.system.Os.setenv(line.substring(4, eq), line.substring(eq + 1), true);
+                    }
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "args.txt env: " + e);
+            }
+        }
         super.onCreate(savedInstanceState);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
     }
@@ -64,10 +81,7 @@ public class GameActivity extends SDLActivity {
                 String line;
                 while ((line = reader.readLine()) != null) {
                     line = line.trim();
-                    if (line.startsWith("env:") && line.indexOf('=') > 4) {
-                        int eq = line.indexOf('=');
-                        android.system.Os.setenv(line.substring(4, eq), line.substring(eq + 1), true);
-                    } else if (!line.isEmpty() && !line.startsWith("#")) {
+                    if (!line.isEmpty() && !line.startsWith("#") && !line.startsWith("env:")) {
                         args.add(line);
                     }
                 }
