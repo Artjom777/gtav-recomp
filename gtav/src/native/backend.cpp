@@ -879,7 +879,14 @@ class PipelineCompiler {
     std::lock_guard lock(mutex_);
     if (!started_) {
       started_ = true;
-      for (int i = 0; i < 3; i++)
+      // iPhone: a pipeline takes ~3 s (MoltenVK + Metal on an A15), most of it waiting on the
+      // Metal compiler service: more compiles in flight drain the backlog after an install faster.
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+      constexpr int kWorkers = 6;
+#else
+      constexpr int kWorkers = 3;
+#endif
+      for (int i = 0; i < kWorkers; i++)
         std::thread([this, device] {
 #if defined(__APPLE__)
           // Same class as the guest threads (the SDK runs them USER_INTERACTIVE): a lower one
