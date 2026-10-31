@@ -14,11 +14,12 @@ repo=$(cd "$(dirname "$0")/../.." && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 top=gtav-recomp-src
-tarball=$work/src.tar
+mkdir -p "$work/$top"
 
+# Each part is unpacked into one staging tree and packed once at the end (GNU tar and macOS's
+# bsdtar both work; no GNU-only options).
 add() {  # add <git dir> <commit> <prefix>
-  git -C "$1" archive --format=tar --prefix="$top/$3/" "$2" > "$work/part.tar"
-  if [ -f "$tarball" ]; then tar --force-local -Af "$tarball" "$work/part.tar"; else mv "$work/part.tar" "$tarball"; fi
+  git -C "$1" archive --format=tar --prefix="$top/$3/" "$2" | tar -C "$work" -xf -
   echo "  $3 @ $(git -C "$1" rev-parse --short "$2^{commit}")"
 }
 add_tree() {  # add a repo and, recursively, its submodules at their checked-out commits
@@ -35,7 +36,7 @@ add_tree "$sdk" rexglue-sdk
 add_tree "$xr" XenosRecomp
 add_tree "$plume" plume
 
-cat > "$work/SOURCE.txt" <<EOF
+cat > "$work/$top/SOURCE.txt" <<EOF
 Corresponding source for the gtav-recomp $tag binaries.
 
 gtav-recomp/   this project at $tag (GPL-3.0-or-later)
@@ -46,21 +47,25 @@ XenosRecomp/   $(git -C "$xr" rev-parse --short HEAD) + submodules; apply gtav-r
 plume/         $(git -C "$plume" rev-parse --short HEAD); apply gtav-recomp/plume-gtav.patch
 
 FFmpeg (rexglue-sdk/thirdparty/FFmpeg, LGPL-2.1-or-later; FFmpeg's GPL parts are not enabled
-by the SDK's build) is linked statically into rexruntimerd.dll (Linux: librexruntime.so). To use a
+by the SDK's build) is linked statically into rexruntimerd.dll (Linux: librexruntime.so, macOS:
+librexruntime.dylib). To use a
 modified FFmpeg: change it in rexglue-sdk/thirdparty/FFmpeg, rebuild the SDK
 (gtav-recomp/build_sdk.cmd on Windows; on Linux the SDK's linux-amd64 CMake preset, Release, then
-cmake --install), and put the new rexruntimerd.dll / librexruntime.so (and the other SDK libraries
-it was built with) in the release folder. The rest of the program needs no change: gtav_fast links
+cmake --install; on macOS the mac-arm64 preset with CMAKE_OSX_DEPLOYMENT_TARGET=15.0), and put the
+new rexruntimerd.dll / librexruntime.so (and the other SDK libraries it was built with) in the
+release folder (macOS: GTAV.app/Contents/Resources/gtav, then sign the app again ad hoc:
+codesign --force --deep --sign - GTAV.app). The rest of the program needs no change: gtav_fast links
 to the runtime library dynamically.
 
 Building everything: gtav-recomp/docs/RELEASE_CLEANROOM.md (release layout and tools) and
 gtav-recomp/build_sdk.cmd, build_xr.cmd, build_release_exe.cmd, build_launcher.cmd (Windows),
-gtav-recomp/tools/release/build_release_linux.sh (Linux).
+gtav-recomp/tools/release/build_release_linux.sh (Linux), gtav-recomp/tools/release/
+build_release_macos.sh (macOS).
 LLVM (clang, lld) and the DirectX Shader Compiler are bundled unmodified from their official
-releases (LLVM 19.1.5: github.com/llvm/llvm-project; dxc: XenosRecomp/thirdparty/dxc-bin).
+releases (LLVM 19.1.5 on Windows and Linux, 19.1.7 on macOS: github.com/llvm/llvm-project; dxc:
+XenosRecomp/thirdparty/dxc-bin).
 
 No game data is in this archive or in the release.
 EOF
-tar --force-local -C "$work" --transform "s,^,$top/," -rf "$tarball" SOURCE.txt
-xz -T0 -6 -c "$tarball" > "$out"
+tar -C "$work" -cf - "$top" | xz -T0 -6 -c > "$out"
 echo "$(du -h "$out" | cut -f1) -> $out"

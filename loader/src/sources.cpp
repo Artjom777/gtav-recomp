@@ -502,7 +502,11 @@ std::unique_ptr<Blob> OpenFileBlob(const std::wstring& path, std::wstring* error
     if (fd >= 0) close(fd);
     return nullptr;
   }
+#ifdef __APPLE__
+  fcntl(fd, F_RDAHEAD, 1);
+#else
   posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
   return std::make_unique<FileBlob>(fd, uint64_t(st.st_size));
 }
 #endif

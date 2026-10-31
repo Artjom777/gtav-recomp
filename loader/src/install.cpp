@@ -13,6 +13,9 @@
 //   data\spirv\                            filled by the game: shaders translated on first use
 // Linux: gtav_fast, librexruntime.so, rexglue, tools/llvm/bin/{clang++,ld.lld}, gtav_game.so; the
 // same data/ layout.
+// macOS: the package (root) is GTAV.app/Contents/Resources/gtav and stays read-only (the app is
+// signed); everything made here goes to the game folder (home): gtav_game.dylib, data/, plus a copy
+// of the runtime (gtav_fast, dylibs, shader tools) so gtav_fast finds gtav_game.dylib next to it.
 #include "install.h"
 
 #ifdef _WIN32
@@ -32,6 +35,9 @@
 #include <cstring>
 
 extern char** environ;
+#endif
+#ifdef __APPLE__
+#include <sys/sysctl.h>
 #endif
 
 #include <algorithm>
@@ -60,6 +66,13 @@ constexpr wchar_t kGameLib[] = L"gtav_game.dll";
 constexpr wchar_t kCodegenExe[] = L"rexgluerd.exe";
 constexpr wchar_t kClang[] = L"clang++.exe";
 constexpr wchar_t kObjExt[] = L".obj";
+#elif defined(__APPLE__)
+constexpr wchar_t kInstalledMarker[] = L"data/installed.txt";
+constexpr wchar_t kGameExe[] = L"gtav_fast";
+constexpr wchar_t kGameLib[] = L"gtav_game.dylib";
+constexpr wchar_t kCodegenExe[] = L"rexglue";
+constexpr wchar_t kClang[] = L"clang++";
+constexpr wchar_t kObjExt[] = L".o";
 #else
 constexpr wchar_t kInstalledMarker[] = L"data/installed.txt";
 constexpr wchar_t kGameExe[] = L"gtav_fast";
@@ -489,8 +502,8 @@ std::string Tail(const fs::path& p, size_t bytes) {
 
 class Installer {
  public:
-  Installer(fs::path root, const InstallInputs& in, InstallUi& ui)
-      : root_(std::move(root)), in_(in), ui_(ui), data_(root_ / L"data") {}
+  Installer(fs::path root, fs::path home, const InstallInputs& in, InstallUi& ui)
+      : root_(std::move(root)), home_(std::move(home)), in_(in), ui_(ui), data_(home_ / L"data") {}
 
   bool Run(std::wstring* error) {
     error_ = error;
@@ -510,7 +523,7 @@ class Installer {
     if (!ReviewMismatches()) return false;
     if (!Codegen() || !CheckGenerated() || !Compile() || !Link()) return Fail();
 
-    std::ofstream(root_ / kInstalledMarker) << kInstallVersion << "\n";
+    std::ofstream(home_ / kInstalledMarker) << kInstallVersion << "\n";
     fs::remove_all(data_ / L"build", ec);
     fs::remove(data_ / L"install_state.txt", ec);
     ui_.Progress(1.0);
@@ -838,7 +851,15 @@ class Installer {
   //--- compile and link ------------------------------------------------------
 
   static int JobCount() {
-#ifndef _WIN32
+#ifdef __APPLE__
+    // clang needs up to ~1 GB for the largest generated file; keep 3 GB for macOS and the app.
+    uint64_t mem = 0;
+    size_t len = sizeof(mem);
+    sysctlbyname("hw.memsize", &mem, &len, nullptr, 0);
+    int64_t by_ram = (int64_t(mem >> 20) - 3072) / 1024;
+    int jobs = int(std::min<int64_t>(sysconf(_SC_NPROCESSORS_ONLN), by_ram));
+    return std::clamp(jobs, 1, 32);
+#elif !defined(_WIN32)
     // MemAvailable from /proc/meminfo, in kB.
     int64_t avail_mb = 4096;
     std::ifstream mi("/proc/meminfo");
@@ -886,7 +907,9 @@ class Installer {
         sources.push_back(gen / Widen(name));
     }
     sources.push_back(fsdir / L"game_dll.cpp");
-    sources.push_back(fsdir / L"fs_crt.cpp");
+#ifndef __APPLE__
+    sources.push_back(fsdir / L"fs_crt.cpp");  // x86 memcpy & co.; macOS takes libSystem's
+#endif
 
     fs::path clang = root_ / L"tools" / L"llvm" / L"bin" / kClang;
     // Keep in sync with tools/game_dll/build_game_dll.py.
@@ -894,6 +917,12 @@ class Installer {
     Args flags = {L"--target=x86_64-pc-windows-msvc", L"-nostdinc++", L"-nostdlibinc", L"-O2",
                   L"-std=gnu++23", L"-march=x86-64-v3", L"-msse4.1", L"-fno-exceptions",
                   L"-fno-rtti", L"-fno-threadsafe-statics", L"-fno-math-errno", L"-w"};
+#elif defined(__APPLE__)
+    // fs/include also holds simde (SSE on NEON, the SDK's own headers).
+    Args flags = {L"--target=arm64-apple-macos15", L"-nostdinc++", L"-nostdlibinc",
+                  L"-fno-stack-protector", L"-O2",
+                  L"-std=gnu++23", L"-mcpu=apple-m1", L"-fno-exceptions", L"-fno-rtti",
+                  L"-fno-threadsafe-statics", L"-fno-math-errno", L"-w"};
 #else
     Args flags = {L"--target=x86_64-linux-gnu", L"-nostdinc++", L"-nostdlibinc", L"-fPIC",
                   L"-fno-semantic-interposition", L"-fno-stack-protector",
@@ -953,7 +982,41 @@ class Installer {
     return true;
   }
 
-#ifndef _WIN32
+#ifdef __APPLE__
+  bool Link() {
+    ui_.Stage(L"Linking gtav_game.dylib...");
+    fs::path build = data_ / L"build";
+    fs::path gd = root_ / L"tools" / L"game_dll";
+    fs::path lld = root_ / L"tools" / L"llvm" / L"bin" / L"ld64.lld";
+    fs::path rsp = build / L"link.rsp";
+    {
+      std::ofstream f(rsp);
+      for (auto& o : objects_) f << "\"" << o.string() << "\"\n";
+      // Hooks and bridge: bound to gtav_fast at load time (Mach-O cannot link against an exe).
+      std::ifstream u(gd / L"interface" / L"gtav_game.undefs");
+      for (std::string line; std::getline(u, line);)
+        if (!line.empty()) f << "-U " << line << "\n";
+    }
+    fs::path out = home_ / L"gtav_game.dylib.new";
+    fs::path log = data_ / L"logs" / L"link.log";
+    // Keep in sync with tools/game_dll/build_game_dll.py. Kernel imports bind to
+    // librexruntime.dylib, memcpy & co. and log2f to libSystem (libSystem.tbd: names only).
+    Args cmd = {lld.wstring(), L"-arch", L"arm64", L"-platform_version", L"macos", L"15.0", L"15.0",
+                L"-dylib", L"-install_name", L"@rpath/gtav_game.dylib", L"-dead_strip_dylibs",
+                L"-O1", L"-exported_symbols_list", (gd / L"interface" / L"gtav_game.exports").wstring(),
+                (gd / L"libSystem.tbd").wstring(), (root_ / L"librexruntime.dylib").wstring(), L"-o",
+                out.wstring(), L"@" + rsp.wstring()};
+    Child c;
+    if (!c.Start(cmd, build, log)) return SetError(L"Could not start ld64.lld");
+    int code = c.Poll(INFINITE);
+    if (code != 0) return SetError(L"Linking failed:\n" + Widen(Tail(log, 1500)));
+    if (rename(out.c_str(), (home_ / kGameLib).c_str()) != 0)
+      return SetError(L"Could not put gtav_game.dylib in place: " + Widen(strerror(errno)));
+    Log(L"Built gtav_game.dylib");
+    ui_.Progress(1.0);
+    return true;
+  }
+#elif !defined(_WIN32)
   bool Link() {
     ui_.Stage(L"Linking gtav_game.so...");
     fs::path build = data_ / L"build";
@@ -1024,7 +1087,7 @@ class Installer {
   }
 #endif
 
-  fs::path root_;
+  fs::path root_, home_;
   InstallInputs in_;
   InstallUi& ui_;
   fs::path data_;
@@ -1049,7 +1112,82 @@ bool IsInstalled(const fs::path& root) {
   return std::getline(f, line) && line == kInstallVersion;
 }
 
-#ifndef _WIN32
+#ifdef __APPLE__
+bool Preflight(const fs::path& root, std::wstring* error) {
+  // The package is arm64 only and its shader compiler (dxc) needs macOS 15.
+  char ver[32] = {};
+  size_t len = sizeof(ver);
+  sysctlbyname("kern.osproductversion", ver, &len, nullptr, 0);
+  if (atoi(ver) < 15) {
+    *error = L"This needs macOS 15 (Sequoia) or newer; this Mac runs macOS " + Widen(ver) + L".";
+    return false;
+  }
+  for (const wchar_t* f :
+       {L"gtav_fast", L"librexruntime.dylib", L"librexgpu-xenos.dylib", L"rexglue",
+        L"vulkan/lib/libMoltenVK.dylib", L"tools/llvm/bin/clang++", L"tools/llvm/bin/ld64.lld",
+        L"tools/game_dll/expected.txt", L"tools/game_dll/gtav_manifest.toml",
+        L"tools/game_dll/fs/gtav_pch.h", L"tools/game_dll/fs/include/simde/x86/sse4.1.h",
+        L"tools/game_dll/libSystem.tbd", L"tools/game_dll/interface/gtav_game.undefs"}) {
+    std::error_code ec;
+    if (!fs::exists(root / f, ec)) {
+      *error = std::wstring(L"The app is incomplete: ") + f + L" is missing. Download it again.";
+      return false;
+    }
+  }
+  return true;
+}
+
+bool CheckGameFolder(const fs::path& home, std::wstring* error) {
+  std::error_code ec;
+  fs::create_directories(home, ec);
+  if (ec) {
+    *error = L"Could not create " + home.wstring() + L": " + Widen(ec.message());
+    return false;
+  }
+  // Xbox paths ignore case: the game data must be on a case-insensitive volume (macOS default).
+  if (pathconf(home.c_str(), _PC_CASE_SENSITIVE) == 1) {
+    *error = home.wstring() + L" is on a case-sensitive volume. Pick a folder on a normal "
+             L"(case-insensitive) APFS or Mac OS Extended volume.";
+    return false;
+  }
+  return true;
+}
+
+// The runtime files gtav_fast needs next to it in the game folder: gtav_fast must find the
+// gtav_game.dylib made there (@rpath = its own folder), and the app bundle itself stays read-only.
+bool SyncRuntime(const fs::path& root, const fs::path& home, std::wstring* error) {
+  std::vector<fs::path> files;
+  std::error_code ec;
+  for (auto& e : fs::directory_iterator(root, ec)) {
+    auto name = e.path().filename().string();
+    if (name == "gtav_fast" || e.path().extension() == ".dylib") files.push_back(e.path().filename());
+  }
+  for (const char* dir : {"vulkan", "tools/shaders"}) {
+    for (auto it = fs::recursive_directory_iterator(root / dir, ec);
+         !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+      if (it->is_regular_file()) files.push_back(fs::relative(it->path(), root));
+    }
+  }
+  for (const fs::path& rel : files) {
+    fs::path src = root / rel, dst = home / rel;
+    if (rel.begin()->string() == "tools") dst = home / "tools" / fs::relative(rel, "tools/shaders");
+    std::error_code e1, e2;
+    if (fs::exists(dst, e1) && fs::file_size(dst, e1) == fs::file_size(src, e2) &&
+        fs::last_write_time(dst, e1) == fs::last_write_time(src, e2))
+      continue;
+    fs::create_directories(dst.parent_path(), e1);
+    fs::path tmp = dst;
+    tmp += ".new";
+    fs::copy_file(src, tmp, fs::copy_options::overwrite_existing, e1);
+    if (!e1) fs::last_write_time(tmp, fs::last_write_time(src, e2), e2);
+    if (e1 || rename(tmp.c_str(), dst.c_str()) != 0) {
+      *error = L"Could not copy " + rel.wstring() + L" into the game folder";
+      return false;
+    }
+  }
+  return true;
+}
+#elif !defined(_WIN32)
 bool Preflight(const fs::path& root, std::wstring* error) {
   // gtav_fast and the game code are built for x86-64-v3 (AVX2, BMI2, FMA, MOVBE).
   __builtin_cpu_init();
@@ -1117,7 +1255,13 @@ bool Preflight(const fs::path& root, std::wstring* error) {
 #endif
 
 bool RunInstall(const fs::path& root, const InstallInputs& in, InstallUi& ui, std::wstring* error) {
-  Installer inst(root, in, ui);
+  Installer inst(root, root, in, ui);
+  return inst.Run(error);
+}
+
+bool RunInstall(const fs::path& root, const fs::path& home, const InstallInputs& in, InstallUi& ui,
+                std::wstring* error) {
+  Installer inst(root, home, in, ui);
   return inst.Run(error);
 }
 
@@ -1133,7 +1277,8 @@ bool LaunchGame(const fs::path& root, std::wstring* error, const std::vector<std
   for (auto it = fs::directory_iterator(root, ec); !ec && it != fs::directory_iterator();
        it.increment(ec)) {
     auto ext = Lower(Narrow(it->path().extension().wstring()));
-    if (ext != ".dll" && ext != ".so" && it->path().filename() != kGameExe) continue;
+    if (ext != ".dll" && ext != ".so" && ext != ".dylib" && it->path().filename() != kGameExe)
+      continue;
     std::wstring err;
     if (auto b = OpenFileBlob(it->path().wstring(), &err)) {
       for (uint64_t off = 0; off < b->size(); off += buf.size())
@@ -1152,10 +1297,38 @@ bool LaunchGame(const fs::path& root, std::wstring* error, const std::vector<std
 #ifdef _WIN32
                L"--input_backend=xinput",
 #endif
+#ifdef __APPLE__
+               // The runtime's own window would open in a fullscreen Space of its own; the native
+               // renderer hides it and opens the game window on the desktop, leaving the player
+               // looking at an empty black Space.
+               L"--fullscreen=false", L"--mnk_mode=true",
+#endif
                L"--gtav_native=on", L"--gtav_fps_limit=0", L"--gpu_skip_rendering=true",
                L"--gpu_skip_rendering_lag_ms=4", L"--vsync=false", L"--gtav_native_vsync=false"};
   args.insert(args.end(), extra.begin(), extra.end());
-#ifndef _WIN32
+#ifdef __APPLE__
+  // The launcher app quits; the game runs on in its own session, its output in data/logs.
+  std::vector<std::string> narrow = NarrowArgs(args);
+  std::vector<char*> argv = Argv(narrow);
+  fs::path out = data / L"logs" / L"gtav_stdout.txt";
+  posix_spawn_file_actions_t fa;
+  posix_spawn_file_actions_init(&fa);
+  posix_spawn_file_actions_addopen(&fa, 1, out.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  posix_spawn_file_actions_adddup2(&fa, 1, 2);
+  posix_spawn_file_actions_addchdir_np(&fa, root.c_str());
+  posix_spawnattr_t attr;
+  posix_spawnattr_init(&attr);
+  posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
+  pid_t pid;
+  int err = posix_spawn(&pid, argv[0], &fa, &attr, argv.data(), environ);
+  posix_spawn_file_actions_destroy(&fa);
+  posix_spawnattr_destroy(&attr);
+  if (err != 0) {
+    *error = L"Could not start " + args[0] + L": " + Widen(strerror(err));
+    return false;
+  }
+  return true;
+#elif !defined(_WIN32)
   // The launcher becomes the game: it keeps the terminal and the exit code.
   if (chdir(root.c_str()) != 0) {
     *error = L"Could not enter " + root.wstring();
