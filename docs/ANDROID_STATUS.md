@@ -11,6 +11,45 @@ GTA V runs in-game on a Galaxy S23 FE (Snapdragon 8 Gen 1, Adreno 730, Android 1
 letterboxed, with on-screen touch controls (a Bluetooth pad hides them). About 10-15 fps while the
 GPU is thermally throttled (350 of 818 MHz after long sessions on the charger).
 
+## Perf session 10-30/31 (Mac arm64 work merged; measured on the phone, live A/B per change)
+
+Branch `android` (not pushed). Numbers: same-run `tools/android/ab.sh NAME 'cvar=a|b'` A/Bs.
+Cold the game reaches 28-29 fps in the open world; hot (battery 40-45 C on the charger, GPU
+220-317 MHz, CPU clusters ~1.1-1.4 GHz) 14-17 fps: record 40-45 ms, GPU 38-42 ms per frame.
+
+Kept:
+- Leaving the app (Home, app switch, lock screen) crashed in vkCreateFramebuffer
+  (VK_ERROR_SURFACE_LOST_KHR): the swap chain is rebuilt on SDL's new window (24 ms after resume).
+- Main game thread pinned to the prime core (`gtav_android_main_prime`): +3-4%. It is busy ~80%
+  of the frame (`--gtav_wait_profile`) and the scheduler had it on little cores 45% of the time.
+- Fence wait on (as on macOS): neutral to +5%, prevents the open-world one-frame slabs.
+- New packets start at the largest arena seen (no growth copies).
+- args.txt `env:` lines are set before libmain.so loads (static initializers read some).
+- Presets: Best image = game limiter 30 + vsync; Max performance = uncapped.
+- appCategory=game in the manifest (Game Booster options for the app).
+
+Measured and left off on Android (all reversible by cvar):
+| change | result |
+|---|---|
+| SDK page-protection write watch | 2x slower (its global lock on every fault) |
+| hash worker threads (macOS win) | not a win |
+| in-pass (fetch) resolves | neutral (GTAV_NATIVE_FETCH_RESOLVE=1 opt-in) |
+| draw clears off (vkCmdClearAttachments) | neutral |
+| texture recheck 2 vs 8 frames | neutral |
+| worker conversion of per-frame vertex data (`gtav_native_convert_threads`) | 1-6 ms slower recording |
+| XMA decoder flush instead of reopen (`xma_flush_streams`) | ~20% less audio-thread CPU but 13-16 audio bursts vs 4 in the scripted desktop capture |
+
+Profile (simpleperf, cold): render thread ~16% of all samples (XXH3 hashing 14%, vertex
+conversion 12% of it), game D3D thread 12%, main thread 11%, audio 17% (a fifth of that was the
+XMA codec reopen), command processor 8-9%. Per frame ~7-8 MB of fence-copied vertex data is
+converted (snapshots), 1.7-2 MB of rect lists.
+
+What 30 fps hot would take (not started): halve both CPU recording and GPU time. Candidates:
+render resolution below 720p (shaders compute 16 px tile indices from FragCoord: needs a scale in
+every recompiled shader), recording on several threads (secondary command buffers), fewer GMEM
+loads per pass (LOAD_OP_CLEAR/DONT_CARE where a pass starts with a full clear), less charging heat
+(Game Booster "Pause USB Power Delivery", or play unplugged).
+
 ## Build and run (from Linux, phone on adb)
 
 ```sh
