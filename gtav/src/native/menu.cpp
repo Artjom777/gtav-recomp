@@ -79,10 +79,17 @@ void ApplyPreset(bool best) {
 #endif
   SetBool("gtav_native_async_pipelines", !best);
   rex::cvar::SetFlagByName("gpu_skip_rendering_lag_ms", best ? kSafeGpuLag : kFastGpuLag);
+#ifdef __ANDROID__
+  // Phones: "Best image" is also the steady one, locked at 30 fps with vsync (sustained play heats
+  // the phone less and throttles later); "Max performance" runs uncapped.
+  rex::cvar::SetFlagByName("gtav_fps_limit", best ? "30" : "0");
+  SetBool("gtav_native_vsync", best);
+#else
   if (!best) {
     rex::cvar::SetFlagByName("gtav_fps_limit", "0");
     SetBool("gtav_native_vsync", false);
   }
+#endif
   SaveSettings();
 }
 

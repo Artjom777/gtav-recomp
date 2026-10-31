@@ -155,6 +155,9 @@ struct Command {
 // Append-only bytes without std::vector's zero fill: a frame pushes tens of MB of register
 // shadows and constants, and packets are recycled (TakeSpare), so the capacity is kept.
 inline std::atomic<uint64_t> g_arena_grows{0}, g_arena_grow_bytes{0};  // stats: reallocations, bytes moved
+// Largest capacity any arena reached: a new arena starts there instead of doubling up from 4 MB
+// (each growth copied tens of MB in the open world: a hitch whenever a new packet was made).
+inline std::atomic<size_t> g_arena_peak{0};
 
 class ByteArena {
  public:
@@ -165,12 +168,13 @@ class ByteArena {
   void Shrink(size_t n) { size_ -= std::min(n, size_); }
   uint8_t* Grow(size_t n) {
     if (size_ + n > cap_) {
-      size_t cap = std::max(size_ + n, cap_ ? cap_ * 2 : size_t(4) << 20);
+      size_t cap = std::max(size_ + n, cap_ ? cap_ * 2 : std::max(size_t(4) << 20, g_arena_peak.load()));
       auto buf = std::make_unique_for_overwrite<uint8_t[]>(cap);
       if (size_) std::memcpy(buf.get(), buf_.get(), size_);
       g_arena_grows++, g_arena_grow_bytes += size_;
       buf_ = std::move(buf);
       cap_ = cap;
+      for (size_t peak = g_arena_peak.load(); cap > peak && !g_arena_peak.compare_exchange_weak(peak, cap);) {}
     }
     uint8_t* p = buf_.get() + size_;
     size_ += n;
