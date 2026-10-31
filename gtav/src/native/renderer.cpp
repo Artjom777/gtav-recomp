@@ -548,8 +548,62 @@ class Renderer {
     return true;
   }
 
+#ifdef __ANDROID__
+  // Android destroys the window's surface whenever the game leaves the screen (another app, the
+  // lock screen, a system dialog) and makes a new ANativeWindow on return: the swap chain then
+  // fails with VK_ERROR_SURFACE_LOST_KHR (creating framebuffers from it crashed in the driver).
+  // Nothing is presented until SDL reports a window again; then the swap chain (and its VkSurface)
+  // is rebuilt on it. Frames recorded meanwhile are skipped like a minimized window's.
+  bool SurfaceReady() {
+    auto* now = static_cast<ANativeWindow*>(SDL_GetPointerProperty(
+        SDL_GetWindowProperties(window_), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr));
+    if (!surface_lost_ && now == render_window_) return true;
+    if (!surface_lost_) REXLOG_INFO("[native] window surface changed: rebuilding the swap chain");
+    surface_lost_ = true;
+    if (!now) {
+      surface_gone_ = true;
+      return false;
+    }
+    auto t = std::chrono::steady_clock::now();
+    if (surface_gone_) {
+      surface_gone_ = false;
+      surface_back_ = t;
+      REXLOG_INFO("[native] window surface back");
+    }
+    if (now == render_window_ && t - surface_retry_ < std::chrono::seconds(1)) return false;
+    surface_retry_ = t;
+    surface_attempts_++;
+    RetireAll();  // also drains the submit thread (it presents on the old swap chain)
+    const double retire_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
+    framebuffers_.clear();
+    {
+      std::lock_guard lock(present_mutex_);
+      swapchain_.reset();  // destroys the old VkSurface before one is made on the window again
+      render_window_ = now;
+      swapchain_ = queue_cmd_->createSwapChain(plume::RenderSwapChainDesc(render_window_, kSwapchainFormat,
+                                                                          kSwapchainBuffers));
+      swapchain_->setVsyncEnabled(vsync_);
+    }
+    if (!swapchain_->resize()) {  // retried in a second
+      REXLOG_INFO("[native] swap chain rebuild attempt {} failed (retire {:.0f} ms)", surface_attempts_, retire_ms);
+      return false;
+    }
+    CreateFramebuffers();
+    surface_lost_ = false;
+    REXLOG_INFO("[native] swap chain rebuilt: {}x{} (attempt {}, retire {:.0f} ms, {:.0f} ms since the surface came back)",
+                swapchain_->getWidth(), swapchain_->getHeight(), surface_attempts_, retire_ms,
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - surface_back_).count());
+    surface_attempts_ = 0;
+    return true;
+  }
+  bool surface_lost_ = false, surface_gone_ = false;
+  uint32_t surface_attempts_ = 0;
+  std::chrono::steady_clock::time_point surface_retry_{}, surface_back_{};
+#endif
+
   void CreateFramebuffers() {
     framebuffers_.clear();
+    if (swapchain_->isEmpty()) return;  // no images (surface lost or zero size)
     for (uint32_t i = 0; i < swapchain_->getTextureCount(); i++) {
       const plume::RenderTexture* color = swapchain_->getTexture(i);
       plume::RenderFramebufferDesc desc;
@@ -854,9 +908,18 @@ class Renderer {
       std::lock_guard lock(present_mutex_);
       swapchain_->setVsyncEnabled(vsync_);
     }
+#ifdef __ANDROID__
+    if (!SurfaceReady()) return;
+#endif
     if (swapchain_->needsResize()) {
       RetireAll();  // also drains the submit thread
-      swapchain_->resize();
+      if (!swapchain_->resize()) {
+        framebuffers_.clear();
+#ifdef __ANDROID__
+        surface_lost_ = true;
+        REXLOG_INFO("[native] swap chain lost (resize failed): waiting for a new window surface");
+#endif
+      }
       CreateFramebuffers();
     }
     if (swapchain_->isEmpty()) return;  // minimized
@@ -980,6 +1043,9 @@ class Renderer {
       std::lock_guard lock(present_mutex_);
       acquired = swapchain_->acquireTexture(acquires_[slot].get(), &image);
     }
+#ifdef __ANDROID__
+    if (!acquired) surface_lost_ = true;  // (VK_ERROR_SURFACE_LOST_KHR): SurfaceReady rebuilds it
+#endif
     if (!acquired) {
       list_->end();
       if (backend_ok_) backend_.EndFrame(slot);

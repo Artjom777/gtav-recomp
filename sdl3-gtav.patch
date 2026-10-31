@@ -1,3 +1,16 @@
+diff --git a/src/core/android/SDL_android.c b/src/core/android/SDL_android.c
+index fa55948..380f65b 100644
+--- a/src/core/android/SDL_android.c
++++ b/src/core/android/SDL_android.c
+@@ -1315,6 +1315,8 @@ retry:
+         if (data->native_window) {
+             ANativeWindow_release(data->native_window);
+             data->native_window = NULL;
++            // gtav: Vulkan renderers poll this to notice the surface is gone (it kept the old one).
++            SDL_SetPointerProperty(SDL_GetWindowProperties(Android_Window), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL);
+         }
+ 
+         // GL Context handling is done in the event loop because this function is run from the Java thread
 diff --git a/src/events/SDL_events.c b/src/events/SDL_events.c
 index c909a2a..e7b2bc6 100644
 --- a/src/events/SDL_events.c

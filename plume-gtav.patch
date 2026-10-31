@@ -92,7 +92,7 @@ index ad63e0e..3133433 100644
          RenderFramebufferDesc() = default;
  
 diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
-index 4fdc4bf..f641386 100644
+index 4fdc4bf..4c0c877 100644
 --- a/plume_vulkan.cpp
 +++ b/plume_vulkan.cpp
 @@ -11,6 +11,7 @@
@@ -230,7 +230,26 @@ index 4fdc4bf..f641386 100644
  
          if (depthTargetFormat != VK_FORMAT_UNDEFINED) {
              depthReference.attachment = uint32_t(attachments.size());
-@@ -2548,8 +2598,11 @@ namespace plume {
+@@ -2352,11 +2402,17 @@ namespace plume {
+         createInfo.clipped = VK_TRUE;
+         createInfo.oldSwapchain = vk;
+ 
+-        VkResult res = vkCreateSwapchainKHR(commandQueue->device->vk, &createInfo, nullptr, &vk);
++        VkSwapchainKHR created = VK_NULL_HANDLE;
++        VkResult res = vkCreateSwapchainKHR(commandQueue->device->vk, &createInfo, nullptr, &created);
+         if (res != VK_SUCCESS) {
++            // The old swap chain is retired either way (VK_ERROR_SURFACE_LOST_KHR when Android
++            // destroyed the window's surface): release it, isEmpty() is true until a resize works.
+             fprintf(stderr, "vkCreateSwapchainKHR failed with error code 0x%X.\n", res);
++            textures.clear();
++            releaseSwapChain();
+             return false;
+         }
++        vk = created;
+ 
+         // Store the chosen present mode to identify later whether the swapchain needs to be recreated.
+         createdPresentMode = requiredPresentMode;
+@@ -2548,8 +2604,11 @@ namespace plume {
              imageViews.emplace_back(colorAttachmentImageView);
  
              if (i == 0) {
@@ -244,7 +263,7 @@ index 4fdc4bf..f641386 100644
              }
  
              VkAttachmentReference reference = {};
-@@ -2560,7 +2613,7 @@ namespace plume {
+@@ -2560,7 +2619,7 @@ namespace plume {
              VkAttachmentDescription attachment = {};
              attachment.format = toVk(colorAttachmentFormat);
              attachment.samples = VkSampleCountFlagBits(colorAttachment->desc.multisampling.sampleCount);
@@ -253,7 +272,7 @@ index 4fdc4bf..f641386 100644
              attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
              attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
              attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-@@ -2619,6 +2672,16 @@ namespace plume {
+@@ -2619,6 +2678,16 @@ namespace plume {
          subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
          subpass.pColorAttachments = !colorReferences.empty() ? colorReferences.data() : nullptr;
          subpass.colorAttachmentCount = uint32_t(colorReferences.size());
@@ -270,7 +289,7 @@ index 4fdc4bf..f641386 100644
  
          if (desc.depthAttachment != nullptr || desc.depthAttachmentView != nullptr) {
              subpass.pDepthStencilAttachment = &depthReference;
-@@ -2685,15 +2748,16 @@ namespace plume {
+@@ -2685,15 +2754,16 @@ namespace plume {
  
      // VulkanQueryPool
  
@@ -289,7 +308,7 @@ index 4fdc4bf..f641386 100644
          createInfo.queryCount = queryCount;
          
          VkResult res = vkCreateQueryPool(device->vk, &createInfo, nullptr, &vk);
-@@ -2711,11 +2775,17 @@ namespace plume {
+@@ -2711,11 +2781,17 @@ namespace plume {
  
      void VulkanQueryPool::queryResults() {
  	    VkResult res = vkGetQueryPoolResults(device->vk, vk, 0, uint32_t(results.size()), sizeof(uint64_t) * results.size(), results.data(), sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
@@ -308,7 +327,7 @@ index 4fdc4bf..f641386 100644
          // Conversion sourced from Godot Engine's Vulkan Rendering Driver.
          auto mult64to128 = [](uint64_t u, uint64_t v, uint64_t &h, uint64_t &l) {
              uint64_t u1 = (u & 0xffffffff);
-@@ -2888,7 +2958,18 @@ namespace plume {
+@@ -2888,7 +2964,18 @@ namespace plume {
              return;
          }
  
@@ -327,7 +346,7 @@ index 4fdc4bf..f641386 100644
      }
  
      void VulkanCommandList::dispatch(uint32_t threadGroupCountX, uint32_t threadGroupCountY, uint32_t threadGroupCountZ) {
-@@ -3007,6 +3088,13 @@ namespace plume {
+@@ -3007,6 +3094,13 @@ namespace plume {
          setDescriptorSet(VK_PIPELINE_BIND_POINT_GRAPHICS, activeGraphicsPipelineLayout, descriptorSet, setIndex);
      }
  
@@ -341,7 +360,7 @@ index 4fdc4bf..f641386 100644
      void VulkanCommandList::setGraphicsRootDescriptor(RenderBufferReference bufferReference, uint32_t rootDescriptorIndex) {
          assert(false && "Root descriptors are not supported in Vulkan.");
      }
-@@ -3486,6 +3574,8 @@ namespace plume {
+@@ -3486,6 +3580,8 @@ namespace plume {
      void VulkanCommandList::resetQueryPool(const RenderQueryPool *queryPool, uint32_t queryFirstIndex, uint32_t queryCount) {
          assert(queryPool != nullptr);
  
@@ -350,7 +369,7 @@ index 4fdc4bf..f641386 100644
          const VulkanQueryPool *interfaceQueryPool = static_cast<const VulkanQueryPool *>(queryPool);
          vkCmdResetQueryPool(vk, interfaceQueryPool->vk, queryFirstIndex, queryCount);
      }
-@@ -3497,6 +3587,22 @@ namespace plume {
+@@ -3497,6 +3593,22 @@ namespace plume {
          vkCmdWriteTimestamp(vk, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, interfaceQueryPool->vk, queryIndex);
      }
  
@@ -373,7 +392,7 @@ index 4fdc4bf..f641386 100644
      void VulkanCommandList::checkActiveRenderPass() {
          assert(targetFramebuffer != nullptr);
          
-@@ -3509,6 +3615,7 @@ namespace plume {
+@@ -3509,6 +3621,7 @@ namespace plume {
              beginInfo.renderArea.extent.height = targetFramebuffer->height;
              vkCmdBeginRenderPass(vk, &beginInfo, VkSubpassContents::VK_SUBPASS_CONTENTS_INLINE);
              activeRenderPass = targetFramebuffer->renderPass;
@@ -381,7 +400,7 @@ index 4fdc4bf..f641386 100644
          }
      }
  
-@@ -3666,7 +3773,22 @@ namespace plume {
+@@ -3666,7 +3779,22 @@ namespace plume {
          assert(fence != nullptr);
  
          VulkanCommandFence *interfaceFence = static_cast<VulkanCommandFence *>(fence);
@@ -405,7 +424,7 @@ index 4fdc4bf..f641386 100644
          if (res != VK_SUCCESS) {
              fprintf(stderr, "vkWaitForFences failed with error code 0x%X.\n", res);
              return;
-@@ -3931,6 +4053,7 @@ namespace plume {
+@@ -3931,6 +4059,7 @@ namespace plume {
          deviceFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
          deviceFeatures.pNext = featuresChain;
          vkGetPhysicalDeviceFeatures2(physicalDevice, &deviceFeatures);
@@ -413,7 +432,7 @@ index 4fdc4bf..f641386 100644
  
          // Check for properties.
          if (rayTracingFound) {
-@@ -4092,6 +4215,22 @@ namespace plume {
+@@ -4092,6 +4221,22 @@ namespace plume {
              }
          }
  
@@ -436,7 +455,7 @@ index 4fdc4bf..f641386 100644
          VmaVulkanFunctions vmaFunctions = {};
          vmaFunctions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
          vmaFunctions.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
-@@ -4203,12 +4342,22 @@ namespace plume {
+@@ -4203,12 +4348,22 @@ namespace plume {
          return std::make_unique<VulkanSampler>(this, desc);
      }
  
@@ -461,7 +480,7 @@ index 4fdc4bf..f641386 100644
      }
  
      std::unique_ptr<RenderPipeline> VulkanDevice::createRaytracingPipeline(const RenderRaytracingPipelineDesc &desc, const RenderPipeline *previousPipeline) {
-@@ -4255,6 +4404,10 @@ namespace plume {
+@@ -4255,6 +4410,10 @@ namespace plume {
          return std::make_unique<VulkanQueryPool>(this, queryCount);
      }
  
@@ -472,7 +491,7 @@ index 4fdc4bf..f641386 100644
      void VulkanDevice::setBottomLevelASBuildInfo(RenderBottomLevelASBuildInfo &buildInfo, const RenderBottomLevelASMesh *meshes, uint32_t meshCount, bool preferFastBuild, bool preferFastTrace) {
          assert(meshes != nullptr);
          assert(meshCount > 0);
-@@ -4463,6 +4616,11 @@ namespace plume {
+@@ -4463,6 +4622,11 @@ namespace plume {
      void VulkanDevice::release() {
          nullBuffer = nullptr; // force destruction before destroying allocator
  
@@ -484,7 +503,7 @@ index 4fdc4bf..f641386 100644
          if (allocator != VK_NULL_HANDLE) {
              vmaDestroyAllocator(allocator);
              allocator = VK_NULL_HANDLE;
-@@ -4666,6 +4824,26 @@ namespace plume {
+@@ -4666,6 +4830,26 @@ namespace plume {
          return instance != nullptr;
      }
  

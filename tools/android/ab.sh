@@ -11,8 +11,9 @@ D=/sdcard/Android/data/$PKG/files
 name=$1 spec=$2 secs=${3:-360}
 shift 3 2>/dev/null || shift $#
 [ -n "$name" ] && [ -n "$spec" ] || { echo "usage: $0 NAME 'cvar=a|b' [SECS] [flags...]"; exit 1; }
-temp() { adb shell dumpsys battery | awk '/temperature/ {print $2}'; }
-gpu_mhz() { adb shell cat /sys/class/kgsl/kgsl-3d0/gpuclk 2>/dev/null | awk '{printf "%d", $1 / 1000000}'; }
+temp() { adb shell dumpsys battery | awk '/^  temperature:/ {print $2; exit}'; }
+gpu_mhz() { adb shell cat /sys/class/kgsl/kgsl-3d0/clock_mhz 2>/dev/null; }
+gpu_temp() { adb shell cat /sys/class/kgsl/kgsl-3d0/temp 2>/dev/null | awk '{printf "%.1f", $1 / 1000}'; }
 for i in $(seq 60); do
   t=$(temp)
   [ "${t:-0}" -lt "${AB_MAX_TEMP:-360}" ] && break
@@ -21,10 +22,16 @@ for i in $(seq 60); do
 done
 "$ROOT/tools/android/set_args.sh" "--gtav_native_ab=$spec" "$@"
 echo "start: battery $(temp), GPU $(gpu_mhz) MHz"
+mkdir -p "$ROOT/logs/android"
+# GPU clock and temperature every 30 s while it runs (throttling shows up here).
+( while sleep 30; do echo "$(date +%T) GPU $(gpu_mhz) MHz $(gpu_temp) C battery $(temp)"; done ) \
+  > "$ROOT/logs/android/$name.therm" &
+SAMPLER=$!
 KEEP=1 "$ROOT/tools/android/run.sh" "$secs" 0 >/dev/null
+kill $SAMPLER
 echo "end: battery $(temp), GPU $(gpu_mhz) MHz, pid $(adb shell pidof $PKG)"
 adb shell am force-stop $PKG
-mkdir -p "$ROOT/logs/android"
 adb pull "$D/logs/gtav.log" "$ROOT/logs/android/$name.log" >/dev/null
 adb logcat -d | grep -E "F DEBUG|F libc" | grep -v "Access denied" | head -20
 grep -E "\[native\] A/B" "$ROOT/logs/android/$name.log" | cut -c1-260
+echo "GPU MHz over the run: $(awk '{print $3}' "$ROOT/logs/android/$name.therm" | tr '\n' ' ')"

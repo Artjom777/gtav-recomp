@@ -16,7 +16,7 @@
 #include <thread>
 #include <vector>
 
-#ifdef __linux__
+#if defined(__linux__) && !defined(__ANDROID__)
 #include <fcntl.h>
 #include <linux/fs.h>
 #include <linux/userfaultfd.h>
@@ -90,7 +90,7 @@ void Mark(uint32_t physical, uint64_t bytes, uint64_t epoch) {
   for (uint32_t p = first; p <= last; p++) g_page_epoch[p].store(epoch, std::memory_order_release);
 }
 
-#ifdef __linux__
+#if defined(__linux__) && !defined(__ANDROID__)
 // The guest views that alias physical memory (SDK map_info): 64 KB, 16 MB and 4 KB page views of
 // all 512 MB, and the GPU writeback window over the first 16 MB.
 struct View {
@@ -200,8 +200,9 @@ bool ScanView(const View& v, uint64_t start, uint64_t end, bool protect, uint64_
   }
   return true;
 }
-#elif defined(_WIN32)
+#elif defined(_WIN32) || defined(__ANDROID__)
 // Windows has no userfaultfd, and GetWriteWatch does not work on the SDK's file-mapped guest views.
+// Android neither (kernel 5.10 has no async write-protect, and SELinux denies apps userfaultfd).
 // The SDK's own physical write watch does: EnablePhysicalMemoryAccessCallbacks makes the pages
 // read-only in the A0/C0/E0 views, and the first write to one faults into the SDK's exception
 // handler, which calls OnWrite and makes the page writable again (file reads into watched pages
@@ -250,7 +251,7 @@ bool Enabled() {
   return g_ready;
 }
 
-#ifdef __linux__
+#if defined(__linux__) && !defined(__ANDROID__)
 namespace {
 // Unprotected pages of a view (written, or never protected): the runs of them copies were made
 // from are marked and protected again, each run in one call (PAGEMAP_SCAN reports what it
@@ -326,7 +327,7 @@ bool HarvestView(const View& v, uint64_t epoch) {
 }  // namespace
 #endif
 
-#ifdef __linux__
+#if defined(__linux__) && !defined(__ANDROID__)
 namespace {
 void HarvestOne(uint32_t i, uint64_t epoch) {
   const View& v = g_views[i];
@@ -373,14 +374,14 @@ std::once_flag g_helpers_started;
 
 void Harvest() {
   if (!Enabled()) return;
-#ifdef __linux__
+#if defined(__linux__) && !defined(__ANDROID__)
   auto start = std::chrono::steady_clock::now();
   uint64_t epoch = g_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
   std::call_once(g_helpers_started, [] { g_helpers.Start(); });
   g_helpers.Run(epoch);
   g_harvests++;
   g_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-#elif defined(_WIN32)
+#elif defined(_WIN32) || defined(__ANDROID__)
   g_harvests++;  // writes are reported as they happen (OnWrite)
 #endif
 }
@@ -389,7 +390,7 @@ uint64_t Watch(uint32_t physical, uint32_t size) {
   if (!g_ready || !size) return 0;
   physical &= kPhysicalSize - 1;
   if (uint64_t(physical) + size > kPhysicalSize) return 0;
-#ifdef __linux__
+#if defined(__linux__) && !defined(__ANDROID__)
   // Pages no copy was made from yet are not protected: protect them in every view (before the
   // caller reads them). UFFDIO_WRITEPROTECT also covers pages without page tables yet.
   uint32_t first = physical >> kPageShift, last = (physical + size - 1) >> kPageShift;
@@ -420,7 +421,7 @@ uint64_t Watch(uint32_t physical, uint32_t size) {
     }
   }
   return g_epoch.load(std::memory_order_acquire);
-#elif defined(_WIN32)
+#elif defined(_WIN32) || defined(__ANDROID__)
   if (physical < kUnwatchedBelow) return 0;
   // The epoch is taken before arming: a write that faults after arming gets a later one.
   uint64_t epoch = g_epoch.load(std::memory_order_acquire);
@@ -443,7 +444,7 @@ uint64_t Watch(uint32_t physical, uint32_t size) {
 }
 
 bool Pending(uint32_t physical, uint32_t size) {
-#ifdef __linux__
+#if defined(__linux__) && !defined(__ANDROID__)
   if (!g_ready || !size) return false;
   physical &= kPhysicalSize - 1;
   auto* mem = REX_KERNEL_MEMORY();
@@ -458,7 +459,7 @@ bool Pending(uint32_t physical, uint32_t size) {
     ScanView(v, host + lo, host + hi, false, 0);
   }
   return g_found != 0;
-#elif defined(_WIN32)
+#elif defined(_WIN32) || defined(__ANDROID__)
   if (!g_ready || !size) return false;
   physical &= kPhysicalSize - 1;
   uint32_t first = physical >> kPageShift;
@@ -487,7 +488,7 @@ void Touch(uint32_t physical, uint32_t size) {
 }
 
 Stats TakeStats() {
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__ANDROID__)
   Stats s{g_faults.exchange(0), g_pages.exchange(0), g_ms};
 #else
   Stats s{g_harvests, g_pages.exchange(0), g_ms};
