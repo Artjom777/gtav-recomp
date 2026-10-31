@@ -59,7 +59,14 @@ struct pm_scan_arg {
 #endif
 #endif
 
-REXCVAR_DEFINE_BOOL(gtav_native_write_watch, true, "GTAV",
+// Off on Android: the SDK's page-protection watch (its global lock on every fault) halved the fps
+// on an S23 FE in a same-run A/B (9 vs 19 fps, game frame 110 vs 55 ms); hashing is cheaper there.
+#ifdef __ANDROID__
+#define GTAV_WRITE_WATCH_DEFAULT false
+#else
+#define GTAV_WRITE_WATCH_DEFAULT true
+#endif
+REXCVAR_DEFINE_BOOL(gtav_native_write_watch, GTAV_WRITE_WATCH_DEFAULT, "GTAV",
                     "Native renderer: let the kernel track guest writes to cached textures and vertex/index "
                     "buffers instead of hashing them every frame");
 
