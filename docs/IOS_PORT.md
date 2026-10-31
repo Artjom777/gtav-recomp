@@ -26,8 +26,9 @@ cmake -S . -B ../build/ios -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_SYSTEM_NA
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
   -DCMAKE_C_FLAGS=-mcpu=apple-a15 -DCMAKE_CXX_FLAGS=-mcpu=apple-a15 \
   -DCMAKE_PREFIX_PATH=<repo>/rexglue-sdk/out/install/ios-arm64 \
-  -DCMAKE_FIND_ROOT_PATH=<repo>/rexglue-sdk/out/install/ios-arm64 \
-  -DGTAV_PREBUILT_NATIVE_SHADERS=<repo>/build/gtav/native_shaders
+  -DCMAKE_FIND_ROOT_PATH=<repo>/rexglue-sdk/out/install/ios-arm64
+# (the renderer's own shaders are compiled with the Mac's dxc-macos; do not use prebuilt headers:
+#  old ones predate the vertex-buffer menu/overlay shader and draw nothing)
 ninja -C ../build/ios -j4
 
 # 3. Game shaders for iOS (constants in uniform buffers, as on Android) from a shader cache
