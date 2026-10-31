@@ -80,6 +80,16 @@ REXCVAR_DEFINE_BOOL(gtav_native_exact_cache, false, "GTAV",
 #else
 #define GTAV_HASH_THREADS_DEFAULT 0
 #endif
+// Android: recording was as long as the GPU frame once the phone throttled; the per-frame vertex
+// conversion (snapshots, ~7-8 MB a frame) is the largest piece that runs well in parallel.
+#ifdef __ANDROID__
+#define GTAV_CONVERT_THREADS_DEFAULT 0  // phone A/B: 2 workers made recording 1-6 ms slower
+#else
+#define GTAV_CONVERT_THREADS_DEFAULT 0
+#endif
+REXCVAR_DEFINE_INT32(gtav_native_convert_threads, GTAV_CONVERT_THREADS_DEFAULT, "GTAV",
+                     "Worker threads that convert per-frame vertex data (fence snapshots, inline vertices) while "
+                     "the frame is recorded (0: on the render thread; live, the pool keeps its first size)");
 REXCVAR_DEFINE_INT32(gtav_native_hash_threads, GTAV_HASH_THREADS_DEFAULT, "GTAV",
                      "Worker threads that hash the frame's small textures and buffers before it is recorded "
                      "when there is no write watch (0: hash on the render thread)");
@@ -309,6 +319,140 @@ void ConvertElement(const vertex_layout::TypeInfo& info, const uint8_t* src, uin
     for (uint32_t b = 0; b < info.guest_size; b += 4)
       dst[b] = src[b + 3], dst[b + 1] = src[b + 2], dst[b + 2] = src[b + 1], dst[b + 3] = src[b];
 }
+
+// One vertex stream of a draw, guest -> host layout, self-contained (the backend's layout memo is
+// rewritten by the next draw): what DrawImpl converts, inline or on a StreamConverter worker.
+struct StreamJob {
+  struct Element {
+    vertex_layout::TypeInfo info;
+    uint32_t guest_offset, host_offset;
+  };
+  uint8_t* out = nullptr;
+  const uint8_t* guest = nullptr;
+  uint32_t stride = 0, host_stride = 0, vertices = 0, count = 0;
+  Element elements[kMaxVertexElements];
+};
+
+void ConvertStream(const StreamJob& j) {
+  const uint32_t stride = j.stride, vertices = j.vertices;
+  const uint8_t* guest = j.guest;
+  uint8_t* out = j.out;
+  // Common case: every element is a plain byte swap (32-bit or 16-bit words) at the same
+  // offset in a stream of the same stride: one pass over the buffer with a per-word swap
+  // plan, instead of a strided pass per element (ConvertElement was ~20% of the render
+  // thread on a phone). All-32-bit streams take a straight NEON/SSE pass.
+  bool bulk = j.host_stride == stride && stride % 4 == 0 && stride <= 256;
+  bool all32 = true;
+  uint8_t plan[64];  // per 4-byte word of the vertex: 4 = bswap32, 2 = two bswap16, 0 = copy
+  for (uint32_t w = 0; w < stride / 4 && w < 64; w++) plan[w] = 0;
+  for (uint32_t n = 0; bulk && n < j.count; n++) {
+    const auto& e = j.elements[n];
+    const auto& info = e.info;
+    bulk = !info.int_bits && !info.dec && (info.swap == 4 || info.swap == 2) &&
+           info.guest_size == info.host_size && e.host_offset == e.guest_offset && e.guest_offset % 4 == 0 &&
+           info.guest_size % 4 == 0 && e.guest_offset + info.guest_size <= stride;
+    if (!bulk) break;
+    for (uint32_t w = e.guest_offset / 4; w < (e.guest_offset + info.guest_size) / 4; w++) plan[w] = uint8_t(info.swap);
+    all32 = all32 && info.swap == 4;
+  }
+  if (bulk && all32) {
+    size_t bytes = size_t(vertices) * stride, i = 0;
+    for (; i + 16 <= bytes; i += 16) Swap16Bytes(out + i, guest + i, 4);
+    for (; i + 4 <= bytes; i += 4) {
+      uint32_t x;
+      std::memcpy(&x, guest + i, 4);
+      x = __builtin_bswap32(x);
+      std::memcpy(out + i, &x, 4);
+    }
+    return;
+  }
+  if (bulk) {
+    const uint32_t words = stride / 4;
+    const uint8_t* src = guest;
+    uint8_t* dst = out;
+    for (uint32_t v = 0; v < vertices; v++, src += stride, dst += stride) {
+      for (uint32_t w = 0; w < words; w++) {
+        uint32_t x;
+        std::memcpy(&x, src + 4 * w, 4);
+        if (plan[w] == 4) x = __builtin_bswap32(x);
+        else if (plan[w] == 2) x = ((x & 0x00FF00FFu) << 8) | ((x >> 8) & 0x00FF00FFu);
+        std::memcpy(dst + 4 * w, &x, 4);
+      }
+    }
+    return;
+  }
+  for (uint32_t n = 0; n < j.count; n++) {
+    const auto& e = j.elements[n];
+    ConvertElement(e.info, guest + e.guest_offset, stride, out + e.host_offset, j.host_stride, vertices);
+  }
+}
+
+// --gtav_native_convert_threads: per-frame vertex data (snapshots copied at GPU fences and inline
+// vertices, ~7-8 MB a frame in the open world on a phone, never cached) is converted by workers
+// while the frame is recorded, straight into its upload memory; Execute waits for all of it
+// before the command list can be submitted. The render thread helps when it waits.
+class StreamConverter {
+ public:
+  explicit StreamConverter(int threads) {
+    for (int i = 0; i < threads; i++)
+      workers_.emplace_back([this] {
+#ifdef __ANDROID__
+        // Not the prime core (the game's main thread) nor the renderer's middle cluster.
+        if (int n = int(sysconf(_SC_NPROCESSORS_CONF)); n >= 4) {
+          cpu_set_t set;
+          CPU_ZERO(&set);
+          for (int c = 0; c < n / 2; c++) CPU_SET(c, &set);
+          sched_setaffinity(0, sizeof(set), &set);
+        }
+#endif
+        std::unique_lock lock(mutex_);
+        for (;;) {
+          cv_.wait(lock, [&] { return stop_ || next_ < jobs_.size(); });
+          if (stop_) return;
+          RunOne(lock);
+        }
+      });
+  }
+  ~StreamConverter() {
+    {
+      std::lock_guard lock(mutex_);
+      stop_ = true;
+    }
+    cv_.notify_all();
+    for (auto& w : workers_) w.join();
+  }
+  void Push(const StreamJob& job) {
+    {
+      std::lock_guard lock(mutex_);
+      jobs_.push_back(job);
+    }
+    cv_.notify_one();
+  }
+  // All pushed jobs are done when this returns; the next frame starts with an empty list.
+  void Finish() {
+    std::unique_lock lock(mutex_);
+    while (next_ < jobs_.size()) RunOne(lock);
+    done_cv_.wait(lock, [&] { return done_ == jobs_.size(); });
+    jobs_.clear();
+    next_ = done_ = 0;
+  }
+
+ private:
+  void RunOne(std::unique_lock<std::mutex>& lock) {
+    // jobs_ only grows while jobs run (Finish clears it after all are done): the copy is stable.
+    StreamJob job = jobs_[next_++];
+    lock.unlock();
+    ConvertStream(job);
+    lock.lock();
+    if (++done_ == jobs_.size()) done_cv_.notify_all();
+  }
+  std::vector<std::thread> workers_;
+  std::mutex mutex_;
+  std::condition_variable cv_, done_cv_;
+  std::vector<StreamJob> jobs_;
+  size_t next_ = 0, done_ = 0;
+  bool stop_ = false;
+};
 
 float HalfToFloat(uint16_t h) {
   uint32_t sign = uint32_t(h & 0x8000) << 16, e = (h >> 10) & 0x1F, m = h & 0x3FF;
@@ -2459,6 +2603,8 @@ struct Backend::Impl {
   // Conversions write byte by byte; upload memory is write-combined, so they go through a
   // cached scratch buffer and land in one sequential copy.
   std::vector<uint8_t> convert_scratch;
+  std::unique_ptr<StreamConverter> converter_pool;
+  StreamConverter* converter = nullptr;  // this frame's (null: convert on the render thread)
   template <class F>
   void ConvertInto(uint8_t* dst, uint64_t size, const F& convert) {
     // Apple GPUs share cached memory with the CPU (Metal shared storage, not write-combined): the
@@ -3855,57 +4001,16 @@ struct Backend::Impl {
                              : snapped   ? f.At(d.snap_stream[s])
                                          : mem->TranslatePhysical(sb.address + sb.offset);
       uint64_t key = Hash(&sb, sizeof(sb), decl.stream_hash[s]);
+      StreamJob job;
+      job.guest = guest, job.stride = stride, job.host_stride = host_stride, job.vertices = vertices;
+      for (uint32_t n = 0; n < vl.element_count; n++) {
+        if (vl.elements[n].slotIndex != s) continue;
+        job.elements[job.count++] = {vl.info[n], d.elements[vl.guest_index[n]].offset, vl.host_offset[n]};
+      }
       auto convert = [&](uint8_t* out) {
-        // Common case: every element is a plain byte swap (32-bit or 16-bit words) at the same
-        // offset in a stream of the same stride: one pass over the buffer with a per-word swap
-        // plan, instead of a strided pass per element (ConvertElement was ~20% of the render
-        // thread on a phone). All-32-bit streams take a straight NEON/SSE pass.
-        bool bulk = host_stride == stride && stride % 4 == 0 && stride <= 256;
-        bool all32 = true;
-        uint8_t plan[64];  // per 4-byte word of the vertex: 4 = bswap32, 2 = two bswap16, 0 = copy
-        for (uint32_t w = 0; w < stride / 4 && w < 64; w++) plan[w] = 0;
-        for (uint32_t n = 0; bulk && n < vl.element_count; n++) {
-          if (vl.elements[n].slotIndex != s) continue;
-          const auto& info = vl.info[n];
-          const auto& e = d.elements[vl.guest_index[n]];
-          bulk = !info.int_bits && !info.dec && (info.swap == 4 || info.swap == 2) &&
-                 info.guest_size == info.host_size && vl.host_offset[n] == e.offset && e.offset % 4 == 0 &&
-                 info.guest_size % 4 == 0 && e.offset + info.guest_size <= stride;
-          if (!bulk) break;
-          for (uint32_t w = e.offset / 4; w < (e.offset + info.guest_size) / 4; w++) plan[w] = uint8_t(info.swap);
-          all32 = all32 && info.swap == 4;
-        }
-        if (bulk && all32) {
-          size_t bytes = size_t(vertices) * stride, i = 0;
-          for (; i + 16 <= bytes; i += 16) Swap16Bytes(out + i, guest + i, 4);
-          for (; i + 4 <= bytes; i += 4) {
-            uint32_t x;
-            std::memcpy(&x, guest + i, 4);
-            x = __builtin_bswap32(x);
-            std::memcpy(out + i, &x, 4);
-          }
-          return;
-        }
-        if (bulk) {
-          const uint32_t words = stride / 4;
-          const uint8_t* src = guest;
-          uint8_t* dst = out;
-          for (uint32_t v = 0; v < vertices; v++, src += stride, dst += stride) {
-            for (uint32_t w = 0; w < words; w++) {
-              uint32_t x;
-              std::memcpy(&x, src + 4 * w, 4);
-              if (plan[w] == 4) x = __builtin_bswap32(x);
-              else if (plan[w] == 2) x = ((x & 0x00FF00FFu) << 8) | ((x >> 8) & 0x00FF00FFu);
-              std::memcpy(dst + 4 * w, &x, 4);
-            }
-          }
-          return;
-        }
-        for (uint32_t n = 0; n < vl.element_count; n++) {
-          if (vl.elements[n].slotIndex != s) continue;
-          const auto& e = d.elements[vl.guest_index[n]];
-          ConvertElement(vl.info[n], guest + e.offset, stride, out + vl.host_offset[n], host_stride, vertices);
-        }
+        StreamJob j = job;
+        j.out = out;
+        ConvertStream(j);
       };
       RenderBufferReference ref;
       if (rect_cpu) {  // converted and expanded below (RectDraw), unless cached
@@ -3920,7 +4025,12 @@ struct Backend::Impl {
         conv_bytes[inline_data ? 1 : 2] += uint64_t(vertices) * host_stride;
         conv_draws[inline_data ? 1 : 2]++;
         auto a = upload.Allocate(uint64_t(vertices) * host_stride, 16);
-        ConvertInto(a.cpu, uint64_t(vertices) * host_stride, convert);
+        if (converter && !dumping) {  // on a worker, done before the frame is submitted
+          job.out = a.cpu;
+          converter->Push(job);
+        } else {
+          ConvertInto(a.cpu, uint64_t(vertices) * host_stride, convert);
+        }
         ref = RenderBufferReference(a.buffer, a.offset);
       } else {
         ref = RenderBufferReference(
@@ -5285,6 +5395,9 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   auto& s = *impl_;
   s.frame++;
   s.PreHash();
+  if (int threads = REXCVAR_GET(gtav_native_convert_threads); threads > 0 && !s.converter_pool)
+    s.converter_pool = std::make_unique<StreamConverter>(std::min(threads, 6));
+  s.converter = REXCVAR_GET(gtav_native_convert_threads) > 0 ? s.converter_pool.get() : nullptr;
   s.bound_fb = nullptr;
   s.pass_end = "frame start";
   s.grow_list = list;
@@ -5437,6 +5550,7 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
       s.prof_frames = 0;
     }
   }
+  if (s.converter_pool) s.converter_pool->Finish();  // the frame's vertex data is in upload memory
   const bool lost = s.lost_pipeline || s.lost_vs || s.lost_ps;
   if (lost)
     REXLOG_INFO("[native] frame {} lost draws: {} pipelines compiling, {} vertex / {} pixel shaders not ready; first: {}",
