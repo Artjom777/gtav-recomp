@@ -2,8 +2,8 @@
 # game launcher. Static C runtime, so it starts on a PC without the Visual C++ runtime and can
 # tell the player to install it.
 # macOS: GTAV.app with an AppKit setup window (src/main_mac.mm) that builds gtav_game.dylib.
-# Linux: a terminal launcher (src/main_linux.cpp) that builds gtav_game.so; static libstdc++ and
-# libgcc, so it needs only glibc.
+# Linux: a setup window (GTK 3, dlopen'ed) or the terminal (src/main_linux.cpp) that builds
+# gtav_game.so; static libstdc++ and libgcc, so it needs only glibc.
 cmake_minimum_required(VERSION 3.25)
 project(gtav_launcher LANGUAGES CXX)
 
@@ -40,4 +40,16 @@ else()
         src/sources.cpp)
     target_link_options(gtav_launcher PRIVATE -static-libstdc++ -static-libgcc)
     target_link_libraries(gtav_launcher PRIVATE ${CMAKE_DL_LIBS})
+    # The setup window: GTK 3 headers only (types and enums); the library is dlopen'ed at run time,
+    # so the launcher still starts without GTK (terminal setup).
+    find_package(PkgConfig QUIET)
+    if(PKG_CONFIG_FOUND)
+        pkg_check_modules(GTK3 QUIET gtk+-3.0)
+    endif()
+    if(GTK3_FOUND)
+        target_include_directories(gtav_launcher SYSTEM PRIVATE ${GTK3_INCLUDE_DIRS})
+        target_compile_definitions(gtav_launcher PRIVATE GTAV_GTK_UI)
+    else()
+        message(WARNING "gtk+-3.0 headers not found: the Linux launcher is built without its setup window")
+    endif()
 endif()

@@ -27,18 +27,23 @@ First run
 1. Unpack the archive somewhere with enough space:
      tar xf gtav-recomp-linux-x64.tar.gz
      cd gtav-recomp-linux-x64
-2. Start the launcher in a terminal and give it your Disc 1, Disc 2 and the title update (it asks
-   for each path if you leave them out; you can drag a file into the terminal):
+2. Open gtav_launcher: double-click it in your file manager (GNOME Files: right-click it, "Run as
+   a Program"), or run ./gtav_launcher in a terminal. The setup window opens: choose Disc 1,
+   Disc 2 and the title update (each an image/file or an extracted folder), then press Install.
+   Without a desktop (or with --cli) the same setup runs in the terminal instead, and
      ./gtav_launcher --setup "/path/Disc 1.iso" "/path/Disc 2.iso" /path/tu00000009_00000000
+   runs it with the paths given.
 3. The launcher checks every file against known-good hashes, copies them into data/, generates C++
    from your game executable, compiles it into gtav_game.so with the bundled clang and removes the
-   build files. This takes 15-30 minutes depending on your CPU. Ctrl+C stops it; running setup
-   again continues where it stopped.
-4. The game starts. The first minutes of play translate shaders in the background; some objects
-   can be missing until their shader is ready. They are kept in data/spirv for later runs.
+   build files. This takes 15-30 minutes depending on your CPU. Cancel (or Ctrl+C in the terminal)
+   stops it; running setup again continues where it stopped.
+4. Press Play. The first minutes of play translate shaders in the background; some objects can be
+   missing until their shader is ready. They are kept in data/spirv for later runs. Setup also adds
+   "GTA V recomp" to your applications menu.
 
-Later runs: ./gtav_launcher starts the game directly. ./gtav_launcher --setup runs setup again,
-for example after moving your discs.
+Later runs: the menu entry or ./gtav_launcher starts the game directly. ./gtav_launcher --setup
+(or the menu entry's "Run setup again") opens the setup window again, for example after moving
+your discs.
 
 Game options go after "--". On a laptop with two GPUs, pick the dedicated one with
   ./gtav_launcher -- --vulkan_device=1

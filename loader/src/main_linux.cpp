@@ -1,23 +1,38 @@
-// gtav launcher (Linux) - first-run setup in the terminal and game launcher.
+// gtav launcher (Linux) - first-run setup window (or terminal) and game launcher.
 //
-//   ./gtav_launcher                         installed: start the game; otherwise run setup
-//   ./gtav_launcher --setup [DISC1 DISC2 TU] run setup again (paths asked for when not given)
+//   ./gtav_launcher                         installed: start the game; otherwise the setup window
+//   ./gtav_launcher --setup                 the setup window again (installed or not)
+//   ./gtav_launcher --setup DISC1 DISC2 TU  setup in the terminal with these paths
+//   ./gtav_launcher --cli [--setup]         terminal setup even with a desktop (paths asked for)
 //   ./gtav_launcher --unattended            setup from data/launcher.ini, no questions (testing)
 //   ./gtav_launcher -- ARGS...              pass ARGS to the game (for example --vulkan_device=1)
 //
-// Setup is the same as on Windows (install.cpp): the player's own Disc 1, Disc 2 and Title Update
-// 27 are copied and checked, the game executable is recompiled on this machine into gtav_game.so,
-// then the game starts.
+// Setup is the same as on Windows and macOS (install.cpp): the player's own Disc 1, Disc 2 and
+// Title Update 27 are copied and checked, the game executable is recompiled on this machine into
+// gtav_game.so, then the game starts. The window is GTK 3, loaded at run time (dlopen): the
+// launcher needs only glibc, and without GTK or a display it falls back to the terminal.
+#include <dlfcn.h>
 #include <unistd.h>
 
+#include <atomic>
+#include <condition_variable>
 #include <csignal>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
+
+#ifdef GTAV_GTK_UI
+// Headers for the types only: every GTK/GLib function is called through dlsym pointers, and the
+// cast macros must not call into GObject.
+#define G_DISABLE_CAST_CHECKS
+#include <gtk/gtk.h>
+#endif
 
 #include "install.h"
 #include "sources.h"
@@ -166,6 +181,8 @@ int Unattended() {
   return ok ? 0 : 1;
 }
 
+void AddDesktopEntry(InstallUi* ui);
+
 int Setup(std::vector<std::string> given, const std::vector<std::wstring>& game_args) {
   printf("GTA V recomp setup\n\n"
          "This builds the game from your own Xbox 360 copy of GTA V: Disc 1 (Install), Disc 2\n"
@@ -209,6 +226,7 @@ int Setup(std::vector<std::string> given, const std::vector<std::wstring>& game_
             (g_root / "data" / "logs" / "install.log").c_str());
     return 1;
   }
+  AddDesktopEntry(&ui);
   printf("\nSetup finished. Start the game now? [Y/n] ");
   fflush(stdout);
   std::string answer;
@@ -220,6 +238,389 @@ int Setup(std::vector<std::string> given, const std::vector<std::wstring>& game_
   return 0;
 }
 
+// "GTA V recomp" in the desktop's applications menu (~/.local/share/applications), pointing at
+// this launcher, with a "Run setup again" action. Rewritten after every setup (the folder may move).
+void AddDesktopEntry(InstallUi* ui) {
+  const char* home = getenv("HOME");
+  if (!home || !*home) return;
+  const char* data = getenv("XDG_DATA_HOME");
+  fs::path dir = data && *data ? fs::path(data) / "applications" : fs::path(home) / ".local/share/applications";
+  std::error_code ec;
+  fs::create_directories(dir, ec);
+  // Exec quoting (Desktop Entry spec): the path in double quotes, \ " ` $ escaped.
+  std::string exe;
+  for (char c : (g_root / "gtav_launcher").string()) {
+    if (c == '"' || c == '`' || c == '$' || c == '\\') exe += '\\';
+    exe += c;
+  }
+  std::ofstream f(dir / "gtav-recomp.desktop");
+  f << "[Desktop Entry]\nType=Application\nName=GTA V recomp\n"
+       "Comment=GTA V for Xbox 360, recompiled from your own copy\n"
+    << "Exec=\"" << exe << "\"\nPath=" << g_root.string() << "\n"
+    << "Icon=applications-games\nTerminal=false\nCategories=Game;\nActions=Setup;\n\n"
+       "[Desktop Action Setup]\nName=Run setup again\n"
+    << "Exec=\"" << exe << "\" --setup\n";
+  f.close();
+  if (f && ui) ui->Log(L"Added \"GTA V recomp\" to the applications menu.");
+}
+
+bool HaveDisplay() {
+  const char* x = getenv("DISPLAY");
+  const char* w = getenv("WAYLAND_DISPLAY");
+  return (x && *x) || (w && *w);
+}
+
+#ifdef GTAV_GTK_UI
+//-----------------------------------------------------------------------------
+// Setup window (GTK 3 through dlopen)
+//-----------------------------------------------------------------------------
+
+struct Gtk {
+#define GTAV_GTK_FUNCTIONS(X)                                                                        \
+  X(gtk_init_check) X(gtk_main) X(gtk_main_quit) X(gtk_events_pending) X(gtk_main_iteration)        \
+  X(gtk_window_new) X(gtk_window_set_title) X(gtk_window_set_default_size) X(gtk_window_set_position) \
+  X(gtk_container_add) X(gtk_container_set_border_width) X(gtk_box_new) X(gtk_box_pack_start)       \
+  X(gtk_box_set_spacing) X(gtk_label_new) X(gtk_label_set_line_wrap) X(gtk_label_set_xalign)        \
+  X(gtk_label_set_text) X(gtk_label_set_markup) X(gtk_entry_new) X(gtk_entry_set_text)              \
+  X(gtk_entry_get_text) X(gtk_editable_set_editable) X(gtk_button_new_with_label)                   \
+  X(gtk_button_set_label) X(gtk_widget_set_sensitive) X(gtk_widget_show_all) X(gtk_widget_hide)     \
+  X(gtk_widget_destroy) X(gtk_widget_set_hexpand) X(gtk_widget_set_vexpand)                          \
+  X(gtk_progress_bar_new) X(gtk_progress_bar_set_fraction) X(gtk_scrolled_window_new)               \
+  X(gtk_scrolled_window_set_policy) X(gtk_text_view_new) X(gtk_text_view_set_editable)              \
+  X(gtk_text_view_set_monospace) X(gtk_text_view_set_cursor_visible) X(gtk_text_view_get_buffer)    \
+  X(gtk_text_view_scroll_mark_onscreen) X(gtk_text_buffer_get_end_iter) X(gtk_text_buffer_insert)   \
+  X(gtk_text_buffer_place_cursor) X(gtk_text_buffer_get_insert) X(gtk_file_chooser_dialog_new)      \
+  X(gtk_file_chooser_get_filename) X(gtk_file_chooser_set_filename) X(gtk_dialog_run)               \
+  X(gtk_message_dialog_new) X(gtk_button_box_new) X(gtk_button_box_set_layout) X(g_signal_connect_data) \
+  X(g_idle_add) X(g_free)
+#define GTAV_GTK_MEMBER(name) decltype(&::name) name = nullptr;
+  GTAV_GTK_FUNCTIONS(GTAV_GTK_MEMBER)
+#undef GTAV_GTK_MEMBER
+
+  bool Load() {
+    void* h = dlopen("libgtk-3.so.0", RTLD_NOW | RTLD_GLOBAL);
+    if (!h) return false;
+    bool ok = true;
+#define GTAV_GTK_LOAD(name) ok = ok && (name = reinterpret_cast<decltype(name)>(dlsym(h, #name)));
+    GTAV_GTK_FUNCTIONS(GTAV_GTK_LOAD)
+#undef GTAV_GTK_LOAD
+    return ok;
+  }
+};
+Gtk g;
+
+// Runs f on the GTK main loop (from the install thread).
+void OnMain(std::function<void()> f) {
+  g.g_idle_add(
+      [](gpointer p) -> gboolean {
+        auto* fn = static_cast<std::function<void()>*>(p);
+        (*fn)();
+        delete fn;
+        return FALSE;
+      },
+      new std::function<void()>(std::move(f)));
+}
+
+GtkWidget* g_window = nullptr;
+
+bool Question(const std::string& text) {
+  GtkWidget* d = g.gtk_message_dialog_new(GTK_WINDOW(g_window), GTK_DIALOG_MODAL, GTK_MESSAGE_QUESTION,
+                                          GTK_BUTTONS_YES_NO, "%s", text.c_str());
+  g.gtk_window_set_title(GTK_WINDOW(d), "GTA V recomp setup");
+  bool yes = g.gtk_dialog_run(GTK_DIALOG(d)) == GTK_RESPONSE_YES;
+  g.gtk_widget_destroy(d);
+  return yes;
+}
+
+void ErrorBox(const std::string& text) {
+  GtkWidget* d = g.gtk_message_dialog_new(g_window ? GTK_WINDOW(g_window) : nullptr, GTK_DIALOG_MODAL,
+                                          GTK_MESSAGE_ERROR, GTK_BUTTONS_OK, "%s", text.c_str());
+  g.gtk_window_set_title(GTK_WINDOW(d), "GTA V recomp");
+  g.gtk_dialog_run(GTK_DIALOG(d));
+  g.gtk_widget_destroy(d);
+}
+
+template <class F>
+void Connect(gpointer widget, const char* signal, F handler, gpointer data = nullptr) {
+  g.g_signal_connect_data(widget, signal, G_CALLBACK(handler), data, nullptr, GConnectFlags(0));
+}
+
+class SetupWindow : public InstallUi {
+ public:
+  explicit SetupWindow(std::vector<std::wstring> game_args) : game_args_(std::move(game_args)) {}
+
+  void Build() {
+    g_window = window_ = g.gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    g.gtk_window_set_title(GTK_WINDOW(window_), "GTA V recomp setup");
+    g.gtk_window_set_default_size(GTK_WINDOW(window_), 760, 620);
+    g.gtk_window_set_position(GTK_WINDOW(window_), GTK_WIN_POS_CENTER);
+    g.gtk_container_set_border_width(GTK_CONTAINER(window_), 16);
+    Connect(window_, "delete-event", +[](GtkWidget*, GdkEvent*, gpointer self) -> gboolean {
+      return static_cast<SetupWindow*>(self)->CloseRequested() ? FALSE : TRUE;
+    }, this);
+    Connect(window_, "destroy", +[](GtkWidget*, gpointer) { g.gtk_main_quit(); });
+
+    GtkWidget* box = g.gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    g.gtk_container_add(GTK_CONTAINER(window_), box);
+    GtkWidget* intro = g.gtk_label_new(
+        "Point setup at your own copy of the game: both Xbox 360 discs and Title Update 27. Setup copies "
+        "the game data into this folder, recompiles the game executable on this computer and checks "
+        "every file. Nothing is downloaded and nothing is sent anywhere. It needs about 25 GB free "
+        "during setup (17 GB after) and 15-40 minutes.");
+    g.gtk_label_set_line_wrap(GTK_LABEL(intro), TRUE);
+    g.gtk_label_set_xalign(GTK_LABEL(intro), 0);
+    g.gtk_box_pack_start(GTK_BOX(box), intro, FALSE, FALSE, 4);
+
+    std::vector<std::string> saved = LoadInputs();
+    for (int i = 0; i < 3; ++i) {
+      GtkWidget* label = g.gtk_label_new(nullptr);
+      std::string markup = std::string("<b>") + kRowLabels[i] + "</b>  <span alpha=\"60%\">" + kRowHints[i] + "</span>";
+      g.gtk_label_set_markup(GTK_LABEL(label), Escape(markup).c_str());
+      g.gtk_label_set_xalign(GTK_LABEL(label), 0);
+      g.gtk_box_pack_start(GTK_BOX(box), label, FALSE, FALSE, i ? 6 : 10);
+      GtkWidget* row = g.gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+      paths_[i] = g.gtk_entry_new();
+      g.gtk_entry_set_text(GTK_ENTRY(paths_[i]), saved[i].c_str());
+      g.gtk_widget_set_hexpand(paths_[i], TRUE);
+      g.gtk_box_pack_start(GTK_BOX(row), paths_[i], TRUE, TRUE, 0);
+      file_[i] = g.gtk_button_new_with_label("Choose file...");
+      folder_[i] = g.gtk_button_new_with_label("Folder...");
+      Connect(file_[i], "clicked", +[](GtkButton* b, gpointer self) { static_cast<SetupWindow*>(self)->Choose(b, false); }, this);
+      Connect(folder_[i], "clicked", +[](GtkButton* b, gpointer self) { static_cast<SetupWindow*>(self)->Choose(b, true); }, this);
+      g.gtk_box_pack_start(GTK_BOX(row), file_[i], FALSE, FALSE, 0);
+      g.gtk_box_pack_start(GTK_BOX(row), folder_[i], FALSE, FALSE, 0);
+      g.gtk_box_pack_start(GTK_BOX(box), row, FALSE, FALSE, 0);
+    }
+
+    stage_ = g.gtk_label_new("");
+    g.gtk_label_set_xalign(GTK_LABEL(stage_), 0);
+    g.gtk_box_pack_start(GTK_BOX(box), stage_, FALSE, FALSE, 10);
+    progress_ = g.gtk_progress_bar_new();
+    g.gtk_box_pack_start(GTK_BOX(box), progress_, FALSE, FALSE, 0);
+
+    GtkWidget* scroll = g.gtk_scrolled_window_new(nullptr, nullptr);
+    g.gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    g.gtk_widget_set_vexpand(scroll, TRUE);
+    log_ = g.gtk_text_view_new();
+    g.gtk_text_view_set_editable(GTK_TEXT_VIEW(log_), FALSE);
+    g.gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(log_), FALSE);
+    g.gtk_text_view_set_monospace(GTK_TEXT_VIEW(log_), TRUE);
+    g.gtk_container_add(GTK_CONTAINER(scroll), log_);
+    g.gtk_box_pack_start(GTK_BOX(box), scroll, TRUE, TRUE, 6);
+
+    GtkWidget* buttons = g.gtk_button_box_new(GTK_ORIENTATION_HORIZONTAL);
+    g.gtk_button_box_set_layout(GTK_BUTTON_BOX(buttons), GTK_BUTTONBOX_END);
+    g.gtk_box_set_spacing(GTK_BOX(buttons), 8);
+    install_ = g.gtk_button_new_with_label("Install");
+    play_ = g.gtk_button_new_with_label("Play");
+    Connect(install_, "clicked", +[](GtkButton*, gpointer self) { static_cast<SetupWindow*>(self)->InstallClicked(); }, this);
+    Connect(play_, "clicked", +[](GtkButton*, gpointer self) { static_cast<SetupWindow*>(self)->Play(); }, this);
+    g.gtk_container_add(GTK_CONTAINER(buttons), install_);
+    g.gtk_container_add(GTK_CONTAINER(buttons), play_);
+    g.gtk_box_pack_start(GTK_BOX(box), buttons, FALSE, FALSE, 0);
+
+    SetBusy(false);
+    g.gtk_label_set_text(GTK_LABEL(stage_), IsInstalled(g_root) ? "Installed. Press Play, or Install to redo setup."
+                                                                : "Pick the three inputs, then press Install.");
+    g.gtk_widget_show_all(window_);
+  }
+
+  // InstallUi: called on the install thread.
+  void Stage(const std::wstring& t) override {
+    std::string s = Narrow(t);
+    OnMain([this, s] { g.gtk_label_set_text(GTK_LABEL(stage_), s.c_str()); });
+  }
+  void Log(const std::wstring& t) override {
+    std::string s = Narrow(t);
+    OnMain([this, s] { Append(s); });
+  }
+  void Progress(double f) override {
+    int v = int(f * 1000);
+    if (v == last_) return;
+    last_ = v;
+    OnMain([this, f] { g.gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(progress_), f); });
+  }
+  bool Cancelled() override { return cancelled_ || g_cancelled; }
+  bool Ask(const std::wstring& q) override {
+    std::string s = Narrow(q);
+    std::mutex m;
+    std::condition_variable cv;
+    int answer = -1;
+    OnMain([&] {
+      bool yes = Question(s);
+      std::lock_guard lock(m);
+      answer = yes;
+      cv.notify_one();
+    });
+    std::unique_lock lock(m);
+    cv.wait(lock, [&] { return answer >= 0; });
+    return answer == 1;
+  }
+
+ private:
+  // Markup: the labels and hints are ours except for '&', which must be an entity.
+  static std::string Escape(const std::string& s) {
+    std::string out;
+    for (char c : s) out += c == '&' ? std::string("&amp;") : std::string(1, c);
+    return out;
+  }
+
+  void Append(const std::string& s) {
+    GtkTextBuffer* buf = g.gtk_text_view_get_buffer(GTK_TEXT_VIEW(log_));
+    GtkTextIter end;
+    g.gtk_text_buffer_get_end_iter(buf, &end);
+    std::string line = s + "\n";
+    g.gtk_text_buffer_insert(buf, &end, line.c_str(), -1);
+    g.gtk_text_buffer_get_end_iter(buf, &end);
+    g.gtk_text_buffer_place_cursor(buf, &end);
+    g.gtk_text_view_scroll_mark_onscreen(GTK_TEXT_VIEW(log_), g.gtk_text_buffer_get_insert(buf));
+  }
+
+  void SetBusy(bool busy) {
+    busy_ = busy;
+    for (int i = 0; i < 3; ++i) {
+      g.gtk_widget_set_sensitive(file_[i], !busy);
+      g.gtk_widget_set_sensitive(folder_[i], !busy);
+      g.gtk_editable_set_editable(GTK_EDITABLE(paths_[i]), !busy);
+    }
+    g.gtk_button_set_label(GTK_BUTTON(install_), busy ? "Cancel" : "Install");
+    g.gtk_widget_set_sensitive(play_, !busy && IsInstalled(g_root));
+  }
+
+  void Choose(GtkButton* button, bool folder) {
+    int i = 0;
+    while (i < 3 && GTK_WIDGET(button) != (folder ? folder_[i] : file_[i])) ++i;
+    if (i == 3) return;
+    std::string title = std::string(kRowLabels[i]) + ": " + kRowHints[i];
+    GtkWidget* d = g.gtk_file_chooser_dialog_new(
+        title.c_str(), GTK_WINDOW(window_),
+        folder ? GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER : GTK_FILE_CHOOSER_ACTION_OPEN, "_Cancel",
+        GTK_RESPONSE_CANCEL, folder ? "_Select" : "_Open", GTK_RESPONSE_ACCEPT, nullptr);
+    std::string current = g.gtk_entry_get_text(GTK_ENTRY(paths_[i]));
+    std::error_code ec;
+    if (!current.empty() && fs::exists(current, ec)) g.gtk_file_chooser_set_filename(GTK_FILE_CHOOSER(d), current.c_str());
+    if (g.gtk_dialog_run(GTK_DIALOG(d)) == GTK_RESPONSE_ACCEPT) {
+      if (gchar* name = g.gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(d))) {
+        g.gtk_entry_set_text(GTK_ENTRY(paths_[i]), name);
+        (g.g_free)(name);  // parenthesised: g_free is also a function-like macro in newer GLib
+      }
+    }
+    g.gtk_widget_destroy(d);
+  }
+
+  void InstallClicked() {
+    if (busy_) {
+      cancelled_ = true;
+      g.gtk_label_set_text(GTK_LABEL(stage_), "Cancelling...");
+      return;
+    }
+    std::vector<std::string> paths(3);
+    for (int i = 0; i < 3; ++i) {
+      paths[i] = Trim(g.gtk_entry_get_text(GTK_ENTRY(paths_[i])));
+      std::error_code ec;
+      if (paths[i].empty() || !fs::exists(paths[i], ec)) {
+        ErrorBox(std::string(kRowLabels[i]) + ": pick the image, file or folder.");
+        return;
+      }
+      paths[i] = fs::absolute(paths[i], ec).string();
+    }
+    SaveInputs(paths);
+    cancelled_ = false;
+    last_ = -1;
+    SetBusy(true);
+    InstallInputs in{Widen(paths[0]), Widen(paths[1]), Widen(paths[2])};
+    std::thread([this, in] {
+      std::wstring err;
+      bool ok = RunInstall(g_root, in, *this, &err);
+      if (ok) AddDesktopEntry(this);
+      std::string e = Narrow(err);
+      OnMain([this, ok, e] { Finished(ok, e); });
+    }).detach();
+  }
+
+  void Finished(bool ok, const std::string& error) {
+    SetBusy(false);
+    if (ok) {
+      g.gtk_label_set_text(GTK_LABEL(stage_), "Setup finished. Press Play.");
+      g.gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(progress_), 1.0);
+      return;
+    }
+    if (cancelled_) {
+      g.gtk_label_set_text(GTK_LABEL(stage_), "Cancelled. Install again to continue where it stopped.");
+      if (quit_when_stopped_) g.gtk_widget_destroy(window_);
+      return;
+    }
+    g.gtk_label_set_text(GTK_LABEL(stage_), "Setup stopped.");
+    ErrorBox(error + "\n\n(log: " + (g_root / "data" / "logs" / "install.log").string() + ")");
+  }
+
+  bool CloseRequested() {
+    if (!busy_) return true;
+    if (Question("Setup is running. Stop it and close? Running setup again continues where it stopped.")) {
+      cancelled_ = true;
+      quit_when_stopped_ = true;  // the window closes when the install thread has stopped
+    }
+    return false;
+  }
+
+  void Play() {
+    // The launcher process becomes the game (exec): take the window down first.
+    g.gtk_widget_hide(window_);
+    while (g.gtk_events_pending()) g.gtk_main_iteration();
+    std::wstring error;
+    if (LaunchGame(g_root, &error, game_args_)) return;
+    g.gtk_widget_show_all(window_);
+    ErrorBox(Narrow(error));
+  }
+
+  std::vector<std::wstring> game_args_;
+  GtkWidget* window_ = nullptr;
+  GtkWidget* paths_[3] = {};
+  GtkWidget* file_[3] = {};
+  GtkWidget* folder_[3] = {};
+  GtkWidget* stage_ = nullptr;
+  GtkWidget* progress_ = nullptr;
+  GtkWidget* log_ = nullptr;
+  GtkWidget* install_ = nullptr;
+  GtkWidget* play_ = nullptr;
+  bool busy_ = false;
+  bool quit_when_stopped_ = false;
+  std::atomic<bool> cancelled_{false};
+  int last_ = -1;
+};
+
+bool LoadGui() {
+  static int loaded = -1;
+  if (loaded < 0) loaded = HaveDisplay() && g.Load() && g.gtk_init_check(nullptr, nullptr);
+  return loaded == 1;
+}
+
+// The setup window until it is closed (or the game starts). false: no GTK / display.
+bool RunSetupWindow(const std::vector<std::wstring>& game_args, int* code) {
+  if (!LoadGui()) return false;
+  std::wstring error;
+  if (!Preflight(g_root, &error)) {
+    ErrorBox(Narrow(error));
+    *code = 1;
+    return true;
+  }
+  SetupWindow w(game_args);
+  w.Build();
+  g.gtk_main();
+  *code = 0;
+  return true;
+}
+
+// Errors when there may be no terminal to see them (started from the desktop).
+void ShowError(const std::string& text) {
+  fprintf(stderr, "%s\n", text.c_str());
+  if (LoadGui()) ErrorBox(text);
+}
+#else
+bool RunSetupWindow(const std::vector<std::wstring>&, int*) { return false; }
+void ShowError(const std::string& text) { fprintf(stderr, "%s\n", text.c_str()); }
+#endif
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -228,7 +629,7 @@ int main(int argc, char** argv) {
   if (ec) g_root = fs::absolute(argv[0]).parent_path();
   std::signal(SIGINT, [](int) { g_cancelled = 1; });
 
-  bool setup = false, unattended = false;
+  bool setup = false, unattended = false, cli = false;
   std::vector<std::string> paths;
   std::vector<std::wstring> game_args;
   for (int i = 1; i < argc; ++i) {
@@ -241,8 +642,10 @@ int main(int argc, char** argv) {
       setup = true;
     } else if (a == "--unattended") {
       unattended = true;
+    } else if (a == "--cli") {
+      cli = true;
     } else if (a == "--help" || a == "-h") {
-      printf("usage: %s [--setup [DISC1 DISC2 TU]] [--unattended] [-- GAME_ARGS...]\n", argv[0]);
+      printf("usage: %s [--setup [DISC1 DISC2 TU]] [--cli] [--unattended] [-- GAME_ARGS...]\n", argv[0]);
       return 0;
     } else if (a.rfind("--", 0) == 0) {
       fprintf(stderr, "unknown option %s (game options go after --)\n", a.c_str());
@@ -253,13 +656,20 @@ int main(int argc, char** argv) {
   }
   if (unattended) return Unattended();
   if (!paths.empty()) setup = true;
+  const bool window = !cli && paths.empty();
 
   std::wstring error;
   if (!setup && IsInstalled(g_root)) {
     if (LaunchGame(g_root, &error, game_args)) return 0;
-    fprintf(stderr, "%s\n", Narrow(error).c_str());
+    if (window) {
+      ShowError(Narrow(error));
+    } else {
+      fprintf(stderr, "%s\n", Narrow(error).c_str());
+    }
     return 1;
   }
+  int code = 0;
+  if (window && RunSetupWindow(game_args, &code)) return code;
   if (!Preflight(g_root, &error)) {
     fprintf(stderr, "%s\n", Narrow(error).c_str());
     return 1;
