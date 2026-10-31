@@ -121,7 +121,8 @@ if(GTAV_GAME_DLL)
         find_program(GTAV_LLVM_NM NAMES llvm-nm nm REQUIRED)
         get_filename_component(GTAV_LLVM_BIN "${GTAV_LLVM_NM}" DIRECTORY)
         add_custom_command(TARGET gtav PRE_LINK
-            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../tools/game_dll/gen_interface.py
+            COMMAND ${CMAKE_COMMAND} -E env GTAV_STUB_SDK=$<IF:$<BOOL:${GTAV_IOS}>,iphoneos,macosx>
+                    ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../tools/game_dll/gen_interface.py
                     ${GTAV_LLVM_BIN} ${CMAKE_BINARY_DIR}/CMakeFiles/gtav.dir ${GTAV_INTERFACE_DIR}
                     $<TARGET_FILE:rex::runtime> ${CMAKE_CXX_COMPILER}
             VERBATIM)

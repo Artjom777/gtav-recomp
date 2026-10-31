@@ -15,7 +15,14 @@ MOLTENVK_FW="${MOLTENVK_FW:-/Volumes/Untitled/MacOffload/skate3/moltenvk-ios/Mol
 APP="$BUILD/package/GTAV.app"
 
 rm -rf "$APP"; mkdir -p "$APP"  # not build/ios/gtav.app: same folder on a case-insensitive disk
-cp "$BUILD/gtav.app/gtav" "$APP/gtav"
+# GTAV_GAME_DYLIB=<path>: the release layout, the shell exe (build/ios-shell, no game code) plus the
+# game library built from the player's discs (tools/game_dll/build_game_dll.py --ios).
+if [ -n "${GTAV_GAME_DYLIB:-}" ]; then
+  cp "${GTAV_SHELL:-$R/build/ios-shell/gtav_fast.app/gtav_fast}" "$APP/gtav"
+  cp "$GTAV_GAME_DYLIB" "$APP/gtav_game.dylib"
+else
+  cp "$BUILD/gtav.app/gtav" "$APP/gtav"
+fi
 cp "$SDK/lib/librexruntime.dylib" "$SDK/lib/librexgpu-xenos.dylib" "$APP/"
 cp "$MOLTENVK_FW/MoltenVK" "$APP/libMoltenVK.dylib"
 chmod u+w "$APP"/*.dylib
