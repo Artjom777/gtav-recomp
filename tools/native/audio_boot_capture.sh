@@ -6,7 +6,7 @@
 # analyse with tools/native/audio_bursts.py logs/NAME.log.
 # GTAV_INPUT_SCRIPT=FILE plays that pad script (--input_script) once the world is loaded, e.g.
 # tools/native/input_run_around.txt.
-NAME=$1; SECS=${2:-90}; shift 2 2>/dev/null
+NAME=$1; SECS=${2:-90}; [ $# -ge 2 ] && shift 2 || shift $#
 ROOT="$HOME/gtav-linux"
 L="$ROOT/logs/$NAME.log"
 if pgrep -x gtav >/dev/null; then echo "game already running: not starting"; exit 1; fi

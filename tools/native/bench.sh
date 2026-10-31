@@ -4,7 +4,7 @@
 # is the bottleneck), the [native] timing lines, and (BENCH_PERF=1, needs
 # kernel.perf_event_paranoid <= 1) a perf profile in logs/NAME.perf.
 # usage: tools/native/bench.sh NAME [SECS] [game flags...]
-NAME=$1; SECS=${2:-30}; shift 2 2>/dev/null
+NAME=$1; SECS=${2:-30}; [ $# -ge 2 ] && shift 2 || shift $#
 ROOT="$HOME/gtav-linux"
 L="$ROOT/logs/$NAME.log"
 if pgrep -x gtav >/dev/null; then echo "game already running: not starting"; exit 1; fi
