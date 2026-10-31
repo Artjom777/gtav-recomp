@@ -389,6 +389,36 @@ bool Decode3D(const rex::graphics::TextureInfo& info, const HostFormat& host, ui
   return true;
 }
 
+// A decoded DXT1 texture without transparent texels -> B5G6R5 (half the memory of RGBA8; the
+// colour came from 5:6:5 endpoints, so only the interpolated texels lose a little precision).
+static void PackOpaqueTo565(DecodedTexture* t) {
+  if (!kDecodeBC || t->format != RenderFormat::R8G8B8A8_UNORM) return;
+  for (uint32_t m = 0; m < t->mip_count; m++) {  // (not the zero padding between mips)
+    const uint8_t* p = t->data.data() + t->mips[m].offset;
+    const size_t bytes = size_t(t->mips[m].row_texels) * t->mips[m].height * 4;
+    for (size_t i = 3; i < bytes; i += 4)
+      if (p[i] != 255) return;  // punch-through alpha: stays RGBA8
+  }
+  std::vector<uint8_t> packed;
+  DecodedTexture::Mip mips[16];
+  for (uint32_t m = 0; m < t->mip_count; m++) {
+    const auto& src = t->mips[m];
+    mips[m] = src;
+    mips[m].offset = uint32_t((packed.size() + 15) & ~size_t(15));
+    const size_t texels = size_t(src.row_texels) * src.height;
+    packed.resize(mips[m].offset + texels * 2);
+    const uint8_t* in = t->data.data() + src.offset;
+    uint8_t* o = packed.data() + mips[m].offset;
+    for (size_t i = 0; i < texels; i++) {
+      const uint16_t v = uint16_t((in[4 * i + 2] >> 3) << 11 | (in[4 * i + 1] >> 2) << 5 | (in[4 * i] >> 3));
+      std::memcpy(o + 2 * i, &v, 2);
+    }
+  }
+  std::memcpy(t->mips, mips, sizeof(mips));
+  t->data = std::move(packed);
+  t->format = RenderFormat::B5G6R5_UNORM;
+}
+
 bool DecodeGuestTexture(const uint32_t words[6], DecodedTexture* out) {
   xenos::xe_gpu_texture_fetch_t fetch = {};
   fetch.dword_0 = words[0];
@@ -492,6 +522,7 @@ bool DecodeGuestTexture(const uint32_t words[6], DecodedTexture* out) {
     }
   }
   out->swizzle = Swizzle(info.format, fetch.swizzle);
+  if (host.convert == Convert::kBC1) PackOpaqueTo565(out);
   return true;
 }
 

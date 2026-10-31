@@ -1316,6 +1316,7 @@ struct CachedTexture {
   std::unique_ptr<RenderTexture> texture;
   std::unique_ptr<RenderTextureView> view;
   uint32_t descriptor = 0;
+  RenderFormat format = RenderFormat::UNKNOWN;  // decoded host format (iOS: DXT1 is RGBA8 or 5:6:5)
   uint64_t content = 0;
   uint64_t raw_hash = 0;  // HashGuestTexture of the decoded bytes
   uint64_t checked_frame = 0;
@@ -2856,7 +2857,12 @@ struct Backend::Impl {
       REXLOG_INFO("[native] texture {:08X} ({}x{}, format {}) is all zero at frame {}", base & 0x1FFFFFFF,
                   dec.width, dec.height, words[1] & 0x3F, frame);
     }
+    if (t.texture && t.format != dec.format) {  // same guest texture, other host format: new texture
+      dead_textures.push_back(std::move(t.texture));
+      dead_views.push_back(std::move(t.view));
+    }
     if (!t.texture) {
+      t.format = dec.format;
       t.texture = device->createTexture(
           dec.volume ? RenderTextureDesc::Texture3D(dec.width, dec.height, dec.depth, 1, dec.format)
                      : RenderTextureDesc::Texture2D(dec.width, dec.height, dec.mip_count, dec.format));
@@ -2864,7 +2870,7 @@ struct Backend::Impl {
           dec.volume ? RenderTextureViewDesc::Texture3D(dec.format) : RenderTextureViewDesc::Texture2D(dec.format);
       view.componentMapping = dec.swizzle;
       t.view = t.texture->createTextureView(view);
-      t.descriptor = AllocDescriptor();
+      if (t.descriptor < kFirstTextureDescriptor) t.descriptor = AllocDescriptor();
       texture_set->setTexture(t.descriptor, t.texture.get(), RenderTextureLayout::SHADER_READ, t.view.get());
     }
     auto staging = upload.Allocate(dec.data.size(), 512);
