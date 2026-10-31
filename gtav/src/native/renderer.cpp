@@ -503,6 +503,23 @@ class Renderer {
 #endif
           // F9 (dump the next frame) and F10 (screenshot; marks audio captures) from any of the
           // process's windows, like the Win32 timer poll. The watch runs where the SDK pumps events.
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+          // Runs on the main thread inside the app delegate's callbacks: entering the background
+          // returns only once the renderer stopped submitting (or after 1 s).
+          SDL_AddEventWatch(
+              [](void*, SDL_Event* e) {
+                if (e->type == SDL_EVENT_WILL_ENTER_BACKGROUND) {
+                  ios_drained_ = false;
+                  ios_background_.store(true, std::memory_order_release);
+                  for (int i = 0; i < 100 && !ios_drained_.load(std::memory_order_acquire); i++)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                } else if (e->type == SDL_EVENT_DID_ENTER_FOREGROUND) {
+                  ios_background_.store(false, std::memory_order_release);
+                }
+                return true;
+              },
+              nullptr);
+#endif
           SDL_AddEventWatch(
               [](void*, SDL_Event* e) {
                 if (e->type == SDL_EVENT_KEY_DOWN && !e->key.repeat) {
@@ -944,6 +961,18 @@ class Renderer {
     }
 #ifdef __ANDROID__
     if (!SurfaceReady()) return;
+#endif
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    // iOS stops an app that submits GPU work in the background: no frames until it is back, and
+    // the GPU drained once (the app delegate's background callback waits for that, see Init).
+    if (ios_background_.load(std::memory_order_acquire)) {
+      if (!ios_drained_.load(std::memory_order_relaxed)) {
+        RetireAll();
+        ios_drained_.store(true, std::memory_order_release);
+        REXLOG_INFO("[native] app in the background: rendering paused");
+      }
+      return;
+    }
 #endif
     if (swapchain_->needsResize()) {
       RetireAll();  // also drains the submit thread
@@ -1508,6 +1537,7 @@ class Renderer {
 #ifdef __APPLE__
   SDL_MetalView metal_view_ = nullptr;
   plume::RenderWindow render_window_ = {};
+  static inline std::atomic<bool> ios_background_{false}, ios_drained_{false};
 #elif defined(__ANDROID__)
   plume::RenderWindow render_window_ = nullptr;  // ANativeWindow* of SDLActivity's surface
 #endif
