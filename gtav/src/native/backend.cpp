@@ -145,7 +145,13 @@ REXCVAR_DEFINE_BOOL(gtav_native_skip_depth_restore, true, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_native_point_float32, GTAV_POINT_FLOAT32_DEFAULT, "GTAV",
                     "Native renderer: nearest filtering for 32-bit float and depth (24_8) texture fetches (GPUs "
                     "without linear filtering for R32F / D32)");
-REXCVAR_DEFINE_DOUBLE(gtav_native_render_scale, 1.0, "GTAV",
+// Android: 0.75 (GPU -4..9 ms a frame on the throttled S23 FE; the SPIR-V there carries the constant).
+#ifdef __ANDROID__
+#define GTAV_RENDER_SCALE_DEFAULT 0.75
+#else
+#define GTAV_RENDER_SCALE_DEFAULT 1.0
+#endif
+REXCVAR_DEFINE_DOUBLE(gtav_native_render_scale, GTAV_RENDER_SCALE_DEFAULT, "GTAV",
                       "Native renderer: render the full-width (1280) targets at this fraction of their size "
                       "(0.5-1; read at start). Needs SPIR-V made with the pixel scale constant (make_spirv.sh)");
 REXCVAR_DEFINE_BOOL(gtav_native_zero_new_targets, true, "GTAV",
