@@ -30,9 +30,21 @@ cmake -S . -B ../build/ios -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_SYSTEM_NA
   -DGTAV_PREBUILT_NATIVE_SHADERS=<repo>/build/gtav/native_shaders
 ninja -C ../build/ios -j4
 
-# 3. App bundle, signing, install (needs a profile for com.nakas.gtav, below)
-tools/ios/make_app.sh --install
+# 3. Game shaders for iOS (constants in uniform buffers, as on Android) from a shader cache
+#    made by a Mac install (the clean-room test install has all 3,604):
+TOOLS=/Volumes/Untitled/gtav-cleanroom-test/tools CACHE=/Volumes/Untitled/gtav-cleanroom-test/data/shader_cache \
+  tools/ios/make_spirv.sh 4          # -> build/ios/spirv
+
+# 4. App bundle, signing, install, args (+ shaders) (needs a profile for com.nakas.gtav, below)
+tools/ios/deploy.sh [--spirv]        # = make_app.sh --install + copies to Documents
+tools/ios/launch_when_unlocked.sh build/ios/run.log   # console log; game log: Documents/logs/gtav.log
 ```
+
+Patches: rexglue-sdk-gtav-linux.patch, plume-gtav.patch, sdl3-gtav.patch (rexglue-sdk/thirdparty/sdl3)
+and ffmpeg-gtav.patch (rexglue-sdk/thirdparty/FFmpeg), applied as on the other platforms. Branch
+ios-android = origin/android + the iOS commits; phone paths shared with Android are `GTAV_MOBILE`
+in backend.cpp (UBO constants, load-op clears, texture recheck interval) and the letterbox in
+renderer.cpp.
 
 Provisioning profile: minted once with a throwaway Xcode project (xcodegen) carrying bundle id
 `com.nakas.gtav`, team FBCD7748P3 and the two kernel entitlements, built with
