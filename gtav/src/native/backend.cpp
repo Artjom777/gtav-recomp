@@ -107,7 +107,14 @@ REXCVAR_DEFINE_INT32(gtav_native_hash_threads, GTAV_HASH_THREADS_DEFAULT, "GTAV"
                      "when there is no write watch (0: hash on the render thread)");
 REXCVAR_DEFINE_INT32(gtav_native_dump_rt_count, 150, "GTAV",
                      "Frame dumps: number of per-draw snapshots of --gtav_native_dump_rt (~2.7 MB each at 720p)");
-REXCVAR_DEFINE_DOUBLE(gtav_native_pipeline_wait_ms, 40.0, "GTAV",
+// The iPhone compiles pipelines several times slower (MoltenVK + Metal on an A15): wait longer before
+// a draw is skipped, so a new effect costs a hitch instead of a frame with holes in it.
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+#define GTAV_PIPELINE_WAIT_DEFAULT 120.0
+#else
+#define GTAV_PIPELINE_WAIT_DEFAULT 40.0
+#endif
+REXCVAR_DEFINE_DOUBLE(gtav_native_pipeline_wait_ms, GTAV_PIPELINE_WAIT_DEFAULT, "GTAV",
                       "Background pipeline compiles: a frame waits up to this long in total for its draws' "
                       "pipelines before skipping them (0: never wait)");
 // Live experiments for the clear-sky slabs (settable while running through logs/menu_set).
