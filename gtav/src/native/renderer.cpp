@@ -50,7 +50,7 @@ REXCVAR_DEFINE_BOOL(gtav_native_vsync, true, "GTAV", "Native renderer: wait for 
 REXCVAR_DEFINE_BOOL(gtav_native_exact_barriers, true, "GTAV",
                     "Native renderer: no TOP_OF_PIPE / BOTTOM_OF_PIPE next to other barrier stages (MoltenVK waits less)");
 #ifdef __ANDROID__
-#define GTAV_LOAD_CLEARS_DEFAULT true
+#define GTAV_LOAD_CLEARS_DEFAULT false  // no measured gain; walk tests showed more lighting squares with it
 #else
 #define GTAV_LOAD_CLEARS_DEFAULT false
 #endif
@@ -1215,7 +1215,7 @@ class Renderer {
         backend_.WriteDump();
         backend_.FrameComplete(slot);
       }
-      if (shot) WriteShot(frame.index);
+      if (shot) WriteShot(frame.index, ab_slot_phase_[slot]);
     }
   }
 
@@ -1240,8 +1240,11 @@ class Renderer {
     return index % every == 0;
   }
 
-  void WriteShot(uint64_t index) {
-    std::string path = fmt::format("{}/native_{:06}.ppm", ShotDir(), index);
+  // ab_phase: the --gtav_native_ab side this frame was drawn with (-1: none), kept in the name so
+  // captures can be compared per side (tools/android/walk_squares.sh).
+  void WriteShot(uint64_t index, int ab_phase = -1) {
+    std::string path = ab_phase >= 0 ? fmt::format("{}/native_{:06}_ab{}.ppm", ShotDir(), index, ab_phase)
+                                     : fmt::format("{}/native_{:06}.ppm", ShotDir(), index);
     const uint8_t* px = static_cast<const uint8_t*>(readback_->map());
     if (FILE* f = std::fopen(path.c_str(), "wb")) {
       std::fprintf(f, "P6\n%u %u\n255\n", kShotW, kShotH);

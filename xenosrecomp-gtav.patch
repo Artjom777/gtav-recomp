@@ -11,7 +11,7 @@ index e59682c..c9592ad 100644
  #include <fmt/core.h>
  #include <string>
 diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
-index 1c74034..391583b 100644
+index 1c74034..3899e2e 100644
 --- a/XenosRecomp/shader_common.h
 +++ b/XenosRecomp/shader_common.h
 @@ -26,25 +26,47 @@ struct PushConstants
@@ -70,7 +70,7 @@ index 1c74034..391583b 100644
  #endif
  
  Texture2D<float4> g_Texture2DDescriptorHeap[] : register(t0, space0);
-@@ -59,16 +81,54 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
+@@ -59,16 +81,60 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
      return dimensions;
  }
  
@@ -78,7 +78,13 @@ index 1c74034..391583b 100644
 +// to its offset. With D3D9 pixel centres, screen-space passes put coordinates exactly on texel
 +// edges, and point sampling then picks texel i or i-1 depending on interpolation rounding (the
 +// ocean wave simulation became a blend of neighbours and drifted).
++#ifdef __spirv__
++// Shared constant 624 (the renderer's --gtav_native_fetch_rounding, normally 1.5/1024): a GPU with
++// coarser texture coordinate rounding (Adreno) needs more for the ties to go the same way.
++#define XENOS_FETCH_ROUNDING vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 624)
++#else
 +#define XENOS_FETCH_ROUNDING (1.5 / 1024.0)
++#endif
 +
 +// 1D textures are bound as 2D textures of height 1.
 +float4 tfetch1D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float texCoord)
@@ -127,7 +133,7 @@ index 1c74034..391583b 100644
  }
  
  float w0(float a)
-@@ -135,17 +195,24 @@ float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex
+@@ -135,17 +201,24 @@ float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex
      float h1y = h1(fy);
  
      float4 r =
@@ -157,7 +163,7 @@ index 1c74034..391583b 100644
  }
  
  struct CubeMapData
-@@ -156,7 +223,54 @@ struct CubeMapData
+@@ -156,7 +229,54 @@ struct CubeMapData
  
  float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData)
  {
@@ -213,7 +219,7 @@ index 1c74034..391583b 100644
  }
  
  float4 tfetchR11G11B10(uint4 value)
-@@ -180,6 +294,116 @@ float4 tfetchTexcoord(uint swappedTexcoords, float4 value, uint semanticIndex)
+@@ -180,6 +300,116 @@ float4 tfetchTexcoord(uint swappedTexcoords, float4 value, uint semanticIndex)
      return (swappedTexcoords & (1ull << semanticIndex)) != 0 ? value.yxwz : value;
  }
  
