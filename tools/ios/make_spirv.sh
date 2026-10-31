@@ -20,7 +20,9 @@ one() {
   [ -s "$out" ] && [ "$out" -nt "$WORK/shader_common.h" ] && return 0
   hlsl=$WORK/$name.hlsl
   "$TOOLS/XenosRecomp" "$bin" "$hlsl" "$WORK/shader_common.h" >/dev/null 2>&1 || { echo "xr fail $name"; return 0; }
-  python3 -I "$UBO" "$hlsl" || { echo "ubo fail $name"; return 0; }
+  # Shaders that render wrong with UBO constants on the iPhone keep device-address loads:
+  # the sky dome came out white (ps_6A340C638FB8D4C2 + its vs; cause not found yet).
+  case " $NO_UBO " in *" $name "*) ;; *) python3 -I "$UBO" "$hlsl" || { echo "ubo fail $name"; return 0; } ;; esac
   case $name in ps_*) prof=ps_6_0; extra=;; *) prof=vs_6_0; extra=-fvk-invert-y;; esac
   "$TOOLS/dxc" -T $prof -HV 2021 -all-resources-bound -spirv -fvk-use-dx-layout -Wno-ignored-attributes \
     -Qstrip_debug $extra -Fo "$out" "$hlsl" >/dev/null 2>&1 || echo "dxc fail $name"
@@ -33,6 +35,7 @@ one() {
   rm -f "$hlsl"
 }
 UBO=$ROOT/tools/android/ubo_constants.py
-export -f one; export TOOLS OUT WORK UBO
+NO_UBO="ps_6A340C638FB8D4C2 vs_5338696E6825DEA1"
+export -f one; export TOOLS OUT WORK UBO NO_UBO
 ls "$CACHE"/*.bin | xargs -P "${1:-4}" -I{} bash -c 'one {}'
 echo "spirv: $(ls "$OUT"/*.spv | wc -l) files in $OUT"
