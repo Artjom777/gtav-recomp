@@ -1,3 +1,18 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9b3cdf5..c03fff2 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -158,6 +158,10 @@ if(WIN32)
+         message(FATAL_ERROR "Unsupported Windows architecture: ${REX_TARGET_PROCESSOR}")
+     endif()
+     add_compile_definitions(REX_PLATFORM_WINDOWS=1)
++elseif(ANDROID)
++    # Android (NDK): Linux kernel + Bionic; platform.h also sets REX_PLATFORM_ANDROID.
++    set(REX_PLATFORM "android-arm64")
++    add_compile_definitions(REX_PLATFORM_LINUX=1)
+ elseif(UNIX AND NOT APPLE)
+     if(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
+         set(REX_PLATFORM "linux-amd64")
 diff --git a/include/rex/audio/sdl/sdl_audio_driver.h b/include/rex/audio/sdl/sdl_audio_driver.h
 index f8949ca..32ce942 100644
 --- a/include/rex/audio/sdl/sdl_audio_driver.h
@@ -30,6 +45,21 @@ index f8949ca..32ce942 100644
  };
  
  }  // namespace rex::audio::sdl
+diff --git a/include/rex/chrono/chrono.h b/include/rex/chrono/chrono.h
+index d876846..549bdf8 100644
+--- a/include/rex/chrono/chrono.h
++++ b/include/rex/chrono/chrono.h
+@@ -116,8 +116,8 @@ using XSystemClock = detail::NtSystemClock<detail::Domain::Guest>;
+ 
+ namespace std::chrono {
+ 
+-#ifdef __APPLE__
+-// Apple libc++ does not expose clock_time_conversion or clock_cast.
++#if defined(__APPLE__) || defined(__ANDROID__)
++// libc++ (Apple, Android NDK) does not expose clock_time_conversion or clock_cast.
+ template <class, class>
+ struct clock_time_conversion {};
+ 
 diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
 index da8e432..749f0ba 100644
 --- a/include/rex/graphics/command_processor.h
@@ -115,8 +145,79 @@ index 0a43f07..a9bf21f 100644
    X_STATUS Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t alertable,
                  uint64_t* opt_timeout);
    static X_STATUS SignalAndWait(XObject* signal_object, XObject* wait_object, uint32_t wait_reason,
+diff --git a/include/rex/thread/fiber.h b/include/rex/thread/fiber.h
+index 352af67..2f6123f 100644
+--- a/include/rex/thread/fiber.h
++++ b/include/rex/thread/fiber.h
+@@ -57,7 +57,13 @@ struct Fiber {
+   void* handle_ = nullptr;
+   bool is_thread_fiber_ = false;
+ #elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
++#if REX_PLATFORM_ANDROID
++  // Bionic has no getcontext/makecontext/swapcontext: fiber_posix.cpp switches stacks itself and
++  // keeps the callee-saved registers on the suspended fiber's stack.
++  void* sp_ = nullptr;
++#else
+   ucontext_t context_{};
++#endif
+   std::vector<uint8_t> stack_;
+   void (*entry_)(void*) = nullptr;
+   void* arg_ = nullptr;
+diff --git a/include/rex/ui/surface_android.h b/include/rex/ui/surface_android.h
+new file mode 100644
+index 0000000..a721b58
+--- /dev/null
++++ b/include/rex/ui/surface_android.h
+@@ -0,0 +1,31 @@
++#pragma once
++/**
++ * @file        rex/ui/surface_android.h
++ * @brief       Android ANativeWindow surface (from SDL3's Android window)
++ *
++ * @license     BSD 3-Clause License
++ *              See LICENSE file in the project root for full license text.
++ */
++
++#include <rex/ui/surface.h>
++
++struct ANativeWindow;
++
++namespace rex {
++namespace ui {
++
++class AndroidNativeWindowSurface final : public Surface {
++ public:
++  explicit AndroidNativeWindowSurface(ANativeWindow* window) : window_(window) {}
++  TypeIndex GetType() const override { return kTypeIndex_AndroidNativeWindow; }
++  ANativeWindow* window() const { return window_; }
++
++ protected:
++  bool GetSizeImpl(uint32_t& width_out, uint32_t& height_out) const override;
++
++ private:
++  ANativeWindow* window_;
++};
++
++}  // namespace ui
++}  // namespace rex
+diff --git a/include/rex/ui/windowed_app.h b/include/rex/ui/windowed_app.h
+index 50638d6..feec200 100644
+--- a/include/rex/ui/windowed_app.h
++++ b/include/rex/ui/windowed_app.h
+@@ -24,10 +24,7 @@
+ #include <rex/platform.h>
+ #include <rex/ui/windowed_app_context.h>
+ 
+-#if REX_PLATFORM_ANDROID
+-// Multiple apps in a single library instead of separate executables.
+-#define XE_UI_WINDOWED_APPS_IN_LIBRARY 1
+-#endif
++// Android: one app per library too (the game's libmain.so; SDL's activity calls its SDL_main).
+ 
+ namespace rex {
+ namespace ui {
 diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
-index 20a2cd8..7d0e54d 100644
+index 20a2cd8..0897aac 100644
 --- a/src/audio/sdl/sdl_audio_driver.cpp
 +++ b/src/audio/sdl/sdl_audio_driver.cpp
 @@ -11,7 +11,14 @@
@@ -134,7 +235,7 @@ index 20a2cd8..7d0e54d 100644
  
  #include <rex/assert.h>
  #include <rex/audio/conversion.h>
-@@ -24,7 +31,35 @@
+@@ -24,7 +31,36 @@
  #include <rex/perf/counter.h>
  #include <SDL3/SDL.h>
  
@@ -155,7 +256,8 @@ index 20a2cd8..7d0e54d 100644
  REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
 +REXCVAR_DEFINE_BOOL(audio_release_pacing, REX_AUDIO_PACING_DEFAULT, "Audio",
 +                    "Hand consumed frames back to the guest one per 5.3 ms instead of in bursts per device callback");
-+#ifdef __APPLE__
++// Android: phones are stereo, and a 6-channel stream costs the audio server ~40% of a core to fold.
++#if defined(__APPLE__) || defined(__ANDROID__)
 +#define REX_AUDIO_FORCE_STEREO_DEFAULT true
 +#else
 +#define REX_AUDIO_FORCE_STEREO_DEFAULT false
@@ -170,7 +272,7 @@ index 20a2cd8..7d0e54d 100644
  
  namespace rex::audio::sdl {
  
-@@ -39,6 +74,12 @@ SDLAudioDriver::~SDLAudioDriver() {
+@@ -39,6 +75,12 @@ SDLAudioDriver::~SDLAudioDriver() {
  bool SDLAudioDriver::Initialize() {
    // Set audio category for proper OS audio handling
    SDL_SetHint(SDL_HINT_AUDIO_CATEGORY, "playback");
@@ -183,7 +285,7 @@ index 20a2cd8..7d0e54d 100644
  
    // Set app name for audio device identification
    SDL_SetAppMetadataProperty(SDL_PROP_APP_METADATA_NAME_STRING, "rexglue");
-@@ -75,7 +116,7 @@ bool SDLAudioDriver::Initialize() {
+@@ -75,7 +117,7 @@ bool SDLAudioDriver::Initialize() {
  
    // A 1-channel device gets the stereo fold too, then SDL collapses to mono.
    // Handing it a 6ch stream instead would use SDL's own downmix.
@@ -192,7 +294,7 @@ index 20a2cd8..7d0e54d 100644
      SDL_DestroyAudioStream(sdl_stream_);
      sdl_stream_ = nullptr;
      desired_spec.channels = 2;
-@@ -106,9 +147,50 @@ bool SDLAudioDriver::Initialize() {
+@@ -106,9 +148,50 @@ bool SDLAudioDriver::Initialize() {
      return false;
    }
  
@@ -243,7 +345,7 @@ index 20a2cd8..7d0e54d 100644
  void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
    const auto input_frame = memory_->TranslateVirtual<float*>(frame_ptr);
    float* output_frame;
-@@ -139,6 +221,10 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
+@@ -139,6 +222,10 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
  }
  
  void SDLAudioDriver::Shutdown() {
@@ -254,7 +356,7 @@ index 20a2cd8..7d0e54d 100644
    if (sdl_stream_) {
      SDL_DestroyAudioStream(sdl_stream_);
      sdl_stream_ = nullptr;
-@@ -158,6 +244,58 @@ void SDLAudioDriver::Shutdown() {
+@@ -158,6 +245,58 @@ void SDLAudioDriver::Shutdown() {
    }
  }
  
@@ -313,7 +415,7 @@ index 20a2cd8..7d0e54d 100644
  void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int additional_amount,
                                   [[maybe_unused]] int total_amount) {
    SCOPE_profile_cpu_f("apu");
-@@ -178,15 +316,26 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+@@ -178,15 +317,26 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
    const StereoFold fold = GetStereoFold();
    const SurroundMix mix = GetSurroundMix();
    const float gain = GetOutputGain();
@@ -340,7 +442,7 @@ index 20a2cd8..7d0e54d 100644
        if (!SDL_PutAudioStreamData(stream, data, len)) {
          REXAPU_ERROR("SDL_PutAudioStreamData() failed while filling silence: {}", SDL_GetError());
          break;
-@@ -195,9 +344,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+@@ -195,9 +345,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
      } else {
        auto buffer = driver->frames_queued_.front();
        driver->frames_queued_.pop();
@@ -351,7 +453,7 @@ index 20a2cd8..7d0e54d 100644
          switch (driver->sdl_device_channels_) {
            case 2:
              conversion::sequential_6_BE_to_interleaved_2_LE(data, buffer, channel_samples_, fold,
-@@ -211,6 +358,8 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+@@ -211,6 +359,8 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
              assert_unhandled_case(driver->sdl_device_channels_);
              break;
          }
@@ -360,7 +462,7 @@ index 20a2cd8..7d0e54d 100644
        }
        if (!SDL_PutAudioStreamData(stream, data, len)) {
          REXAPU_ERROR("SDL_PutAudioStreamData() failed: {}", SDL_GetError());
-@@ -219,8 +368,12 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+@@ -219,8 +369,12 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
        }
        driver->frames_unused_.push(buffer);
  
@@ -576,11 +678,434 @@ index cbdd7f7..6b9067c 100644
    ctx.println("\t}}");
    return true;
  }
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 1ddafd0..055910f 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -98,7 +98,10 @@ target_include_directories(rexcore PRIVATE
+     ${PROJECT_SOURCE_DIR}/thirdparty/cli11/include
+ )
+ 
+-if(APPLE)
++if(ANDROID)
++    # Bionic has pthread and rt in libc.
++    target_link_libraries(rexcore PRIVATE dl log)
++elseif(APPLE)
+     target_link_libraries(rexcore PRIVATE pthread)
+ elseif(UNIX)
+     target_link_libraries(rexcore PRIVATE pthread rt dl)
+diff --git a/src/core/exception_handler_posix.cpp b/src/core/exception_handler_posix.cpp
+index 8b1c76a..ff8bff1 100644
+--- a/src/core/exception_handler_posix.cpp
++++ b/src/core/exception_handler_posix.cpp
+@@ -28,6 +28,11 @@
+ #include <rex/logging.h>
+ #include <rex/math.h>
+ #include <rex/platform.h>
++#if REX_PLATFORM_ANDROID
++#include <dlfcn.h>
++#include <unistd.h>
++#include <cstdio>
++#endif
+ 
+ #include <ucontext.h>
+ 
+@@ -225,6 +230,12 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
+         access_violation_operation = (mcontext_esr->esr & (UINT64_C(1) << 6))
+                                          ? Exception::AccessViolationOperation::kWrite
+                                          : Exception::AccessViolationOperation::kRead;
++      } else if ((mcontext_esr && ((mcontext_esr->esr >> 26) & 0b111110) == 0b100000) ||
++                 reinterpret_cast<uint64_t>(signal_info->si_addr) == mcontext.pc) {
++        // Instruction abort (a jump to an unmapped address, e.g. a null function pointer):
++        // there is no instruction to decode, and reading it here would fault again inside the
++        // handler, which the kernel answers by killing the process without any report.
++        access_violation_operation = Exception::AccessViolationOperation::kUnknown;
+       } else {
+         // Determine the memory access direction based on which instruction has
+         // requested it.
+@@ -417,6 +428,53 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
+       return;
+     }
+   }
++#if REX_PLATFORM_ANDROID && REX_ARCH_ARM64
++  // Under ART the restored handler is not debuggerd's, so no tombstone is written: report the
++  // fault (pc, lr and a frame-pointer walk as module+offset) on stderr first.
++  {
++    auto print_frame = [](const char* tag, uint64_t pc) {
++      Dl_info info{};
++      if (dladdr(reinterpret_cast<void*>(pc), &info) && info.dli_fname) {
++        fprintf(stderr, "  %s %016llx %s+0x%llx %s\n", tag, (unsigned long long)pc, info.dli_fname,
++                (unsigned long long)(pc - uint64_t(info.dli_fbase)), info.dli_sname ? info.dli_sname : "");
++      } else {
++        fprintf(stderr, "  %s %016llx ?\n", tag, (unsigned long long)pc);
++      }
++    };
++    fprintf(stderr, "unhandled signal %d at %p (thread %d)\n", signal_number, signal_info->si_addr,
++            int(gettid()));
++    print_frame("pc", thread_context.pc);
++    print_frame("lr", thread_context.x[30]);
++    uint64_t fp = thread_context.x[29];
++    for (int i = 0; i < 32 && fp && (fp & 7) == 0; i++) {
++      uint64_t next = reinterpret_cast<uint64_t*>(fp)[0];
++      uint64_t ret = reinterpret_cast<uint64_t*>(fp)[1];
++      if (!ret) break;
++      print_frame("fp", ret);
++      if (next <= fp) break;
++      fp = next;
++    }
++    fflush(stderr);
++  }
++#endif
++  // No handler claimed the fault: returning would re-run the faulting instruction forever (a
++  // silent spin, as seen in a Vulkan driver on Android). Put the previous handler back so the
++  // re-executed fault reaches it (the system crash reporter / debuggerd tombstone).
++  switch (signal_number) {
++    case SIGILL:
++      sigaction(SIGILL, &original_sigill_handler_, nullptr);
++      break;
++    case SIGSEGV:
++      sigaction(SIGSEGV, &original_sigsegv_handler_, nullptr);
++      break;
++#if REX_PLATFORM_MAC
++    case SIGBUS:
++      sigaction(SIGBUS, &original_sigbus_handler_, nullptr);
++      break;
++#endif
++    default:
++      break;
++  }
+ }
+ 
+ void ExceptionHandler::Install(Handler fn, void* data) {
+diff --git a/src/core/fiber_posix.cpp b/src/core/fiber_posix.cpp
+index 4fe1ca6..c5a4199 100644
+--- a/src/core/fiber_posix.cpp
++++ b/src/core/fiber_posix.cpp
+@@ -27,6 +27,89 @@ namespace rex::thread {
+ 
+ thread_local Fiber* Fiber::tls_current_ = nullptr;
+ 
++#if REX_PLATFORM_ANDROID
++// rex_fiber_switch(&from->sp_, to->sp_): push x19-x30 and d8-d15 (AAPCS64 callee-saved) on the
++// current stack, store sp, load the target's sp, pop its registers and return into it.
++// A new fiber's stack holds a frame whose x30 is rex_fiber_start and whose x19 is the entry.
++extern "C" void rex_fiber_switch(void** from_sp, void* to_sp);
++extern "C" void rex_fiber_start();
++asm(R"(
++  .text
++  .p2align 2
++  .globl rex_fiber_switch
++  .type rex_fiber_switch, %function
++rex_fiber_switch:
++  sub sp, sp, #160
++  stp x29, x30, [sp, #0]
++  stp x19, x20, [sp, #16]
++  stp x21, x22, [sp, #32]
++  stp x23, x24, [sp, #48]
++  stp x25, x26, [sp, #64]
++  stp x27, x28, [sp, #80]
++  stp d8, d9, [sp, #96]
++  stp d10, d11, [sp, #112]
++  stp d12, d13, [sp, #128]
++  stp d14, d15, [sp, #144]
++  mov x2, sp
++  str x2, [x0]
++  mov sp, x1
++  ldp x29, x30, [sp, #0]
++  ldp x19, x20, [sp, #16]
++  ldp x21, x22, [sp, #32]
++  ldp x23, x24, [sp, #48]
++  ldp x25, x26, [sp, #64]
++  ldp x27, x28, [sp, #80]
++  ldp d8, d9, [sp, #96]
++  ldp d10, d11, [sp, #112]
++  ldp d12, d13, [sp, #128]
++  ldp d14, d15, [sp, #144]
++  add sp, sp, #160
++  ret
++  .size rex_fiber_switch, . - rex_fiber_switch
++
++  .globl rex_fiber_start
++  .type rex_fiber_start, %function
++rex_fiber_start:
++  mov x29, #0
++  blr x19
++  brk #0
++  .size rex_fiber_start, . - rex_fiber_start
++)");
++
++Fiber* Fiber::ConvertCurrentThread() {
++  auto* f = new Fiber();
++  f->is_thread_fiber_ = true;
++  tls_current_ = f;
++  return f;
++}
++
++Fiber* Fiber::Create(size_t stack_size, void (*entry)(void*), void* arg) {
++  auto* f = new Fiber();
++  f->entry_ = entry;
++  f->arg_ = arg;
++  f->stack_.resize(stack_size);
++  uintptr_t top = (reinterpret_cast<uintptr_t>(f->stack_.data()) + f->stack_.size()) & ~uintptr_t(15);
++  auto* frame = reinterpret_cast<uint64_t*>(top - 160);
++  for (int i = 0; i < 20; ++i) {
++    frame[i] = 0;
++  }
++  frame[1] = reinterpret_cast<uint64_t>(&rex_fiber_start);  // x30
++  frame[2] = reinterpret_cast<uint64_t>(&Fiber::Trampoline);  // x19
++  f->sp_ = frame;
++  return f;
++}
++
++/*static*/ void Fiber::Trampoline() {
++  Fiber* f = tls_current_;
++  f->entry_(f->arg_);
++}
++
++void Fiber::SwitchTo(Fiber* target) {
++  Fiber* from = tls_current_;
++  tls_current_ = target;
++  rex_fiber_switch(&from->sp_, target->sp_);
++}
++#else
+ Fiber* Fiber::ConvertCurrentThread() {
+   auto* f = new Fiber();
+   if (getcontext(&f->context_) == -1) {
+@@ -67,6 +150,7 @@ void Fiber::SwitchTo(Fiber* target) {
+   tls_current_ = target;
+   swapcontext(&from->context_, &target->context_);
+ }
++#endif  // REX_PLATFORM_ANDROID
+ 
+ void Fiber::Destroy() {
+   // Thread fibers are destroyed from the owning thread itself.
+diff --git a/src/core/filesystem_posix.cpp b/src/core/filesystem_posix.cpp
+index ef5bdf4..7a6cf2e 100644
+--- a/src/core/filesystem_posix.cpp
++++ b/src/core/filesystem_posix.cpp
+@@ -303,4 +303,21 @@ std::vector<FileInfo> ListFiles(const std::filesystem::path& path) {
+ }
+ 
+ }  // namespace filesystem
++#if REX_PLATFORM_ANDROID
++namespace filesystem {
++// Game data lives on app-specific storage as plain files; content:// URIs (Storage Access
++// Framework) would need JNI and are not used by the port.
++void AndroidInitialize() {}
++void AndroidShutdown() {}
++bool IsAndroidContentUri(const std::string_view source) {
++  return source.starts_with("content://");
++}
++int OpenAndroidContentFileDescriptor(const std::string_view uri, const char* mode) {
++  (void)uri;
++  (void)mode;
++  return -1;
++}
++}  // namespace filesystem
++#endif  // REX_PLATFORM_ANDROID
++
+ }  // namespace rex
+diff --git a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
+index b52bf39..d84a12c 100644
+--- a/src/core/memory_posix.cpp
++++ b/src/core/memory_posix.cpp
+@@ -51,10 +51,7 @@
+ #include <dlfcn.h>
+ #include <sys/ioctl.h>
+ 
+-#include <linux/ashmem.h>
+-
+-// TODO(tomc): Android or maybe na. idk
+-// #include "xenia/base/main_android.h"
++#include <sys/mman.h>
+ #endif
+ 
+ namespace rex {
+@@ -84,32 +81,6 @@ static std::string MakeShmName(const std::filesystem::path& path) {
+   return name;
+ }
+ 
+-#if REX_PLATFORM_ANDROID
+-// May be null if no dynamically loaded functions are required.
+-static void* libandroid_;
+-// API 26+.
+-static int (*android_ASharedMemory_create_)(const char* name, size_t size);
+-
+-void AndroidInitialize() {
+-  if (rex::GetAndroidApiLevel() >= 26) {
+-    libandroid_ = dlopen("libandroid.so", RTLD_NOW);
+-    assert_not_null(libandroid_);
+-    if (libandroid_) {
+-      android_ASharedMemory_create_ = reinterpret_cast<decltype(android_ASharedMemory_create_)>(
+-          dlsym(libandroid_, "ASharedMemory_create"));
+-      assert_not_null(android_ASharedMemory_create_);
+-    }
+-  }
+-}
+-
+-void AndroidShutdown() {
+-  android_ASharedMemory_create_ = nullptr;
+-  if (libandroid_) {
+-    dlclose(libandroid_);
+-    libandroid_ = nullptr;
+-  }
+-}
+-#endif
+ 
+ size_t page_size() {
+   return getpagesize();
+@@ -432,28 +403,19 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
+ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, size_t length,
+                                           PageAccess access, bool commit) {
+ #if REX_PLATFORM_ANDROID
+-  // TODO(Triang3l): Check if memfd can be used instead on API 30+.
+-  if (android_ASharedMemory_create_) {
+-    int sharedmem_fd = android_ASharedMemory_create_(path.c_str(), length);
+-    return sharedmem_fd >= 0 ? static_cast<FileMappingHandle>(sharedmem_fd)
+-                             : kFileMappingHandleInvalid;
+-  }
+-
+-  // Use /dev/ashmem on API versions below 26, which added ASharedMemory.
+-  // /dev/ashmem was disabled on API 29 for apps targeting it.
+-  // https://chromium.googlesource.com/chromium/src/+/master/third_party/ashmem/ashmem-dev.c
+-  int ashmem_fd = open("/" ASHMEM_NAME_DEF, O_RDWR);
+-  if (ashmem_fd < 0) {
++  // memfd (API 30+, the minimum this port targets): anonymous, sparse until written, like the
++  // /dev/shm file on Linux. Grows with ftruncate; nothing to unlink.
++  (void)access;
++  (void)commit;
++  int fd = memfd_create(path.filename().c_str(), MFD_CLOEXEC);
++  if (fd < 0) {
+     return kFileMappingHandleInvalid;
+   }
+-  char ashmem_name[ASHMEM_NAME_LEN];
+-  strlcpy(ashmem_name, path.c_str(), rex::countof(ashmem_name));
+-  if (ioctl(ashmem_fd, ASHMEM_SET_NAME, ashmem_name) < 0 ||
+-      ioctl(ashmem_fd, ASHMEM_SET_SIZE, length) < 0) {
+-    close(ashmem_fd);
++  if (ftruncate64(fd, static_cast<off64_t>(length)) != 0) {
++    close(fd);
+     return kFileMappingHandleInvalid;
+   }
+-  return static_cast<FileMappingHandle>(ashmem_fd);
++  return static_cast<FileMappingHandle>(fd);
+ #else
+   int oflag;
+   switch (access) {
+diff --git a/src/core/seh_posix.cpp b/src/core/seh_posix.cpp
+index 5e0a932..cd75b74 100644
+--- a/src/core/seh_posix.cpp
++++ b/src/core/seh_posix.cpp
+@@ -13,12 +13,71 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+ 
+ #include <signal.h>
+ #include <cstdlib>  // std::abort()
++#if defined(__ANDROID__)
++#include <dlfcn.h>
++#include <ucontext.h>
++#include <unistd.h>
++#include <cstdio>
++#endif
+ 
+ #include <rex/platform/exceptions.h>
+ 
+ namespace rex::platform {
+ 
+ static thread_local SehThreadState tls_seh_state;
++
++// Handlers installed before seh_initialize (the runtime's guest-memory exception handler, ART's
++// signal chain and debuggerd on Android): faults outside SEH regions go to them.
++static struct sigaction g_previous[NSIG];
++
++static void ChainToPrevious(int sig, siginfo_t* info, void* ucontext) {
++  const struct sigaction& prev = g_previous[sig];
++  if (prev.sa_flags & SA_SIGINFO) {
++    if (prev.sa_sigaction) {
++      prev.sa_sigaction(sig, info, ucontext);
++      return;
++    }
++  } else if (prev.sa_handler != SIG_DFL && prev.sa_handler != SIG_IGN && prev.sa_handler) {
++    prev.sa_handler(sig);
++    return;
++  }
++#if defined(__ANDROID__) && defined(__aarch64__)
++  // Under ART the default action dies without a tombstone: report the fault on stderr first.
++  {
++    const mcontext_t& mc = static_cast<ucontext_t*>(ucontext)->uc_mcontext;
++    auto frame = [](const char* tag, uint64_t pc) {
++      Dl_info dl{};
++      if (dladdr(reinterpret_cast<void*>(pc), &dl) && dl.dli_fname) {
++        fprintf(stderr, "  %s %016llx %s+0x%llx %s\n", tag, (unsigned long long)pc, dl.dli_fname,
++                (unsigned long long)(pc - uint64_t(dl.dli_fbase)), dl.dli_sname ? dl.dli_sname : "");
++      } else {
++        fprintf(stderr, "  %s %016llx ?\n", tag, (unsigned long long)pc);
++      }
++    };
++    fprintf(stderr, "fatal signal %d, fault address %p, thread %d\n", sig, info ? info->si_addr : nullptr,
++            int(gettid()));
++    frame("pc", mc.pc);
++    frame("lr", mc.regs[30]);
++    for (int r = 0; r < 31; r += 4) {
++      fprintf(stderr, "  x%d %016llx %016llx %016llx %016llx\n", r, (unsigned long long)mc.regs[r],
++              (unsigned long long)mc.regs[r + 1], (unsigned long long)mc.regs[r + 2],
++              r + 3 < 31 ? (unsigned long long)mc.regs[r + 3] : 0ull);
++    }
++    uint64_t fp = mc.regs[29];
++    for (int i = 0; i < 40 && fp && (fp & 7) == 0; i++) {
++      uint64_t next = reinterpret_cast<uint64_t*>(fp)[0];
++      uint64_t ret = reinterpret_cast<uint64_t*>(fp)[1];
++      if (!ret) break;
++      frame("fp", ret);
++      if (next <= fp) break;
++      fp = next;
++    }
++    fflush(stderr);
++  }
++#endif
++  signal(sig, SIG_DFL);
++  raise(sig);
++}
+ static thread_local bool tls_seh_active = false;
+ 
+ SehThreadState& seh_thread_state() {
+@@ -31,12 +90,13 @@ int seh_filter(uint32_t /*code*/, void* /*ep*/) {
+ }
+ 
+ /// Signal handler for SIGSEGV/SIGBUS/SIGFPE/SIGILL
+-static void signal_handler(int sig, siginfo_t* info, void* /*ucontext*/) {
++static void signal_handler(int sig, siginfo_t* info, void* ucontext) {
+   // Only handle if we're in SEH-protected code
+   if (!tls_seh_active) {
+-    // Not in SEH region - restore default handler and re-raise
+-    signal(sig, SIG_DFL);
+-    raise(sig);
++    // Not in an SEH region: the previous handler decides (it may be a guest-memory access the
++    // runtime resolves). Resetting to SIG_DFL here killed the process silently, with no crash
++    // report, and bypassed the runtime's own handler.
++    ChainToPrevious(sig, info, ucontext);
+     return;
+   }
+ 
+@@ -110,10 +170,10 @@ void seh_initialize() {
+   sigemptyset(&sa.sa_mask);
+   sa.sa_flags = SA_SIGINFO | SA_NODEFER;  // SA_NODEFER allows re-entry for nested exceptions
+ 
+-  sigaction(SIGSEGV, &sa, nullptr);
+-  sigaction(SIGBUS, &sa, nullptr);
+-  sigaction(SIGFPE, &sa, nullptr);
+-  sigaction(SIGILL, &sa, nullptr);
++  sigaction(SIGSEGV, &sa, &g_previous[SIGSEGV]);
++  sigaction(SIGBUS, &sa, &g_previous[SIGBUS]);
++  sigaction(SIGFPE, &sa, &g_previous[SIGFPE]);
++  sigaction(SIGILL, &sa, &g_previous[SIGILL]);
+ }
+ 
+ bool& seh_active() {
 diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
-index 9ac8d15..07992ab 100644
+index 9ac8d15..4f692bc 100644
 --- a/src/core/threading_posix.cpp
 +++ b/src/core/threading_posix.cpp
-@@ -41,6 +41,10 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+@@ -41,15 +41,18 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
  #include <rex/thread/timer_queue.h>
  
  #include <sched.h>
@@ -590,8 +1115,10 @@ index 9ac8d15..07992ab 100644
 +#include <string>
  
  #if REX_PLATFORM_ANDROID
- #include <dlfcn.h>
-@@ -50,6 +54,8 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+-#include <dlfcn.h>
+-
+-#include <rex/main_android.h>
+ #include <rex/string.h>
  #endif
  
  #if REX_PLATFORM_LINUX
@@ -600,7 +1127,44 @@ index 9ac8d15..07992ab 100644
  // SIGEV_THREAD_ID in timer_create(...) is a Linux extension
  #define REX_HAS_SIGEV_THREAD_ID 1
  #ifdef __GLIBC__
-@@ -267,8 +273,33 @@ static sem_t* RexCreateAnonymousSemaphore() {
+@@ -65,30 +68,14 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+ namespace rex::thread {
+ 
+ #if REX_PLATFORM_ANDROID
+-// May be null if no dynamically loaded functions are required.
+-static void* android_libc_;
+-// API 26+.
+-static int (*android_pthread_getname_np_)(pthread_t pthread, char* buf, size_t n);
++// The port targets API 30+, where Bionic has pthread_getname_np (API 26+), so the pre-26 name
++// fallback below is never taken.
++static int (*android_pthread_getname_np_)(pthread_t pthread, char* buf,
++                                          size_t n) = pthread_getname_np;
+ 
+-void AndroidInitialize() {
+-  if (rex::GetAndroidApiLevel() >= 26) {
+-    android_libc_ = dlopen("libc.so", RTLD_NOW);
+-    assert_not_null(android_libc_);
+-    if (android_libc_) {
+-      android_pthread_getname_np_ = reinterpret_cast<decltype(android_pthread_getname_np_)>(
+-          dlsym(android_libc_, "pthread_getname_np"));
+-      assert_not_null(android_pthread_getname_np_);
+-    }
+-  }
+-}
++void AndroidInitialize() {}
+ 
+-void AndroidShutdown() {
+-  android_pthread_getname_np_ = nullptr;
+-  if (android_libc_) {
+-    dlclose(android_libc_);
+-    android_libc_ = nullptr;
+-  }
+-}
++void AndroidShutdown() {}
+ #endif
+ 
+ template <typename _Rep, typename _Period>
+@@ -267,10 +254,35 @@ static sem_t* RexCreateAnonymousSemaphore() {
  }
  #endif  // __APPLE__
  
@@ -632,9 +1196,21 @@ index 9ac8d15..07992ab 100644
 +  }
 +
    PosixConditionBase() {
- #if REX_PLATFORM_LINUX
+-#if REX_PLATFORM_LINUX
++#if REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID  // Bionic: no robust mutexes
      // Use robust mutexes so waits can recover if owner thread terminates.
-@@ -330,12 +361,28 @@ class PosixConditionBase {
+     pthread_mutexattr_t attr;
+     if (pthread_mutexattr_init(&attr) == 0) {
+@@ -290,7 +302,7 @@ class PosixConditionBase {
+   WaitResult Wait(std::chrono::milliseconds timeout) {
+     bool executed;
+     auto predicate = [this] { return this->signaled(); };
+-#if REX_PLATFORM_LINUX
++#if REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID  // Bionic: no robust mutexes
+     auto native_mutex = static_cast<pthread_mutex_t*>(mutex_.native_handle());
+     int lock_result = pthread_mutex_lock(native_mutex);
+     if (lock_result == EOWNERDEAD) {
+@@ -330,12 +342,28 @@ class PosixConditionBase {
        return std::make_pair(result, 0);
      }
  
@@ -663,7 +1239,16 @@ index 9ac8d15..07992ab 100644
        size_t first_signaled = std::numeric_limits<size_t>::max();
        bool condition_met = false;
        bool all_locked = true;
-@@ -411,6 +458,19 @@ class PosixConditionBase {
+@@ -344,7 +372,7 @@ class PosixConditionBase {
+       locks.reserve(handles.size());
+ 
+       for (size_t i = 0; i < handles.size(); ++i) {
+-#if REX_PLATFORM_LINUX
++#if REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID  // Bionic: no robust mutexes
+         auto native_mutex = static_cast<pthread_mutex_t*>(handles[i]->mutex_.native_handle());
+         int result = pthread_mutex_trylock(native_mutex);
+         if (result == 0 || result == EOWNERDEAD) {
+@@ -411,6 +439,19 @@ class PosixConditionBase {
          return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
        }
  
@@ -683,7 +1268,7 @@ index 9ac8d15..07992ab 100644
        if (timeout == std::chrono::milliseconds::max()) {
          std::this_thread::sleep_for(std::chrono::milliseconds(1));
        } else {
-@@ -418,6 +478,7 @@ class PosixConditionBase {
+@@ -418,6 +459,7 @@ class PosixConditionBase {
          auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
          std::this_thread::sleep_for(sleep_time);
        }
@@ -691,7 +1276,7 @@ index 9ac8d15..07992ab 100644
      }
    }
  
-@@ -450,6 +511,7 @@ class PosixCondition<Event> : public PosixConditionBase {
+@@ -450,6 +492,7 @@ class PosixCondition<Event> : public PosixConditionBase {
      auto lock = std::unique_lock<std::mutex>(mutex_);
      signal_ = true;
      cond_.notify_all();
@@ -699,7 +1284,7 @@ index 9ac8d15..07992ab 100644
      return true;
    }
  
-@@ -487,6 +549,7 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
+@@ -487,6 +530,7 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
      }
      count_ += release_count;
      cond_.notify_all();
@@ -707,7 +1292,7 @@ index 9ac8d15..07992ab 100644
      return true;
    }
  
-@@ -519,6 +582,7 @@ class PosixCondition<Mutant> : public PosixConditionBase {
+@@ -519,6 +563,7 @@ class PosixCondition<Mutant> : public PosixConditionBase {
        // Free to be acquired by another thread
        if (count_ == 0) {
          cond_.notify_all();
@@ -715,7 +1300,7 @@ index 9ac8d15..07992ab 100644
        }
        return true;
      }
-@@ -551,6 +615,7 @@ class PosixCondition<Timer> : public PosixConditionBase {
+@@ -551,6 +596,7 @@ class PosixCondition<Timer> : public PosixConditionBase {
      std::lock_guard<std::mutex> lock(mutex_);
      signal_ = true;
      cond_.notify_all();
@@ -723,7 +1308,7 @@ index 9ac8d15..07992ab 100644
      return true;
    }
  
-@@ -979,6 +1044,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -979,6 +1025,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
        exit_code_ = exit_code;
        signaled_ = true;
        cond_.notify_all();
@@ -731,7 +1316,7 @@ index 9ac8d15..07992ab 100644
      }
      if (is_current_thread) {
        pthread_exit(reinterpret_cast<void*>(exit_code));
-@@ -1405,6 +1471,14 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+@@ -1405,6 +1452,30 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
    }
  #endif
    set_current_thread_name("");
@@ -743,10 +1328,26 @@ index 9ac8d15..07992ab 100644
 +    if (qos) pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 +  }
 +#endif
++#if REX_PLATFORM_ANDROID
++  // Same problem on phones (big.LITTLE): the scheduler kept the title's threads on the little
++  // cores, about 3x slower for recompiled code. Keep them on the upper half of the CPU numbers
++  // (the mid and prime clusters). Opt in with REX_THREAD_BIG_CORES=1: with ~20 title threads on
++  // four cores the renderer competed for them (not yet measured on a cool phone).
++  {
++    static const bool big = getenv("REX_THREAD_BIG_CORES") && std::string(getenv("REX_THREAD_BIG_CORES")) == "1";
++    int n = int(sysconf(_SC_NPROCESSORS_CONF));
++    if (big && n >= 4) {
++      cpu_set_t set;
++      CPU_ZERO(&set);
++      for (int i = n / 2; i < n; i++) CPU_SET(i, &set);
++      sched_setaffinity(0, sizeof(set), &set);
++    }
++  }
++#endif
  
    auto start_data = static_cast<ThreadStartData*>(parameter);
    assert_not_null(start_data);
-@@ -1449,6 +1523,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+@@ -1449,6 +1520,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
      thread->handle_.exit_code_ = 0;
      thread->handle_.signaled_ = true;
      thread->handle_.cond_.notify_all();
@@ -1616,6 +2217,38 @@ index 813bb1c..bf17297 100644
    if (!assignment_) {
      return X_ERROR_DEVICE_NOT_CONNECTED;
    }
+diff --git a/src/input/sdl/sdl_input_driver.cpp b/src/input/sdl/sdl_input_driver.cpp
+index c7c440d..95eaccf 100644
+--- a/src/input/sdl/sdl_input_driver.cpp
++++ b/src/input/sdl/sdl_input_driver.cpp
+@@ -12,6 +12,8 @@
+ #include <array>
+ #include <filesystem>
+ 
++#include <atomic>
++#include <chrono>
+ #include <rex/assert.h>
+ #include <rex/chrono/clock.h>
+ #include <rex/cvar.h>
+@@ -669,7 +671,17 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
+ }
+ 
+ void SDLInputDriver::QueueControllerUpdate() {
+-  // Pump SDL events to ensure controller state is up to date.
++  // Pump SDL events to ensure controller state is up to date. Titles poll every pad several times
++  // a frame; pumping on each poll kept the UI thread busy (on Android a whole big core, mostly in
++  // SDL's joystick detection), so pump at most every 4 ms.
++  static std::atomic<int64_t> last_pump_ns{0};
++  const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
++                             std::chrono::steady_clock::now().time_since_epoch())
++                             .count();
++  if (now_ns - last_pump_ns.load(std::memory_order_relaxed) < 4000000) {
++    return;
++  }
++  last_pump_ns.store(now_ns, std::memory_order_relaxed);
+   bool is_queued = false;
+   sdl_pumpevents_queued_.compare_exchange_strong(is_queued, true);
+   if (!is_queued) {
 diff --git a/src/kernel/xam/xam_info.cpp b/src/kernel/xam/xam_info.cpp
 index 1fda053..fe2e5e3 100644
 --- a/src/kernel/xam/xam_info.cpp
@@ -1648,6 +2281,37 @@ index 1fda053..fe2e5e3 100644
    return X_STATUS_SUCCESS;
  }
  
+diff --git a/src/system/gpu_plugin_loader.cpp b/src/system/gpu_plugin_loader.cpp
+index 754fa13..b1006d6 100644
+--- a/src/system/gpu_plugin_loader.cpp
++++ b/src/system/gpu_plugin_loader.cpp
+@@ -22,6 +22,10 @@
+ #include <rex/platform.h>
+ #include <rex/platform/dynlib.h>
+ 
++#if REX_PLATFORM_ANDROID
++#include <dlfcn.h>
++#endif
++
+ namespace rex::system {
+ 
+ namespace {
+@@ -56,6 +60,15 @@ std::vector<platform::DynamicLibrary>& LoadedPlugins() {
+ 
+ std::unique_ptr<IGraphicsSystem> LoadGpuPlugin(std::string_view name, std::string_view backend) {
+   auto path = rex::filesystem::GetExecutableFolder() / PluginFileName(name);
++#if REX_PLATFORM_ANDROID
++  // The executable is app_process; plugins sit next to librexruntime.so in the app's lib dir.
++  {
++    Dl_info info{};
++    if (dladdr(reinterpret_cast<void*>(&LoadGpuPlugin), &info) && info.dli_fname) {
++      path = std::filesystem::path(info.dli_fname).parent_path() / PluginFileName(name);
++    }
++  }
++#endif
+   if (!std::filesystem::exists(path)) {
+     REXSYS_ERROR(
+         "GPU plugin '{}' not found at {}. Stage it next to the executable "
 diff --git a/src/system/xam/content_manager.cpp b/src/system/xam/content_manager.cpp
 index bd6c797..57d3f44 100644
 --- a/src/system/xam/content_manager.cpp
@@ -1683,6 +2347,47 @@ index c24fbd1..0663781 100644
    event_->Pulse();
    return 1;
  }
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index 76cc877..ff4ba63 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -13,7 +13,7 @@
+ #include <cstring>
+ #include <utility>
+ 
+-#if REX_PLATFORM_MAC
++#if REX_PLATFORM_MAC || REX_PLATFORM_ANDROID
+ #include <sys/mman.h>
+ #endif
+ 
+@@ -363,6 +363,27 @@ int Memory::MapViews(uint8_t* mapping_base) {
+   // 0xE0000000 4 KB offset is emulated via host_address_offset and on the CPU
+   // side if system allocation granularity is bigger than 4 KB.
+   uint64_t granularity_mask = ~uint64_t(system_allocation_granularity_ - 1);
++#if REX_PLATFORM_ANDROID
++  // The views are mapped with MAP_FIXED, which silently replaces whatever is already there. On a
++  // desktop the low 64 GB are empty, but on Android the GPU driver, Scudo and ART map there, and
++  // a replaced driver mapping faults forever (vkCreateSwapchainKHR spun in the fault handler).
++  // Reserve the whole span without replacing anything first; the views then replace only it.
++  {
++    uint64_t span = 0;
++    for (size_t n = 0; n < rex::countof(map_info); n++) {
++      span = std::max<uint64_t>(span, map_info[n].virtual_address_end + 1);
++    }
++    void* reserved = mmap(mapping_base, span, PROT_NONE,
++                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
++    if (reserved == MAP_FAILED) {
++      return 1;
++    }
++    if (reserved != mapping_base) {
++      munmap(reserved, span);
++      return 1;
++    }
++  }
++#endif
+   for (size_t n = 0; n < rex::countof(map_info); n++) {
+     views_.all_views[n] = reinterpret_cast<uint8_t*>(rex::memory::MapFileView(
+         mapping_, mapping_base + map_info[n].virtual_address_start,
 diff --git a/src/system/xobject.cpp b/src/system/xobject.cpp
 index d358f39..145de50 100644
 --- a/src/system/xobject.cpp
@@ -1806,6 +2511,173 @@ index db830e4..f053f2a 100644
    int32_t previous_count = 0;
    bool success = semaphore_->Release(release_count, &previous_count);
    if (out_previous_count) {
+diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
+index 5bd3dc5..adff0de 100644
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -68,6 +68,10 @@ if(WIN32)
+     set(REXUI_PLATFORM_SOURCES
+         surface_win.cpp
+     )
++elseif(ANDROID)
++    set(REXUI_PLATFORM_SOURCES
++        surface_android.cpp
++    )
+ elseif(APPLE)
+     set(REXUI_PLATFORM_SOURCES
+         surface_mac.cpp
+@@ -146,7 +150,9 @@ if(REXGLUE_USE_VULKAN)
+ endif()
+ 
+ # Platform-specific dependencies
+-if(UNIX AND NOT APPLE)
++if(ANDROID)
++    target_link_libraries(rexui PUBLIC android log)
++elseif(UNIX AND NOT APPLE)
+     find_package(PkgConfig REQUIRED)
+     pkg_check_modules(X11_XCB REQUIRED x11-xcb)
+     # Required, not optional: vulkan/api.h pulls in <wayland-client.h> on every
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index b94fe9e..b112566 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -46,6 +46,9 @@
+ #include <filesystem>
+ #include <string_view>
+ 
++REXCVAR_DEFINE_BOOL(window_presenter, true, "UI",
++                    "Attach the emulated GPU's presenter to the window (off when the title presents "
++                    "to the window with its own renderer)");
+ REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
+                       "GPU emulation plugin to load at startup (e.g. 'xenos'); empty disables "
+                       "GPU emulation")
+@@ -369,7 +372,11 @@ bool ReXApp::SetupPresentation() {
+         SetupOverlays(presenter, immediate_drawer_.get());
+       }
+     }
+-    window_->SetPresenter(presenter);
++    // A window has one surface on Android: a title that presents to the window itself (GTA V's
++    // native renderer under gpu_skip_rendering) needs the emulated presenter kept off it.
++    if (REXCVAR_GET(window_presenter)) {
++      window_->SetPresenter(presenter);
++    }
+   } else if (!graphics_system) {
+     // Detached mode: the app brings its own renderer and drives its own paint
+     // loop. ReXApp owns the returned drawer via immediate_drawer_.
+diff --git a/src/ui/surface_android.cpp b/src/ui/surface_android.cpp
+new file mode 100644
+index 0000000..913511e
+--- /dev/null
++++ b/src/ui/surface_android.cpp
+@@ -0,0 +1,28 @@
++/**
++ * @file        rex/ui/surface_android.cpp
++ * @brief       Android ANativeWindow surface
++ *
++ * @license     BSD 3-Clause License
++ *              See LICENSE file in the project root for full license text.
++ */
++
++#include <rex/ui/surface_android.h>
++
++#include <android/native_window.h>
++
++namespace rex {
++namespace ui {
++
++bool AndroidNativeWindowSurface::GetSizeImpl(uint32_t& width_out, uint32_t& height_out) const {
++  int width = ANativeWindow_getWidth(window_);
++  int height = ANativeWindow_getHeight(window_);
++  if (width <= 0 || height <= 0) {
++    return false;
++  }
++  width_out = uint32_t(width);
++  height_out = uint32_t(height);
++  return true;
++}
++
++}  // namespace ui
++}  // namespace rex
+diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
+index 2251429..f7aeaf0 100644
+--- a/src/ui/window_sdl.cpp
++++ b/src/ui/window_sdl.cpp
+@@ -35,6 +35,8 @@
+ #include <SDL3/SDL_metal.h>
+ 
+ #include <rex/ui/surface_mac.h>
++#elif REX_PLATFORM_ANDROID
++#include <rex/ui/surface_android.h>
+ #else
+ #include <X11/Xlib-xcb.h>
+ #include <rex/ui/surface_gnulinux.h>
+@@ -398,6 +400,14 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
+       SDL_Metal_DestroyView(metal_view);
+     }
+   }
++#elif REX_PLATFORM_ANDROID
++  if (allowed_types & Surface::kTypeFlag_AndroidNativeWindow) {
++    auto* native_window = static_cast<ANativeWindow*>(SDL_GetPointerProperty(
++        SDL_GetWindowProperties(sdl_window_), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr));
++    if (native_window) {
++      return std::make_unique<AndroidNativeWindowSurface>(native_window);
++    }
++  }
+ #else
+   SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window_);
+   if (allowed_types & Surface::kTypeFlag_WaylandSurface) {
+diff --git a/src/ui/windowed_app_context_sdl.cpp b/src/ui/windowed_app_context_sdl.cpp
+index dc0b4c2..5c7de33 100644
+--- a/src/ui/windowed_app_context_sdl.cpp
++++ b/src/ui/windowed_app_context_sdl.cpp
+@@ -9,6 +9,9 @@
+  *              See LICENSE file in the project root for full license text.
+  */
+ 
++#include <map>
++#include <string>
++#include <fmt/format.h>
+ #include <rex/ui/windowed_app_context_sdl.h>
+ 
+ #include <cstdlib>
+@@ -91,6 +94,21 @@ int SDLWindowedAppContext::RunMainMessageLoop() {
+       REXLOG_ERROR("SDL_WaitEvent failed: {}", SDL_GetError());
+       return EXIT_FAILURE;
+     }
++#if REX_PLATFORM_ANDROID
++    // Diagnostics: which events keep the UI thread awake (logged every 5 s).
++    {
++      static std::map<uint32_t, uint32_t> counts;
++      static uint64_t since = SDL_GetTicks();
++      counts[event.type]++;
++      if (SDL_GetTicks() - since > 5000) {
++        std::string line;
++        for (auto& [type, n] : counts) line += fmt::format(" {:X}:{}", type, n);
++        REXLOG_INFO("UI thread events in 5 s:{}", line);
++        counts.clear();
++        since = SDL_GetTicks();
++      }
++    }
++#endif
+     ProcessEvent(event);
+   }
+   return EXIT_SUCCESS;
+diff --git a/src/ui/windowed_app_main_sdl.cpp b/src/ui/windowed_app_main_sdl.cpp
+index 77bb1dc..61f94b0 100644
+--- a/src/ui/windowed_app_main_sdl.cpp
++++ b/src/ui/windowed_app_main_sdl.cpp
+@@ -22,6 +22,11 @@
+ #include <rex/ui/windowed_app.h>
+ #include <rex/ui/windowed_app_context_sdl.h>
+ 
++#if REX_PLATFORM_ANDROID
++// Renames main to SDL_main, which SDLActivity looks up in libmain.so and calls on its thread.
++#include <SDL3/SDL_main.h>
++#endif
++
+ #if REX_PLATFORM_WIN32
+ #ifndef WIN32_LEAN_AND_MEAN
+ #define WIN32_LEAN_AND_MEAN
 diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
 index f102b56..cf06f7a 100644
 --- a/thirdparty/CMakeLists.txt
@@ -1847,3 +2719,9 @@ index 0000000..b961317
 +#include "imgui_rex_config.h"
 +
 +thread_local ImGuiContext* RexImGuiContextTLS = nullptr;
+diff --git a/thirdparty/sdl3 b/thirdparty/sdl3
+--- a/thirdparty/sdl3
++++ b/thirdparty/sdl3
+@@ -1 +1 @@
+-Subproject commit 8bf3b7215ad9fc3deb583c6a3a37c6c67f2e24e4
++Subproject commit 8bf3b7215ad9fc3deb583c6a3a37c6c67f2e24e4-dirty

@@ -8,8 +8,7 @@ struct MemoryPush {
     uint Width;
     uint Height;
     uint PitchBlocks;    // row pitch in texels, aligned to 32 below
-    uint AddressLow;     // destination buffer device address
-    uint AddressHigh;
+    uint64_t Address;    // destination buffer device address (written as two 32-bit words, low first)
     uint BppLog2;        // 2 or 3
     uint Mode;           // packing (bits 0-7) | endian << 8 | linear (not tiled) << 16
 };
@@ -40,7 +39,7 @@ void CSResolveToMemory(uint3 id : SV_DispatchThreadID) {
     if (id.x >= g_Push.Width || id.y >= g_Push.Height)
         return;
     float4 v = g_Textures[g_Push.TextureIndex].Load(int3(id.xy, 0));
-    uint64_t address = (uint64_t(g_Push.AddressHigh) << 32) | g_Push.AddressLow;
+    uint64_t address = g_Push.Address;  // no 64-bit shift: Adreno's compiler asserts on those
     bool untiled = ((g_Push.Mode >> 16) & 1) != 0;
     address += untiled ? ((id.y * ((g_Push.PitchBlocks + 31) & ~31u) + id.x) << g_Push.BppLog2)
                       : TiledOffset2D(int(id.x), int(id.y), g_Push.PitchBlocks, g_Push.BppLog2);

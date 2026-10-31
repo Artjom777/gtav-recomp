@@ -82,7 +82,8 @@ const bool kInstalled = (SetUnhandledExceptionFilter(ReportCrash), true);
 
 #endif  // _WIN32
 
-#ifdef __linux__
+// Android: debuggerd already writes a tombstone with the native stack (adb logcat / bugreport).
+#if defined(__linux__) && !defined(__ANDROID__)
 
 #include <sys/prctl.h>
 
@@ -158,4 +159,4 @@ const bool kCrashReporter = (std::signal(SIGABRT, OnAbort), std::set_terminate(O
 
 }  // namespace
 
-#endif  // __linux__
+#endif  // __linux__ && !__ANDROID__

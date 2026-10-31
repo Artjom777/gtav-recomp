@@ -1,10 +1,8 @@
 // gtav - native renderer: settings menu (Dear ImGui draw lists). Uses the backend's pipeline
-// layout: texture heap in set 0, samplers in set 3. Vertices are read from the upload ring by
-// device address (ImDrawVert: float2 pos, float2 uv, RGBA8 colour = 20 bytes); the bound index
-// buffer supplies SV_VertexID.
+// layout: texture heap in set 0, samplers in set 3.
 
 struct PushConstants {
-    uint64_t Vertices;
+    uint2 Unused;        // formerly the vertex device address; kept so the layout stays 24 bytes
     uint TextureIndex;
     uint SamplerIndex;
     float2 InvHalfSize;  // 2 / display size
@@ -14,13 +12,13 @@ struct PushConstants {
 Texture2D<float4> g_Textures[] : register(t0, space0);
 SamplerState g_Samplers[] : register(s0, space3);
 
-void VSMenu(uint id : SV_VertexID, out float4 position : SV_Position, out float2 uv : TEXCOORD0,
-            out float4 color : COLOR0) {
-    uint64_t v = g_Push.Vertices + uint64_t(id) * 20;
-    float2 pos = vk::RawBufferLoad<float2>(v, 4);
-    uv = vk::RawBufferLoad<float2>(v + 8, 4);
-    uint c = vk::RawBufferLoad<uint>(v + 16, 4);
-    color = float4(c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF, c >> 24) / 255.0;
+// Vertices come in as an ordinary vertex buffer (ImDrawVert: float2 pos, float2 uv, RGBA8): no
+// device addresses or 64-bit integers, which Adreno's compiler mishandles (it crashed on them).
+void VSMenu([[vk::location(0)]] float2 pos : POSITION, [[vk::location(1)]] float2 uv_in : TEXCOORD0,
+            [[vk::location(2)]] float4 color_in : COLOR0, out float4 position : SV_Position,
+            out float2 uv : TEXCOORD0, out float4 color : COLOR0) {
+    uv = uv_in;
+    color = color_in;
     position = float4(pos * g_Push.InvHalfSize - 1.0, 0.0, 1.0);  // Vulkan: y = -1 is the top
 }
 

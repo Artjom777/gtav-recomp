@@ -1,4 +1,5 @@
 #include "menu.h"
+#include "touch_controls.h"
 
 #include "paths.h"
 
@@ -41,6 +42,9 @@ constexpr const char* kSettings[] = {
     "gtav_native_tile_penumbra_all",
     "gtav_native_async_pipelines",
     "gpu_skip_rendering_lag_ms",
+    "gtav_native_exact_cache",
+    "gtav_native_texture_recheck_frames",
+    "gtav_touch_controls",
 };
 
 std::filesystem::path SettingsPath() { return ExeDir() / "gtav_settings.ini"; }
@@ -66,7 +70,13 @@ constexpr const char* kSafeGpuLag = "6";
 constexpr const char* kFastGpuLag = "4";
 
 void ApplyPreset(bool best) {
+#ifdef __ANDROID__
+  // Phones: the per-pixel sun tiles cost no measurable fps (same-run A/B on an Adreno 730), and
+  // without them the game's per-tile shortcut shows gray 16x16 blocks at object edges.
+  SetBool("gtav_native_tile_penumbra_all", true);
+#else
   SetBool("gtav_native_tile_penumbra_all", best);
+#endif
   SetBool("gtav_native_async_pipelines", !best);
   rex::cvar::SetFlagByName("gpu_skip_rendering_lag_ms", best ? kSafeGpuLag : kFastGpuLag);
   if (!best) {
@@ -121,7 +131,7 @@ void Build(uint32_t fps, double frame_ms) {
   ImGui::SetNextWindowPos(ImVec2(40.0f * g_scale, 40.0f * g_scale), ImGuiCond_FirstUseEver);
   ImGui::SetNextWindowSize(ImVec2(520.0f * g_scale, 0.0f), ImGuiCond_FirstUseEver);
   bool open = true;
-  if (!ImGui::Begin("Settings (Esc to close)", &open, ImGuiWindowFlags_NoCollapse)) {
+  if (!ImGui::Begin("Settings (Esc / B to close)", &open, ImGuiWindowFlags_NoCollapse)) {
     ImGui::End();
     return;
   }
@@ -159,7 +169,7 @@ void Build(uint32_t fps, double frame_ms) {
   ImGui::TextUnformatted("Accuracy");
   check("Per-pixel sun shadows", "gtav_native_tile_penumbra_all",
         "On: every screen tile computes sun shadows per pixel (no blocky shadows or car reflections).\n"
-        "Off: the game's own per-tile shortcut, which goes blocky on this renderer.");
+        "Off: the game's own per-tile shortcut, which goes blocky on this renderer (gray 16x16 blocks).");
   check("Compile new effects in the background", "gtav_native_async_pipelines",
         "On: no hitch when a new effect first appears; it is skipped for a frame or two instead.\n"
         "Off: it is drawn from its first frame, with a short hitch while it is built.");
@@ -173,6 +183,24 @@ void Build(uint32_t fps, double frame_ms) {
       ImGui::SetTooltip("On: the emulated GPU trails the game by 2 ms instead of 6 (about 20%% more fps).\n"
                         "Off: the tested setting; with On, watch foliage and distant meshes while driving.");
   }
+  ImGui::Separator();
+  ImGui::TextUnformatted("Textures");
+  check("Exact texture checks", "gtav_native_exact_cache",
+        "On: every texture is fully re-checked each frame: no stale gray blocks, but more CPU time.\n"
+        "Off: large textures are spot-checked between full checks (faster).");
+  {
+    int frames = std::atoi(rex::cvar::GetFlagByName("gtav_native_texture_recheck_frames").c_str());
+    ImGui::SetNextItemWidth(200.0f * g_scale);
+    if (ImGui::SliderInt("Full re-check every N frames", &frames, 1, 30)) {
+      rex::cvar::SetFlagByName("gtav_native_texture_recheck_frames", std::to_string(frames));
+      changed = true;
+    }
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Lower: textures the game streams in show up sooner (fewer gray blocks), more CPU.");
+  }
+  ImGui::Separator();
+  check("Touch controls", "gtav_touch_controls", "The on-screen gamepad (hidden while a controller is connected).");
+  ImGui::TextDisabled("Controller: RB + Back opens/closes this menu; D-pad + A to change, B to close.");
   if (changed) SaveSettings();
   ImGui::End();
   if (!open) g_open = false;
@@ -187,6 +215,7 @@ void OnEscape() {
     g_input.clear();
   }
 }
+bool IsOpen() { return g_open.load(); }
 void OnMouseMove(float x, float y) { Push({Input::kMove, x, y}); }
 void OnMouseButton(int button, bool down) { Push({Input::kButton, 0, 0, button, down}); }
 void OnMouseWheel(float dy) { Push({Input::kWheel, 0, dy}); }
@@ -219,7 +248,8 @@ void LoadSettings() {
 }
 
 ImDrawData* Frame(uint32_t w, uint32_t h, uint32_t fps, double frame_ms) {
-  if (!g_open) return nullptr;
+  const bool touch_overlay = touch::Visible();
+  if (!g_open && !touch_overlay) return nullptr;
   EnsureContext(h);
   ImGuiContext* previous = ImGui::GetCurrentContext();
   ImGui::SetCurrentContext(g_context);
@@ -244,7 +274,8 @@ ImDrawData* Frame(uint32_t w, uint32_t h, uint32_t fps, double frame_ms) {
     io.Fonts->GetTexDataAsRGBA32(&pixels, &fw, &fh);
   }
   ImGui::NewFrame();
-  Build(fps, frame_ms);
+  if (g_open) Build(fps, frame_ms);
+  if (touch_overlay) touch::Draw(ImGui::GetForegroundDrawList(), float(w), float(h));
   ImGui::Render();
   ImDrawData* data = ImGui::GetDrawData();
   if (previous && previous != g_context) ImGui::SetCurrentContext(previous);

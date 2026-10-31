@@ -4,7 +4,11 @@
 
 #pragma once
 
+#include <rex/input/input_system.h>
 #include <rex/rex_app.h>
+
+#include "native/menu.h"
+#include "native/touch_controls.h"
 #include <rex/system/kernel_state.h>
 #include <rex/ui/presenter.h>
 #include <rex/runtime.h>
@@ -29,7 +33,14 @@ class GtavApp : public rex::ReXApp {
 
   // Override virtual hooks for customization:
   // void OnPostInitLogging() override {}
-  // void OnPreSetup(rex::RuntimeConfig& config) override {}
+  // Adds the on-screen gamepad (gtav_touch_controls) next to the SDK's pad and keyboard drivers.
+  void OnPreSetup(rex::RuntimeConfig& config) override {
+    config.input_factory = [](bool tool_mode) -> std::unique_ptr<rex::system::IInputSystem> {
+      auto input = rex::input::CreateDefaultInputSystem(tool_mode);
+      if (!tool_mode) input->AddDriver(gtav::native::touch::CreateDriver());
+      return input;
+    };
+  }
   // void OnLoadXexImage(std::string& xex_image) override {}
   // GTAV_DUMP_IMAGE=<path>: write the loaded (title-update patched) guest image and exit.
   // Used to rescan the patched code for entry points the analyzer misses.
@@ -46,6 +57,11 @@ class GtavApp : public rex::ReXApp {
   // GTAV_SHOT_DIR=<dir> [GTAV_SHOT_SECS=<n>, default 30]: every n seconds save the guest
   // output as <dir>/shot_<seconds>.ppm. For checking unattended boots (no screen capture needed).
   void OnPostSetup() override {
+#ifdef __ANDROID__
+    // The settings menu (controller: RB + Back) takes the pad while open: the game sees no input.
+    if (auto* input = static_cast<rex::input::InputSystem*>(runtime() ? runtime()->input_system() : nullptr))
+      input->SetActiveCallback([] { return !gtav::native::menu::IsOpen(); });
+#endif
     const char* dir = std::getenv("GTAV_SHOT_DIR");
     if (!dir) return;
     const char* secs_env = std::getenv("GTAV_SHOT_SECS");

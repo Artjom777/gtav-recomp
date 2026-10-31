@@ -14,6 +14,8 @@
 #include <windows.h>
 #elif defined(__APPLE__)
 #include <mach-o/dyld.h>
+#elif defined(__ANDROID__)
+#include <SDL3/SDL_system.h>
 #endif
 
 namespace gtav::native {
@@ -30,6 +32,11 @@ inline std::filesystem::path ExeDir() {
   std::error_code ec;
   auto exe = std::filesystem::canonical(buf, ec);
   return ec ? std::filesystem::path(buf).parent_path() : exe.parent_path();
+#elif defined(__ANDROID__)
+  // The process is app_process: use the app's external files dir (game data, spirv, logs),
+  // which adb can write. Only valid once SDL's Java side is up (not from static initializers).
+  const char* dir = SDL_GetAndroidExternalStoragePath();
+  return dir ? std::filesystem::path(dir) : std::filesystem::current_path();
 #else
   std::error_code ec;
   auto exe = std::filesystem::read_symlink("/proc/self/exe", ec);

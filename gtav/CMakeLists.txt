@@ -29,6 +29,14 @@ if(WIN32 AND TARGET rex::rexglue)
         IMPORTED_LOCATION_RELEASE "${_rex_prefix}/bin/rexgluerd.exe")
 endif()
 
+# Cross builds (Android): codegen runs on the build host, with the host SDK's rexglue tool.
+if(ANDROID AND TARGET rex::rexglue)
+    set(GTAV_HOST_REXGLUE "${CMAKE_CURRENT_SOURCE_DIR}/../rexglue-sdk/out/install/linux-amd64/bin/rexglue"
+        CACHE FILEPATH "Host rexglue binary used for codegen in cross builds")
+    set_target_properties(rex::rexglue PROPERTIES IMPORTED_LOCATION_RELEASE "${GTAV_HOST_REXGLUE}"
+                          IMPORTED_LOCATION "${GTAV_HOST_REXGLUE}")
+endif()
+
 # Sources
 set(GTAV_SOURCES
     src/main.cpp
@@ -48,10 +56,19 @@ set(GTAV_SOURCES
     src/native/textures.cpp
     src/native/write_watch.cpp
     src/native/shader_compiler.cpp
+    src/native/touch_controls.cpp
 )
 
 if(WIN32)
     add_executable(gtav WIN32 ${GTAV_SOURCES})
+elseif(ANDROID)
+    # Android: the game is libmain.so, which SDL's SDLActivity loads and whose SDL_main it calls
+    # (tools/android). A shared library exports the rex_skip_rendering_* hooks by default.
+    add_library(gtav SHARED ${GTAV_SOURCES})
+    set_target_properties(gtav PROPERTIES OUTPUT_NAME main)
+    target_link_libraries(gtav PRIVATE android log)
+    target_sources(gtav PRIVATE src/android_threads.cpp)
+    target_link_options(gtav PRIVATE -Wl,--wrap=pthread_create)
 else()
     add_executable(gtav ${GTAV_SOURCES})
     # The SDK's Vulkan command processor finds rex_skip_rendering_swap with dlsym.
@@ -117,6 +134,19 @@ if(UNIX AND NOT APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
             target_compile_options(${_gtav_target} PRIVATE -march=x86-64-v3)
         endif()
     endforeach()
+elseif(ANDROID)
+    # Phones: the SDK builds for baseline armv8-a. ARMv8.2 adds LSE atomics (one instruction
+    # instead of an LL/SC loop for every guest lwarx/stwcx. pair and host lock), RCpc and dot
+    # product: every Snapdragon 845 (2018) and newer core has them.
+    set(GTAV_ARM64_MARCH "armv8.2-a+lse+rcpc+dotprod" CACHE STRING "-march for the Android game code")
+    # The game is a shared library here (an executable elsewhere): every call between the ~100k
+    # recompiled functions went through the PLT (10% of the game's render thread). Bind them locally.
+    foreach(_gtav_target gtav gtav_recomp)
+        if(TARGET ${_gtav_target})
+            target_compile_options(${_gtav_target} PRIVATE -march=${GTAV_ARM64_MARCH} -fno-semantic-interposition)
+        endif()
+    endforeach()
+    target_link_options(gtav PRIVATE -Wl,-Bsymbolic-functions)
 elseif(WIN32 AND NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     # Windows: the SDK already uses the default code model; only the CPU level is added.
     option(GTAV_X86_64_V3 "Build the game code for x86-64-v3 CPUs (MOVBE, BMI2, AVX2)" ON)
@@ -271,14 +301,28 @@ add_custom_command(
     COMMAND ${CMAKE_COMMAND} -E echo "#include \"native_menu_ps.h\"" >> ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h
     DEPENDS ${GTAV_BLIT_HLSL} ${GTAV_RECTLIST_HLSL} ${GTAV_MEMORY_HLSL} ${GTAV_MENU_HLSL}
     VERBATIM)
-add_custom_target(gtav_native_shaders DEPENDS ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h)
+if(ANDROID)
+    # No shaderInt64 on Adreno: lower the 64-bit address math of the device-address shaders.
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_custom_command(OUTPUT ${GTAV_NATIVE_SHADER_DIR}/lowered.stamp
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../tools/android/lower_header.py
+                ${GTAV_NATIVE_SHADER_DIR}/native_resolve_memory_cs.h
+        COMMAND ${CMAKE_COMMAND} -E touch ${GTAV_NATIVE_SHADER_DIR}/lowered.stamp
+        DEPENDS ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/android/lower_int64.py
+        VERBATIM)
+    add_custom_target(gtav_native_shaders DEPENDS ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h
+                                                  ${GTAV_NATIVE_SHADER_DIR}/lowered.stamp)
+else()
+    add_custom_target(gtav_native_shaders DEPENDS ${GTAV_NATIVE_SHADER_DIR}/native_blit_shaders.h)
+endif()
 add_dependencies(gtav gtav_native_shaders)
 endif()
 target_include_directories(gtav PRIVATE ${GTAV_NATIVE_SHADER_DIR})
 
 # Background shader compiler tools (shader_compiler.cpp; build.cmd copies them on Windows):
 # <exe>/tools/XenosRecomp, dxc (a wrapper that sets the library path) and shader_common.h.
-if(NOT WIN32 AND NOT APPLE)
+if(NOT WIN32 AND NOT APPLE AND NOT ANDROID)
     set(GTAV_XR_BIN ${CMAKE_CURRENT_SOURCE_DIR}/../build/xenosrecomp/XenosRecomp/XenosRecomp CACHE FILEPATH
         "XenosRecomp binary for the background shader compiler")
     set(GTAV_TOOLS_DIR $<TARGET_FILE_DIR:gtav>/tools)

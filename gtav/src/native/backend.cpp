@@ -27,6 +27,8 @@
 #include "byteswap_simd.h"
 
 #include <algorithm>
+#include <map>
+#include <tuple>
 #include <chrono>
 #include <atomic>
 #include <condition_variable>
@@ -52,6 +54,16 @@ REXCVAR_DEFINE_INT32(gtav_native_dump_rt, 0x2D0, "GTAV",
                      "Frame dumps: EDRAM base of the color target snapshotted after every draw (0x2D0 = scene HDR)");
 REXCVAR_DEFINE_INT32(gtav_native_dump_rt_skip, 0, "GTAV",
                      "Frame dumps: skip this many draws into --gtav_native_dump_rt before the snapshots start");
+// Without a write watch (Android: kernel 5.10) large textures are spot-checked between full
+// checks; the game streaming new data into a texture showed as stale gray blocks for up to that
+// many frames while moving.
+#ifdef __ANDROID__
+REXCVAR_DEFINE_INT32(gtav_native_texture_recheck_frames, 4, "GTAV",
+                     "Frames between full re-checks of a large texture (spot checks in between)");
+#else
+REXCVAR_DEFINE_INT32(gtav_native_texture_recheck_frames, 30, "GTAV",
+                     "Frames between full re-checks of a large texture (spot checks in between)");
+#endif
 REXCVAR_DEFINE_BOOL(gtav_native_exact_cache, false, "GTAV",
                     "Check cached vertex/index buffers and textures with a full content hash every frame "
                     "(no sampled-hash shortcut for large ones)");
@@ -82,6 +94,11 @@ REXCVAR_DEFINE_INT32(gtav_native_texture_budget_mb, 1024, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_native_lightvol_keep, true, "GTAV",
                     "Light-volume stencil marks keep the stencil where the volume is behind the scene "
                     "(no holes in the clouds over the sky)");
+#ifdef __ANDROID__
+REXCVAR_DEFINE_BOOL(gtav_native_rect_gs, false, "GTAV", "Native renderer: expand rect lists with a geometry shader (else on the CPU)");
+#else
+REXCVAR_DEFINE_BOOL(gtav_native_rect_gs, true, "GTAV", "Native renderer: expand rect lists with a geometry shader (else on the CPU)");
+#endif
 REXCVAR_DEFINE_STRING(gtav_native_skip_vs, "", "GTAV", "Diagnostic: drop draws with these vertex shader hashes");
 REXCVAR_DEFINE_BOOL(gtav_native_slot_targets, false, "GTAV",
                     "Native renderer: separate render targets per frame in flight (frames overlap on the GPU)");
@@ -141,7 +158,11 @@ enum DiagMode : uint32_t { kDiagOff, kDiagDepthAlways, kDiagNoCull, kDiagFlat, k
 const char* const kDiagNames[kDiagModes] = {"off", "depth_always", "no_cull", "flat", "flat+depth_always"};
 std::atomic<uint32_t> g_diag_mode{kDiagOff};
 
+REXCVAR_DEFINE_INT32(gtav_native_diag_all, 0, "GTAV",
+                     "Diagnostic: apply this F11 mode to every draw (3 = flat pixel shader; for GPU-cost A/B)");
+
 uint32_t DiagFor(uint64_t vs_hash, uint64_t ps_hash) {
+  if (int32_t all = REXCVAR_GET(gtav_native_diag_all); all > 0 && all < int32_t(kDiagModes)) return uint32_t(all);
   uint32_t mode = g_diag_mode.load(std::memory_order_relaxed);
   if (mode == kDiagOff) return kDiagOff;
   static const std::string ps = std::getenv("GTAV_NATIVE_DIAG_PS") ? std::getenv("GTAV_NATIVE_DIAG_PS") : "";
@@ -1233,6 +1254,18 @@ struct Backend::Impl {
   RenderDevice* device = nullptr;
   std::unique_ptr<RenderDescriptorSet> texture_set, sampler_set;
   std::unique_ptr<RenderPipelineLayout> layout;
+#ifdef __ANDROID__
+  // Constant uniform-buffer sets (layout set 4), one per combination of upload-ring buffers the
+  // three constant blocks of a draw live in (almost always one chunk).
+  static constexpr uint32_t kConstantSet = 4;
+  RenderDescriptorSetBuilder ubo_builder;
+  std::map<std::tuple<const RenderBuffer*, const RenderBuffer*, const RenderBuffer*>,
+           std::unique_ptr<RenderDescriptorSet>>
+      ubo_sets;
+  RenderDescriptorSet* ConstantSet(const RenderBuffer* vs, const RenderBuffer* ps, const RenderBuffer* shared) {
+    return ConstantSetImpl(vs, ps, shared);
+  }
+#endif
   std::unique_ptr<RenderTexture> null_textures[3];
   std::unique_ptr<RenderTextureView> null_views[3];
   std::unique_ptr<RenderBuffer> zero_buffer;  // dummy vertex stream
@@ -1644,10 +1677,20 @@ struct Backend::Impl {
       desc.renderTargetCount = 1;
       desc.renderTargetFormat[0] = format;
       desc.renderTargetBlend[0] = RenderBlendDesc::AlphaBlend();
+      static const RenderInputElement elements[] = {
+          RenderInputElement("POSITION", 0, 0, RenderFormat::R32G32_FLOAT, 0, 0),
+          RenderInputElement("TEXCOORD", 0, 1, RenderFormat::R32G32_FLOAT, 0, 8),
+          RenderInputElement("COLOR", 0, 2, RenderFormat::R8G8B8A8_UNORM, 0, 16)};
+      static const RenderInputSlot slot(0, sizeof(ImDrawVert));
+      desc.inputElements = elements;
+      desc.inputElementsCount = 3;
+      desc.inputSlots = &slot;
+      desc.inputSlotsCount = 1;
       menu_pipeline = device->createGraphicsPipeline(desc);
       menu_format = format;
     }
     list->setGraphicsPipelineLayout(layout.get());
+    if (!menu_pipeline) return;  // the driver refused the menu shader
     list->setPipeline(menu_pipeline.get());
     list->setGraphicsDescriptorSet(texture_set.get(), 0);
     list->setGraphicsDescriptorSet(texture_set.get(), 1);
@@ -1664,6 +1707,10 @@ struct Backend::Impl {
                                  uint32_t(cl->IdxBuffer.Size) * sizeof(ImDrawIdx),
                                  sizeof(ImDrawIdx) == 2 ? RenderFormat::R16_UINT : RenderFormat::R32_UINT);
       list->setIndexBuffer(&view);
+      RenderVertexBufferView vview(RenderBufferReference(vtx.buffer, vtx.offset),
+                                   uint32_t(cl->VtxBuffer.Size) * sizeof(ImDrawVert));
+      RenderInputSlot vslot(0, sizeof(ImDrawVert));
+      list->setVertexBuffers(0, &vview, 1, &vslot);
       for (const ImDrawCmd& cmd : cl->CmdBuffer) {
         if (cmd.UserCallback) continue;
         ImVec2 lo(std::max(cmd.ClipRect.x - data->DisplayPos.x, 0.0f), std::max(cmd.ClipRect.y - data->DisplayPos.y, 0.0f));
@@ -1674,7 +1721,7 @@ struct Backend::Impl {
           uint64_t vertices;
           uint32_t texture, sampler;
           float inv_half[2];
-        } push{vtx.gpu, uint32_t(cmd.GetTexID()) ? uint32_t(cmd.GetTexID()) : menu_font_descriptor, blit_sampler,
+        } push{0, uint32_t(cmd.GetTexID()) ? uint32_t(cmd.GetTexID()) : menu_font_descriptor, blit_sampler,
                {2.0f / w, 2.0f / h}};
         list->setGraphicsPushConstants(0, &push, 0, sizeof(push));
         list->drawIndexedInstanced(cmd.ElemCount, 1, cmd.IdxOffset, int32_t(cmd.VtxOffset), 0);
@@ -1968,6 +2015,21 @@ struct Backend::Impl {
     bound_fb = nullptr;  // a barrier ends the render pass; rebind before the next draw
   }
 
+#ifdef __ANDROID__
+  RenderDescriptorSet* ConstantSetImpl(const RenderBuffer* vs, const RenderBuffer* ps, const RenderBuffer* shared) {
+    auto key = std::make_tuple(vs, ps, shared);
+    auto it = ubo_sets.find(key);
+    if (it != ubo_sets.end()) return it->second.get();
+    auto set = ubo_builder.create(device);
+    if (set) {
+      set->setBuffer(0, vs, kAluSize);
+      set->setBuffer(1, ps, kAluSize);
+      set->setBuffer(2, shared, kSharedConstantsSize);
+    }
+    return (ubo_sets[key] = std::move(set)).get();
+  }
+#endif
+
   bool fragment_barriers = true;  // --gtav_native_fragment_barriers (live)
 
   bool Init(RenderDevice* dev) {
@@ -1989,6 +2051,16 @@ struct Backend::Impl {
     set.end(true, kSamplerDescriptors);
     sampler_set = set.create(device);
     lb.addDescriptorSet(set);
+#ifdef __ANDROID__
+    // Set 4: the draw's constants as dynamic uniform buffers (tools/android/ubo_constants.py):
+    // VS ALU, PS ALU and shared constants, at the upload-ring offsets the push constants address.
+    ubo_builder.begin();
+    ubo_builder.addConstantBufferDynamic(0);
+    ubo_builder.addConstantBufferDynamic(1);
+    ubo_builder.addConstantBufferDynamic(2);
+    ubo_builder.end();
+    lb.addDescriptorSet(ubo_builder);
+#endif
     lb.addPushConstant(0, 4, 24, RenderShaderStageFlag::VERTEX | RenderShaderStageFlag::PIXEL);
     lb.end();
     layout = lb.create(device);
@@ -2030,6 +2102,9 @@ struct Backend::Impl {
                                        RenderShaderFormat::SPIRV);
     // Metal (MoltenVK) has no geometry shaders: rect lists are expanded on the CPU instead.
     rect_gs = device->getCapabilities().geometryShader;
+    // Adreno reports geometry shaders, but its compiler asserts on the rect-list one ("cast<Ty>()
+    // argument of incompatible type"): Android expands rect lists on the CPU by default.
+    if (!REXCVAR_GET(gtav_native_rect_gs)) rect_gs = false;
     if (!rect_gs) REXLOG_INFO("[native] no geometry shaders: rect lists expanded on the CPU");
     depth_ps = device->createShader(g_native_depth_ps, sizeof(g_native_depth_ps), "PSDepth", RenderShaderFormat::SPIRV);
     diag_flat_ps = device->createShader(g_native_diag_flat_ps, sizeof(g_native_diag_flat_ps), "PSDiagFlat",
@@ -2439,7 +2514,8 @@ struct Backend::Impl {
       t.checked_frame = frame;
       return t.descriptor;
     }
-    if (t.texture && t.bytes > kSmallTexture && frame - t.checked_frame < 30 &&
+    if (t.texture && t.bytes > kSmallTexture &&
+        frame - t.checked_frame < uint64_t(std::max(1, REXCVAR_GET(gtav_native_texture_recheck_frames))) &&
         !REXCVAR_GET(gtav_native_exact_cache)) {
       ScopedMs st{tprof.sampled_ms};
       tprof.sampled++;
@@ -3614,6 +3690,51 @@ struct Backend::Impl {
                                          : mem->TranslatePhysical(sb.address + sb.offset);
       uint64_t key = Hash(&sb, sizeof(sb), decl.stream_hash[s]);
       auto convert = [&](uint8_t* out) {
+        // Common case: every element is a plain byte swap (32-bit or 16-bit words) at the same
+        // offset in a stream of the same stride: one pass over the buffer with a per-word swap
+        // plan, instead of a strided pass per element (ConvertElement was ~20% of the render
+        // thread on a phone). All-32-bit streams take a straight NEON/SSE pass.
+        bool bulk = host_stride == stride && stride % 4 == 0 && stride <= 256;
+        bool all32 = true;
+        uint8_t plan[64];  // per 4-byte word of the vertex: 4 = bswap32, 2 = two bswap16, 0 = copy
+        for (uint32_t w = 0; w < stride / 4 && w < 64; w++) plan[w] = 0;
+        for (uint32_t n = 0; bulk && n < vl.element_count; n++) {
+          if (vl.elements[n].slotIndex != s) continue;
+          const auto& info = vl.info[n];
+          const auto& e = d.elements[vl.guest_index[n]];
+          bulk = !info.int_bits && !info.dec && (info.swap == 4 || info.swap == 2) &&
+                 info.guest_size == info.host_size && vl.host_offset[n] == e.offset && e.offset % 4 == 0 &&
+                 info.guest_size % 4 == 0 && e.offset + info.guest_size <= stride;
+          if (!bulk) break;
+          for (uint32_t w = e.offset / 4; w < (e.offset + info.guest_size) / 4; w++) plan[w] = uint8_t(info.swap);
+          all32 = all32 && info.swap == 4;
+        }
+        if (bulk && all32) {
+          size_t bytes = size_t(vertices) * stride, i = 0;
+          for (; i + 16 <= bytes; i += 16) Swap16Bytes(out + i, guest + i, 4);
+          for (; i + 4 <= bytes; i += 4) {
+            uint32_t x;
+            std::memcpy(&x, guest + i, 4);
+            x = __builtin_bswap32(x);
+            std::memcpy(out + i, &x, 4);
+          }
+          return;
+        }
+        if (bulk) {
+          const uint32_t words = stride / 4;
+          const uint8_t* src = guest;
+          uint8_t* dst = out;
+          for (uint32_t v = 0; v < vertices; v++, src += stride, dst += stride) {
+            for (uint32_t w = 0; w < words; w++) {
+              uint32_t x;
+              std::memcpy(&x, src + 4 * w, 4);
+              if (plan[w] == 4) x = __builtin_bswap32(x);
+              else if (plan[w] == 2) x = ((x & 0x00FF00FFu) << 8) | ((x >> 8) & 0x00FF00FFu);
+              std::memcpy(dst + 4 * w, &x, 4);
+            }
+          }
+          return;
+        }
         for (uint32_t n = 0; n < vl.element_count; n++) {
           if (vl.elements[n].slotIndex != s) continue;
           const auto& e = d.elements[vl.guest_index[n]];
@@ -3873,6 +3994,12 @@ struct Backend::Impl {
     std::memcpy(shared.cpu, shared_cpu, kSharedConstantsSize);
     uint64_t push[3] = {vsc.gpu, psc.gpu, shared.gpu};
     list->setGraphicsPushConstants(0, push, 0, sizeof(push));
+#ifdef __ANDROID__
+    if (RenderDescriptorSet* cs = ConstantSet(vsc.buffer, psc.buffer, shared.buffer)) {
+      const uint32_t offsets[3] = {uint32_t(vsc.offset), uint32_t(psc.offset), uint32_t(shared.offset)};
+      list->setGraphicsDescriptorSetDynamic(cs, kConstantSet, offsets, 3);
+    }
+#endif
     // Pipelines with several render targets declare one viewport per target.
     uint32_t w = count ? color[0]->width : depth->width, h = count ? color[0]->height : depth->height;
     uint32_t nvp = std::max(bind_count, 1u);

@@ -1,0 +1,33 @@
+diff --git a/src/events/SDL_events.c b/src/events/SDL_events.c
+index c909a2a..e7b2bc6 100644
+--- a/src/events/SDL_events.c
++++ b/src/events/SDL_events.c
+@@ -1149,6 +1149,7 @@ static int SDL_PeepEventsInternal(SDL_Event *events, int numevents, SDL_EventAct
+                                   Uint32 minType, Uint32 maxType, bool include_sentinel)
+ {
+     int i, used, sentinels_expected = 0;
++    bool wake = false;
+ 
+     // Lock the event queue
+     used = 0;
+@@ -1172,6 +1173,11 @@ static int SDL_PeepEventsInternal(SDL_Event *events, int numevents, SDL_EventAct
+             }
+             for (i = 0; i < numevents; ++i) {
+                 used += SDL_AddEvent(&events[i]);
++                // The poll sentinel is added by every pump: waking the waiter for it made the
++                // Android event wait spin (pump -> sentinel -> wake -> pump).
++                if (events[i].type != SDL_EVENT_POLL_SENTINEL) {
++                    wake = true;
++                }
+             }
+         } else {
+             SDL_EventEntry *entry, *next;
+@@ -1209,7 +1215,7 @@ static int SDL_PeepEventsInternal(SDL_Event *events, int numevents, SDL_EventAct
+     }
+     SDL_UnlockMutex(SDL_EventQ.lock);
+ 
+-    if (used > 0 && action == SDL_ADDEVENT) {
++    if (used > 0 && action == SDL_ADDEVENT && wake) {
+         SDL_SendWakeupEvent();
+     }
+ 

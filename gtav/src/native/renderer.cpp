@@ -75,6 +75,25 @@ extern bool g_exactBarrierStages;
 extern bool g_colorInputAttachments;
 }
 
+
+#ifdef __ANDROID__
+#include <sched.h>
+#include <unistd.h>
+// Phones mix core sizes (Snapdragon 8 Gen 1: 4 little, 3 mid, 1 prime). The scheduler kept moving
+// the renderer threads onto little cores, where recording a frame takes about 3x as long: keep
+// them on the cores of the top two clusters (the upper half of the CPU numbers).
+static void PinToBigCores() {
+  int n = int(sysconf(_SC_NPROCESSORS_CONF));
+  if (n < 4) return;
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  for (int i = n / 2; i < n; i++) CPU_SET(i, &set);
+  sched_setaffinity(0, sizeof(set), &set);
+}
+#else
+static void PinToBigCores() {}
+#endif
+
 namespace gtav::native {
 namespace {
 
@@ -95,7 +114,20 @@ const bool g_plume_input_attachments = (plume::g_colorInputAttachments = std::ge
 // frame is ever dropped: the game renders some textures once (static shadow-map caches, ...) and
 // reuses them for many frames, so a dropped frame lost them for good.
 constexpr size_t kMaxQueuedFrames = 2;
-constexpr uint32_t kSwapchainBuffers = 3;  // two frames in flight + one being presented
+// Two frames in flight + one being presented. Android lets an app hold only
+// (images - minImageCount + 1) images before presenting (minImageCount is 3 on Adreno), so it needs
+// more images or vkAcquireNextImageKHR blocks forever with frames still in flight.
+#ifdef __ANDROID__
+constexpr uint32_t kSwapchainBuffers = 5;
+#else
+constexpr uint32_t kSwapchainBuffers = 3;
+#endif
+// Android swap chains offer RGBA8 (not BGRA8) on most GPUs (Adreno, Mali).
+#ifdef __ANDROID__
+constexpr plume::RenderFormat kSwapchainFormat = plume::RenderFormat::R8G8B8A8_UNORM;
+#else
+constexpr plume::RenderFormat kSwapchainFormat = plume::RenderFormat::B8G8R8A8_UNORM;
+#endif
 
 class Renderer {
  public:
@@ -312,6 +344,36 @@ class Renderer {
   // the navigation keys.
   static void MenuInput(const SDL_Event* e) {
     switch (e->type) {
+      // Controller: RB + Back (View) opens or closes the menu (in either order); while it is
+      // open the D-pad moves, A activates and B closes.
+      case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+      case SDL_EVENT_GAMEPAD_BUTTON_UP: {
+        static bool rb = false, back = false;
+        const bool down = e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
+        const auto button = SDL_GamepadButton(e->gbutton.button);
+        if (button == SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER || button == SDL_GAMEPAD_BUTTON_BACK) {
+          bool& held = button == SDL_GAMEPAD_BUTTON_BACK ? back : rb;
+          if (down && !held && (button == SDL_GAMEPAD_BUTTON_BACK ? rb : back)) menu::OnEscape();
+          held = down;
+          break;
+        }
+        if (!menu::IsOpen()) break;
+        if (button == SDL_GAMEPAD_BUTTON_EAST) {
+          if (down) menu::OnEscape();
+          break;
+        }
+        menu::Key key;
+        switch (button) {
+          case SDL_GAMEPAD_BUTTON_DPAD_UP: key = menu::Key::kUp; break;
+          case SDL_GAMEPAD_BUTTON_DPAD_DOWN: key = menu::Key::kDown; break;
+          case SDL_GAMEPAD_BUTTON_DPAD_LEFT: key = menu::Key::kLeft; break;
+          case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: key = menu::Key::kRight; break;
+          case SDL_GAMEPAD_BUTTON_SOUTH: key = menu::Key::kSpace; break;
+          default: return;
+        }
+        menu::OnKey(key, down);
+        break;
+      }
       case SDL_EVENT_MOUSE_MOTION: menu::OnMouseMove(e->motion.x, e->motion.y); break;
       case SDL_EVENT_MOUSE_BUTTON_DOWN:
       case SDL_EVENT_MOUSE_BUTTON_UP: {
@@ -341,6 +403,11 @@ class Renderer {
 #endif
 
   bool Init() {
+#ifdef __ANDROID__
+    // Plume reports its Vulkan failures on stderr, which Android discards.
+    std::freopen((ExeDir() / "logs" / "stderr.txt").string().c_str(), "w", stderr);
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+#endif
 #ifdef _WIN32
     if (!CreateNativeWindow()) return false;
 #else
@@ -357,9 +424,28 @@ class Renderer {
               SDL_free(windows);
             }
           }
+#ifdef __ANDROID__
+          // Android has one window (SDLActivity's surface): reuse the SDK's if it made one.
+          {
+            int count = 0;
+            if (SDL_Window** windows = SDL_GetWindows(&count)) {
+              if (count > 0) r->window_ = windows[0];
+              SDL_free(windows);
+            }
+          }
+          if (!r->window_) {
+            r->window_ = SDL_CreateWindow("GTA V", 0, 0, SDL_WINDOW_VULKAN | SDL_WINDOW_FULLSCREEN);
+          }
+          if (r->window_) {
+            SDL_ShowWindow(r->window_);
+            r->render_window_ = static_cast<ANativeWindow*>(SDL_GetPointerProperty(
+                SDL_GetWindowProperties(r->window_), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr));
+          }
+#else
           r->window_ = SDL_CreateWindow(on ? "GTA V" : "GTA V - native renderer (shadow)", 1280, 720,
                                         SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE |
                                             (REXCVAR_GET(gtav_native_hidden) ? SDL_WINDOW_HIDDEN : 0));
+#endif
 #ifdef __APPLE__
           // Plume's Vulkan backend (MoltenVK) on macOS takes the NSWindow and a CAMetalLayer.
           if (r->window_) {
@@ -379,7 +465,8 @@ class Renderer {
                   // M as well: no fn key needed on Mac laptops, and no pad button uses it (mnk_mode).
                   if (e->key.scancode == SDL_SCANCODE_F10 || e->key.scancode == SDL_SCANCODE_M) key_shot_ = true;
                   if (e->key.scancode == SDL_SCANCODE_F11) CycleDiagMode();
-                  if (e->key.scancode == SDL_SCANCODE_ESCAPE) menu::OnEscape();
+                  // Android's Back button arrives as AC_BACK: it opens the settings menu too.
+                  if (e->key.scancode == SDL_SCANCODE_ESCAPE || e->key.scancode == SDL_SCANCODE_AC_BACK) menu::OnEscape();
                 }
                 MenuInput(e);
                 return true;
@@ -410,17 +497,24 @@ class Renderer {
       return false;
     }
     REXLOG_INFO("[native] using {}", device_->getDescription().name);
+    {
+      const auto& caps = device_->getCapabilities();
+      REXLOG_INFO("[native] device caps: geometry shader {}, descriptor indexing {}, scalar layout {}, "
+                  "buffer device address {}, present wait {}",
+                  caps.geometryShader, caps.descriptorIndexing, caps.scalarBlockLayout,
+                  caps.bufferDeviceAddress, caps.presentWait);
+    }
     queue_cmd_ = device_->createCommandQueue(plume::RenderCommandListType::DIRECT);
     // Init steps are logged: a cold first boot after a rebuild sometimes never got past here.
     REXLOG_INFO("[native] init: queue created, creating the swap chain");
     swapchain_ = queue_cmd_->createSwapChain(
         plume::RenderSwapChainDesc(
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__ANDROID__)
             render_window_,
 #else
             window_,
 #endif
-            plume::RenderFormat::B8G8R8A8_UNORM, kSwapchainBuffers));
+            kSwapchainFormat, kSwapchainBuffers));
     menu::LoadSettings();
     vsync_ = REXCVAR_GET(gtav_native_vsync);
     swapchain_->setVsyncEnabled(vsync_);
@@ -704,6 +798,7 @@ class Renderer {
 
    private:
     void Run() {
+      PinToBigCores();
 #if defined(__APPLE__)
       pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);  // keep it on the performance cores
 #endif
@@ -846,7 +941,11 @@ class Renderer {
     }
     uint32_t front_descriptor = 0;
     auto record_start = std::chrono::steady_clock::now();
-    plume::RenderTexture* front = backend_ok_ ? backend_.Execute(frame, list_, &front_descriptor) : nullptr;
+    // GTAV_NATIVE_NO_BACKEND=1: present only a clear (bisects GPU hangs between the game's frame
+    // and the swap chain path).
+    static const bool no_backend = std::getenv("GTAV_NATIVE_NO_BACKEND") != nullptr;
+    plume::RenderTexture* front =
+        backend_ok_ && !no_backend ? backend_.Execute(frame, list_, &front_descriptor) : nullptr;
     // The frame's rendering goes to the GPU now, in a command buffer of its own; only the copy
     // into the window waits for a drawable. As one submission, the whole frame waited for the
     // swap chain image (MoltenVK: ~4 ms of GPU idle per frame on the M1).
@@ -935,7 +1034,19 @@ class Renderer {
     }
     if (key_replay_.exchange(false)) WriteReplay(frame.index);
     if (front) {
-      backend_.Blit(list_, front_descriptor, plume::RenderFormat::B8G8R8A8_UNORM);
+#ifdef __ANDROID__
+      // Phone screens are wider than 16:9: keep the game's aspect ratio with black bars.
+      {
+        float fw = float(w), fh = float(h), vw = fw, vh = fh;
+        if (fw * 9.0f > fh * 16.0f) vw = fh * 16.0f / 9.0f; else vh = fw * 9.0f / 16.0f;
+        list_->clearColor(0, plume::RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
+        list_->setViewports(plume::RenderViewport((fw - vw) * 0.5f, (fh - vh) * 0.5f, vw, vh));
+      }
+#endif
+      backend_.Blit(list_, front_descriptor, kSwapchainFormat);
+#ifdef __ANDROID__
+      list_->setViewports(plume::RenderViewport(0, 0, float(w), float(h)));
+#endif
     } else {
       list_->clearColor(0, plume::RenderColor(0.12f, 0.0f, 0.12f, 1.0f));
     }
@@ -949,11 +1060,11 @@ class Renderer {
       fps_since_ = now;
     }
     if (backend_ok_ && REXCVAR_GET(gtav_native_fps))
-      backend_.DrawCounter(list_, fps_value_, 8, 8, std::max(1u, h / 720), plume::RenderFormat::B8G8R8A8_UNORM);
+      backend_.DrawCounter(list_, fps_value_, 8, 8, std::max(1u, h / 720), kSwapchainFormat);
     if (backend_ok_) {
       double frame_ms = fps_value_ ? 1000.0 / fps_value_ : 0.0;
       if (ImDrawData* menu_data = menu::Frame(w, h, fps_value_, frame_ms))
-        backend_.DrawMenu(list_, menu_data, plume::RenderFormat::B8G8R8A8_UNORM);
+        backend_.DrawMenu(list_, menu_data, kSwapchainFormat);
     }
     list_->barriers(plume::RenderBarrierStage::NONE,
                     plume::RenderTextureBarrier(target, plume::RenderTextureLayout::PRESENT));
@@ -1103,6 +1214,7 @@ class Renderer {
   }
 
   void ThreadMain() {
+    PinToBigCores();
 #if defined(__APPLE__)
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);  // keep it on the performance cores
 #endif
@@ -1268,6 +1380,8 @@ class Renderer {
 #ifdef __APPLE__
   SDL_MetalView metal_view_ = nullptr;
   plume::RenderWindow render_window_ = {};
+#elif defined(__ANDROID__)
+  plume::RenderWindow render_window_ = nullptr;  // ANativeWindow* of SDLActivity's surface
 #endif
 #endif
   std::unique_ptr<plume::RenderInterface> interface_;

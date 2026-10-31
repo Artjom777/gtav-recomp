@@ -12,6 +12,7 @@ namespace gtav::native::menu {
 
 // Window thread. Coordinates are window pixels; buttons 0 left, 1 right, 2 middle.
 void OnEscape();
+bool IsOpen();
 void OnMouseMove(float x, float y);
 void OnMouseButton(int button, bool down);
 void OnMouseWheel(float dy);
