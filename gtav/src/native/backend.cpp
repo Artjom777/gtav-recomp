@@ -154,9 +154,6 @@ REXCVAR_DEFINE_BOOL(gtav_native_point_float32, GTAV_POINT_FLOAT32_DEFAULT, "GTAV
 REXCVAR_DEFINE_DOUBLE(gtav_native_render_scale, GTAV_RENDER_SCALE_DEFAULT, "GTAV",
                       "Native renderer: render the full-width (1280) targets at this fraction of their size "
                       "(0.5-1; read at start). Needs SPIR-V made with the pixel scale constant (make_spirv.sh)");
-REXCVAR_DEFINE_DOUBLE(gtav_native_fetch_rounding, 1.5 / 1024.0, "GTAV",
-                      "Native renderer: texels added to texture fetch coordinates (Xbox tie-breaking on texel "
-                      "edges; shaders made with the live rounding constant read it)");
 REXCVAR_DEFINE_BOOL(gtav_native_zero_new_targets, true, "GTAV",
                     "Native renderer: new render targets and resolve destinations start zeroed (Adreno hands out "
                     "recycled memory: grey blocks where the game never writes)");
@@ -4094,10 +4091,6 @@ struct Backend::Impl {
       vp = RenderViewport(0, 0, float(tw), float(th), vp.minDepth, vp.maxDepth);
     }
     std::memcpy(&sc[134], ndc, sizeof(ndc));
-    // g_FetchRounding (624): texels added to every fetch so coordinates on a texel edge pick the
-    // texel the Xbox picks (shader_common.h XENOS_FETCH_ROUNDING).
-    const float rounding = float(REXCVAR_GET(gtav_native_fetch_rounding));
-    std::memcpy(&sc[156], &rounding, 4);
     // g_HalfPixelOffset at 520: with D3D9 pixel centres (PA_SU_VTX_CNTL.pix_center == 0) the guest
     // samples attributes at integer window positions, the host at .5; shift geometry by half a
     // pixel like the SDK. Without it every screen-space pass reads one source texel too far
