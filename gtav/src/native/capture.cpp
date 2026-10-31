@@ -79,7 +79,13 @@ REXCVAR_DEFINE_INT32(gtav_native_fence_lag, 0, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_native_fence_wait, GTAV_FENCE_WAIT_DEFAULT, "GTAV",
                     "The command processor waits at a GPU fence until the renderer recorded the draws before "
                     "it (textures too) when their frame is complete, instead of copying their vertex data");
-REXCVAR_DEFINE_INT32(gtav_native_fence_wait_ms, 100, "GTAV",
+// The phone records slowly enough that 100 ms timed out every few frames (slab flicker).
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+#define GTAV_FENCE_WAIT_MS_DEFAULT 1000
+#else
+#define GTAV_FENCE_WAIT_MS_DEFAULT 100
+#endif
+REXCVAR_DEFINE_INT32(gtav_native_fence_wait_ms, GTAV_FENCE_WAIT_MS_DEFAULT, "GTAV",
                      "Longest wait of the command processor at a GPU fence for the renderer (then it copies, "
                      "or gives up for the frame being recorded; Mac: stalls past 100 ms left one-frame slabs)");
 REXCVAR_DEFINE_BOOL(gtav_native_fence_wait_draw, false, "GTAV",
@@ -99,14 +105,6 @@ REXCVAR_DEFINE_BOOL(gtav_native_pm4_scan, false, "GTAV",
 REXCVAR_DEFINE_INT32(gtav_native_layout_probe, 0, "GTAV",
                      "Log objects and register shadow for the first draws of this guest frame");
 
-#if defined(__APPLE__) && TARGET_OS_IPHONE
-#define GTAV_FENCE_WAIT_MS_DEFAULT 1000  // the phone records slowly: 100 ms timed out every few frames
-#else
-#define GTAV_FENCE_WAIT_MS_DEFAULT 100
-#endif
-REXCVAR_DEFINE_INT32(gtav_native_fence_wait_ms, GTAV_FENCE_WAIT_MS_DEFAULT, "GTAV",
-                     "Native renderer: longest wait of the game at a GPU fence for the renderer (a timeout lets the "
-                     "game reuse memory a queued frame still reads: one-frame slabs)");
 
 namespace gtav::native {
 namespace {

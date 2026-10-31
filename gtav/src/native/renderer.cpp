@@ -1155,7 +1155,7 @@ class Renderer {
     }
     if (key_replay_.exchange(false)) WriteReplay(frame.index);
     if (front) {
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
       // Phone screens are wider than 16:9: keep the game's aspect ratio with black bars.
       {
         float fw = float(w), fh = float(h), vw = fw, vh = fh;
@@ -1165,7 +1165,7 @@ class Renderer {
       }
 #endif
       backend_.Blit(list_, front_descriptor, kSwapchainFormat);
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
       list_->setViewports(plume::RenderViewport(0, 0, float(w), float(h)));
 #endif
     } else {

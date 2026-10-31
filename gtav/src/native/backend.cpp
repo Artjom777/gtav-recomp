@@ -49,6 +49,15 @@
 #include <unordered_set>
 #include <bit>
 #include <set>
+// Phones (Android, iOS): the settings and paths measured on the Android port.
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
+#define GTAV_MOBILE 1
+#else
+#define GTAV_MOBILE 0
+#endif
 #ifdef __ANDROID__
 #include <sched.h>
 #include <unistd.h>
@@ -64,7 +73,7 @@ REXCVAR_DEFINE_INT32(gtav_native_dump_rt_skip, 0, "GTAV",
 // Without a write watch (Android: kernel 5.10) large textures are spot-checked between full
 // checks; the game streaming new data into a texture showed as stale gray blocks for up to that
 // many frames while moving.
-#ifdef __ANDROID__
+#if GTAV_MOBILE
 REXCVAR_DEFINE_INT32(gtav_native_texture_recheck_frames, 4, "GTAV",
                      "Frames between full re-checks of a large texture (spot checks in between)");
 #else
@@ -132,7 +141,7 @@ REXCVAR_DEFINE_BOOL(gtav_native_defer_writebacks, true, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_native_skip_depth_restore, true, "GTAV",
                     "Native renderer: skip GTA V's depth restore strips (EDRAM aliasing trick; native "
                     "depth targets keep their contents)");
-#ifdef __ANDROID__
+#if GTAV_MOBILE
 #define GTAV_DRAW_CLEARS_DEFAULT false  // vkCmdClearAttachments can become a load op (gtav_native_load_clears)
 #else
 #define GTAV_DRAW_CLEARS_DEFAULT true
@@ -1486,7 +1495,7 @@ struct Backend::Impl {
   RenderDevice* device = nullptr;
   std::unique_ptr<RenderDescriptorSet> texture_set, sampler_set;
   std::unique_ptr<RenderPipelineLayout> layout;
-#ifdef __ANDROID__
+#if GTAV_MOBILE
   // Constant uniform-buffer sets (layout set 4), one per combination of upload-ring buffers the
   // three constant blocks of a draw live in (almost always one chunk).
   static constexpr uint32_t kConstantSet = 4;
@@ -2274,7 +2283,7 @@ struct Backend::Impl {
     bound_fb = nullptr;  // a barrier ends the render pass; rebind before the next draw
   }
 
-#ifdef __ANDROID__
+#if GTAV_MOBILE
   RenderDescriptorSet* ConstantSetImpl(const RenderBuffer* vs, const RenderBuffer* ps, const RenderBuffer* shared) {
     auto key = std::make_tuple(vs, ps, shared);
     auto it = ubo_sets.find(key);
@@ -2310,7 +2319,7 @@ struct Backend::Impl {
     set.end(true, kSamplerDescriptors);
     sampler_set = set.create(device);
     lb.addDescriptorSet(set);
-#ifdef __ANDROID__
+#if GTAV_MOBILE
     // Set 4: the draw's constants as dynamic uniform buffers (tools/android/ubo_constants.py):
     // VS ALU, PS ALU and shared constants, at the upload-ring offsets the push constants address.
     ubo_builder.begin();
@@ -4348,7 +4357,7 @@ struct Backend::Impl {
     std::memcpy(shared.cpu, shared_cpu, kSharedConstantsSize);
     uint64_t push[3] = {vsc.gpu, psc.gpu, shared.gpu};
     list->setGraphicsPushConstants(0, push, 0, sizeof(push));
-#ifdef __ANDROID__
+#if GTAV_MOBILE
     if (RenderDescriptorSet* cs = ConstantSet(vsc.buffer, psc.buffer, shared.buffer)) {
       const uint32_t offsets[3] = {uint32_t(vsc.offset), uint32_t(psc.offset), uint32_t(shared.offset)};
       list->setGraphicsDescriptorSetDynamic(cs, kConstantSet, offsets, 3);
