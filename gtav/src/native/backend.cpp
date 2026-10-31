@@ -97,6 +97,9 @@ REXCVAR_DEFINE_BOOL(gtav_native_defer_writebacks, true, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_native_skip_depth_restore, true, "GTAV",
                     "Native renderer: skip GTA V's depth restore strips (EDRAM aliasing trick; native "
                     "depth targets keep their contents)");
+REXCVAR_DEFINE_BOOL(gtav_native_draw_clears, true, "GTAV",
+                    "Native renderer: colour clears as draws instead of vkCmdClearAttachments (MoltenVK restarts "
+                    "the Metal render pass for a clear at its start)");
 REXCVAR_DEFINE_BOOL(gtav_native_fragment_barriers, true, "GTAV",
                     "Native renderer: render target transitions wait at the fragment stage only");
 REXCVAR_DEFINE_INT32(gtav_native_skip_resolves, 0, "GTAV",
@@ -2149,6 +2152,11 @@ struct Backend::Impl {
                        fetch_ps[3];
       REXLOG_INFO("[native] in-pass colour resolves: {}", fetch_resolves ? "on" : "unavailable");
     }
+    {  // ClearAttachment: colour clears as draws (see native_clear.frag), in the draws' layout
+      clear_vs = device->createShader(g_native_resolve_fetch_vs, sizeof(g_native_resolve_fetch_vs), "main",
+                                      RenderShaderFormat::SPIRV);
+      clear_ps = device->createShader(g_native_clear_ps, sizeof(g_native_clear_ps), "main", RenderShaderFormat::SPIRV);
+    }
     RenderGraphicsPipelineDesc dc;
     dc.pipelineLayout = layout.get();
     dc.vertexShader = blit_vs.get();
@@ -2625,9 +2633,87 @@ struct Backend::Impl {
     for (uint32_t i = 0; i < count && !pending_clears.empty(); i++) {
       auto it = pending_clears.find(color[i]);
       if (it == pending_clears.end()) continue;
-      for (const auto& c : it->second) list->clearColor(i, c.color, &c.rect, 1);
+      for (const auto& c : it->second) ClearAttachment(list, i, c.color, &c.rect, 1);
       pending_clears.erase(it);
     }
+  }
+
+  // Colour clear of bound attachment `index` as a draw (--gtav_native_draw_clears): MoltenVK turned a
+  // vkCmdClearAttachments at the start of a render pass into a restart of the Metal render pass with
+  // clear load actions, an extra encoder (~16 us of GPU gap) per clear, ~30 a frame.
+  std::unique_ptr<RenderShader> clear_vs, clear_ps;
+  std::unordered_map<uint64_t, std::unique_ptr<RenderPipeline>> clear_pipelines;
+  uint32_t stat_draw_clears = 0;
+  void ClearAttachment(RenderCommandList* list, uint32_t index, const RenderColor& color, const RenderRect* rects,
+                       uint32_t count) {
+    RenderTarget* t = index < 4 ? bound_color[index] : nullptr;
+    if (!REXCVAR_GET(gtav_native_draw_clears) || !clear_vs || !clear_ps || !bound_fb || !t ||
+        dumping) {
+      list->clearColor(index, color, rects, count);
+      return;
+    }
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < 4; i++)
+      if (bound_color[i]) n = i + 1;
+    struct {
+      RenderFormat formats[4];
+      RenderFormat depth;
+      uint32_t count, index, samples;
+    } key{};
+    for (uint32_t i = 0; i < n; i++) key.formats[i] = bound_color[i] ? bound_color[i]->format : RenderFormat::UNKNOWN;
+    key.depth = bound_depth ? bound_depth->format : RenderFormat::UNKNOWN;
+    key.count = n;
+    key.index = index;
+    key.samples = bound_color[0] ? bound_color[0]->msaa : 0;
+    auto& pipeline = clear_pipelines[Hash(&key, sizeof(key))];
+    if (!pipeline) {
+      RenderGraphicsPipelineDesc desc;
+      desc.pipelineLayout = layout.get();  // the draws' layout: their descriptor sets stay bound
+      desc.vertexShader = clear_vs.get();
+      desc.pixelShader = clear_ps.get();
+      desc.renderTargetCount = n;
+      for (uint32_t i = 0; i < n; i++) {
+        desc.renderTargetFormat[i] = key.formats[i];
+        desc.renderTargetBlend[i] = RenderBlendDesc::Copy();
+        if (i != index) desc.renderTargetBlend[i].renderTargetWriteMask = 0;
+      }
+      desc.depthTargetFormat = key.depth;
+      desc.multisampling = RenderMultisampling(SampleCount(key.samples));
+      pipeline = device->createGraphicsPipeline(desc);
+      if (!pipeline) {
+        list->clearColor(index, color, rects, count);
+        return;
+      }
+    }
+    auto& ds = draw_state;
+    if (!ds.sets) {
+      list->setGraphicsPipelineLayout(layout.get());
+      list->setGraphicsDescriptorSet(texture_set.get(), 0);
+      list->setGraphicsDescriptorSet(texture_set.get(), 1);
+      list->setGraphicsDescriptorSet(texture_set.get(), 2);
+      list->setGraphicsDescriptorSet(sampler_set.get(), 3);
+      ds.sets = true;
+    }
+    list->setPipeline(pipeline.get());
+    const float push[4] = {color.r, color.g, color.b, color.a};
+    list->setGraphicsPushConstants(0, push, 0, sizeof(push));
+    RenderViewport vp(0.0f, 0.0f, float(t->width), float(t->height));
+    RenderViewport vps[4] = {vp, vp, vp, vp};
+    list->setViewports(vps, std::max(n, 1u));
+    const RenderRect whole{0, 0, int32_t(t->width), int32_t(t->height)};
+    for (uint32_t r = 0; r < (rects ? count : 1u); r++) {
+      const RenderRect& rc = rects ? rects[r] : whole;
+      RenderRect scs[4] = {rc, rc, rc, rc};
+      list->setScissors(scs, std::max(n, 1u));
+      list->drawInstanced(3, 1, 0, 0);
+    }
+    // The next draw sets its pipeline, viewports, scissor and depth bias again; descriptor sets and
+    // vertex buffers stay bound (same layout).
+    ds.pipeline = nullptr;
+    ds.viewports = 0;
+    ds.scissor = RenderRect{};
+    ds.bias_set = false;
+    stat_draw_clears++;
   }
 
   // D3DRESOLVE_CLEARRENDERTARGET clears of a resolve's source, applied in the next render pass
@@ -4136,7 +4222,7 @@ struct Backend::Impl {
     const RenderRect* rc;
     uint32_t rn;
     for (uint32_t i = 0; i < count; i++)
-      if ((c.flags & (1u << i)) && rects_for(targets[i], &rc, &rn)) list->clearColor(i, col, rc, rn);
+      if ((c.flags & (1u << i)) && rects_for(targets[i], &rc, &rn)) ClearAttachment(list, i, col, rc, rn);
     if (depth && rects_for(depth, &rc, &rn)) list->clearDepthStencil(z, stencil, c.z, c.stencil & 0xFF, rc, rn);
     // The same EDRAM under another color format is another host target here, and D3D sets the new
     // surface's format only at the next draw, so the registers can still name the previous one: the
@@ -5018,7 +5104,7 @@ struct Backend::Impl {
       if (in_pass && bound_fb) {  // the source's pass is still open: clear there
         for (uint32_t i = 0; i < 4; i++)
           if (bound_color[i] == src) {
-            list->clearColor(i, RenderColor(rc.clear_color[0], rc.clear_color[1], rc.clear_color[2], rc.clear_color[3]),
+            ClearAttachment(list, i, RenderColor(rc.clear_color[0], rc.clear_color[1], rc.clear_color[2], rc.clear_color[3]),
                              &rect, 1);
             return;
           }

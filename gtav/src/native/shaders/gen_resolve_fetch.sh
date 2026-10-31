@@ -15,4 +15,6 @@ for i in 0 1 2 3; do
 done
 $G -V --target-env vulkan1.2 --vn g_native_resolve_compute_cs -o $T/cs.h native_resolve_compute.comp >/dev/null
 cat $T/cs.h >> $out
+$G -V --target-env vulkan1.2 --vn g_native_clear_ps -o $T/clear.h native_clear.frag >/dev/null
+cat $T/clear.h >> $out
 rm -rf "$T"

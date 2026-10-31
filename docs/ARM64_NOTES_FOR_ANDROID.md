@@ -56,6 +56,16 @@ Kept (A/B in the same run, see section 6):
 | plume: no TOP/BOTTOM_OF_PIPE next to real stages (MoltenVK maps them to every stage); render-target transitions wait at the fragment stage only | gtav_native_exact_barriers, gtav_native_fragment_barriers (true) | -0.3 ms |
 | whole-destination resolve copies use LOAD_OP_DONT_CARE | gtav_native_resolve_discard (true) | ~0 (kept, cheaper on bandwidth) |
 
+| colour clears as draws in the draws' pipeline layout, not vkCmdClearAttachments (MoltenVK restarted the Metal render pass at each clear: ~34 extra encoders a frame) | gtav_native_draw_clears (true) | -2.0..2.2 ms |
+| GTA V's EDRAM depth-restore strips skipped (25 passes into targets nothing reads) | gtav_native_skip_depth_restore (true) | -0.8 ms |
+
+Finding encoders: `tools/native/mst_labels.py` joins MoltenVK's encoder labels ("vkCmdBeginRenderPass",
+"Metal renderpass restart", "vkCmdResolveImage (... stage)", "Post-render-pass occlusion query
+accumulation", ...) from a Metal System Trace with the GPU intervals: count, busy and the idle gap
+before each kind per frame. A clear at the start of a pass cost a whole encoder; a clear as a draw
+costs nothing extra. Other MoltenVK extras per frame: vkCmdResolveImage = 2-3 encoders (the
+reflection cubemap's 6 MSAA faces), occlusion queries = an accumulation compute encoder each.
+
 Tried and not kept:
 - Render targets per frame in flight (frames overlap on the GPU): `gtav_native_slot_targets`
   (false) — no change, doubles target memory.
