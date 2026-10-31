@@ -11,11 +11,15 @@ D=/sdcard/Android/data/$PKG/files
 name=$1 spec=$2 secs=${3:-360}
 shift 3 2>/dev/null || shift $#
 [ -n "$name" ] && [ -n "$spec" ] || { echo "usage: $0 NAME 'cvar=a|b' [SECS] [flags...]"; exit 1; }
+# The phone drops off USB now and then: wait for it, and stop when it is gone mid-run (the game
+# would otherwise start later with whatever args.txt it had).
+adb wait-for-device
 temp() { adb shell dumpsys battery | awk '/^  temperature:/ {print $2; exit}'; }
 gpu_mhz() { adb shell cat /sys/class/kgsl/kgsl-3d0/clock_mhz 2>/dev/null; }
 gpu_temp() { adb shell cat /sys/class/kgsl/kgsl-3d0/temp 2>/dev/null | awk '{printf "%.1f", $1 / 1000}'; }
 for i in $(seq 60); do
   t=$(temp)
+  [ -n "$t" ] || { echo "phone not reachable"; exit 2; }
   [ "${t:-0}" -lt "${AB_MAX_TEMP:-360}" ] && break
   [ "$i" = 1 ] && echo "cooling: battery $t"
   sleep 10
@@ -29,6 +33,11 @@ mkdir -p "$ROOT/logs/android"
 SAMPLER=$!
 KEEP=1 "$ROOT/tools/android/run.sh" "$secs" 0 >/dev/null
 kill $SAMPLER
+if grep -q "GPU  MHz" "$ROOT/logs/android/$name.therm"; then
+  echo "phone disconnected during the run: results invalid"
+  adb wait-for-device; adb shell am force-stop $PKG
+  exit 2
+fi
 echo "end: battery $(temp), GPU $(gpu_mhz) MHz, pid $(adb shell pidof $PKG)"
 adb shell am force-stop $PKG
 adb pull "$D/logs/gtav.log" "$ROOT/logs/android/$name.log" >/dev/null

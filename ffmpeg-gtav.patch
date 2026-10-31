@@ -1,0 +1,41 @@
+diff --git a/libavcodec/wmaprodec.c b/libavcodec/wmaprodec.c
+index 704c0a4..d8ad3a5 100644
+--- a/libavcodec/wmaprodec.c
++++ b/libavcodec/wmaprodec.c
+@@ -2025,6 +2025,28 @@ static av_cold int xmaframes_decode_init(AVCodecContext* avctx)
+     return decode_init(s, avctx, 0);
+ }
+ 
++/**
++ *@brief Start a new stream: what a freshly opened context has (the previous stream's MDCT
++ *       overlap tail, window shape and bit reservoir go), without rebuilding the MDCT, sine
++ *       window and VLC tables as a reopen does (gtav: the game starts a stream per sound, and
++ *       reopening for each was ~20% of the audio thread on a phone).
++ */
++static void xmaframes_flush(AVCodecContext *avctx)
++{
++    WMAProDecodeCtx *s = avctx->priv_data;
++    int i;
++
++    flush(s);
++    for (i = 0; i < s->nb_channels; i++) {
++        s->channel[i].prev_block_len = s->samples_per_frame;
++        s->channel[i].reuse_sf = 0;
++    }
++    s->num_saved_bits = 0;
++    s->frame_offset = 0;
++    s->frame_num = 0;
++    s->skip_frame = 0;
++}
++
+ static av_cold int xmaframes_decode_end(AVCodecContext* avctx)
+ {
+     WMAProDecodeCtx *s = avctx->priv_data;
+@@ -2152,6 +2174,7 @@ AVCodec ff_xmaframes_decoder = {
+     .init           = xmaframes_decode_init,
+     .close          = xmaframes_decode_end,
+     .decode         = xmaframes_decode_packet,
++    .flush          = xmaframes_flush,
+     .capabilities   = AV_CODEC_CAP_DR1,
+     .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
+     .sample_fmts    = (const enum AVSampleFormat[]) { AV_SAMPLE_FMT_FLTP,

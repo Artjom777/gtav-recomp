@@ -81,13 +81,14 @@ extern bool g_colorInputAttachments;
 #include <unistd.h>
 // Phones mix core sizes (Snapdragon 8 Gen 1: 4 little, 3 mid, 1 prime). The scheduler kept moving
 // the renderer threads onto little cores, where recording a frame takes about 3x as long: keep
-// them on the cores of the top two clusters (the upper half of the CPU numbers).
+// them on the cores of the top two clusters (the upper half of the CPU numbers), except the last
+// (prime) one, which the game's main thread gets (android_threads.cpp, --gtav_android_main_prime).
 static void PinToBigCores() {
   int n = int(sysconf(_SC_NPROCESSORS_CONF));
   if (n < 4) return;
   cpu_set_t set;
   CPU_ZERO(&set);
-  for (int i = n / 2; i < n; i++) CPU_SET(i, &set);
+  for (int i = n / 2; i < n - 1; i++) CPU_SET(i, &set);
   sched_setaffinity(0, sizeof(set), &set);
 }
 #else
