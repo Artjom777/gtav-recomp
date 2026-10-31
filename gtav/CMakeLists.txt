@@ -13,6 +13,19 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # (fs/gtav_pch.h). The exe then needs no generated sources at all.
 option(GTAV_GAME_DLL "Build gtav_fast.exe against a separately built gtav_game.dll" OFF)
 
+# iOS: the SDK installs runtime libraries only; the codegen tool is the Mac's (it only runs when
+# the generated code is out of date, which a phone build never regenerates).
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(GTAV_IOS TRUE)
+    find_package(rexglue 0.10.0 REQUIRED CONFIG)
+    if(NOT TARGET rex::rexglue)
+        set(GTAV_HOST_REXGLUE "${CMAKE_CURRENT_SOURCE_DIR}/../rexglue-sdk/out/install/mac-arm64/bin/rexglue"
+            CACHE FILEPATH "Host (macOS) rexglue codegen tool")
+        add_executable(rex::rexglue IMPORTED)
+        set_target_properties(rex::rexglue PROPERTIES IMPORTED_LOCATION "${GTAV_HOST_REXGLUE}")
+    endif()
+endif()
+
 if(GTAV_GAME_DLL)
     find_package(rexglue 0.10.0 REQUIRED CONFIG)
 else()
@@ -354,7 +367,7 @@ if(NOT WIN32 AND NOT APPLE AND NOT ANDROID)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 ${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/XenosRecomp/XenosRecomp/shader_common.h ${GTAV_TOOLS_DIR}/shader_common.h
         VERBATIM)
-elseif(APPLE)
+elseif(APPLE AND NOT GTAV_IOS)
     # macOS: tools/XenosRecomp and tools/dxc (dxc-macos) find tools/lib/libdxcompiler.dylib through
     # an @executable_path/lib rpath (re-signed ad hoc after install_name_tool).
     set(GTAV_XR_BIN ${CMAKE_CURRENT_SOURCE_DIR}/../build/xenosrecomp-mac/XenosRecomp/XenosRecomp CACHE FILEPATH
@@ -370,4 +383,9 @@ elseif(APPLE)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../tools/release/macho_tool.py
                 ${GTAV_DXC_DIR}/bin/arm64/dxc-macos ${GTAV_TOOLS_DIR}/dxc
         VERBATIM)
+endif()
+
+if(GTAV_IOS)
+    # Memory log: the Metal device's allocated size (capture.cpp).
+    target_link_libraries(gtav PRIVATE "-framework Metal" objc)
 endif()

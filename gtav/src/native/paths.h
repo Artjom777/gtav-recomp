@@ -13,6 +13,8 @@
 #endif
 #include <windows.h>
 #elif defined(__APPLE__)
+#include <TargetConditionals.h>
+#include <cstdlib>
 #include <mach-o/dyld.h>
 #elif defined(__ANDROID__)
 #include <SDL3/SDL_system.h>
@@ -25,6 +27,11 @@ inline std::filesystem::path ExeDir() {
   wchar_t buf[MAX_PATH];
   DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
   return std::filesystem::path(std::wstring(buf, n)).parent_path();
+#elif defined(__APPLE__) && TARGET_OS_IPHONE
+  // The app bundle is read-only: settings, SPIR-V, caches and logs live in the app's Documents
+  // (visible in the Files app and Finder file sharing).
+  const char* home = std::getenv("HOME");
+  return home ? std::filesystem::path(home) / "Documents" : std::filesystem::current_path();
 #elif defined(__APPLE__)
   char buf[4096];
   uint32_t size = sizeof(buf);

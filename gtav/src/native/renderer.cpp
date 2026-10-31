@@ -42,6 +42,7 @@
 #include <thread>
 #include <vector>
 #if defined(__APPLE__)
+#include <TargetConditionals.h>
 #include <pthread/qos.h>
 #endif
 
@@ -468,6 +469,19 @@ class Renderer {
             r->render_window_ = static_cast<ANativeWindow*>(SDL_GetPointerProperty(
                 SDL_GetWindowProperties(r->window_), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr));
           }
+#elif defined(__APPLE__) && TARGET_OS_IPHONE
+          // iOS has one window (fullscreen): draw into the SDK's own, with a Metal view of our own
+          // on top of whatever the SDK attached to it.
+          {
+            int count = 0;
+            if (SDL_Window** windows = SDL_GetWindows(&count)) {
+              if (count > 0) {
+                r->window_ = windows[0];
+                SDL_ShowWindow(r->window_);
+              }
+              SDL_free(windows);
+            }
+          }
 #else
           r->window_ = SDL_CreateWindow(on ? "GTA V" : "GTA V - native renderer (shadow)", 1280, 720,
                                         SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE |
@@ -477,8 +491,13 @@ class Renderer {
           // Plume's Vulkan backend (MoltenVK) on macOS takes the NSWindow and a CAMetalLayer.
           if (r->window_) {
             r->metal_view_ = SDL_Metal_CreateView(r->window_);
+#if TARGET_OS_IPHONE
+            r->render_window_.window = SDL_GetPointerProperty(SDL_GetWindowProperties(r->window_),
+                                                              SDL_PROP_WINDOW_UIKIT_WINDOW_POINTER, nullptr);
+#else
             r->render_window_.window = SDL_GetPointerProperty(SDL_GetWindowProperties(r->window_),
                                                               SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, nullptr);
+#endif
             r->render_window_.view = r->metal_view_ ? SDL_Metal_GetLayer(r->metal_view_) : nullptr;
           }
 #endif

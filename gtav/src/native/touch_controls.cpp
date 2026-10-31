@@ -22,7 +22,10 @@
 #include <mutex>
 #include <unordered_map>
 
-#ifdef __ANDROID__
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
 REXCVAR_DEFINE_BOOL(gtav_touch_controls, true, "GTAV", "Show the on-screen gamepad (touch screens)");
 #else
 REXCVAR_DEFINE_BOOL(gtav_touch_controls, false, "GTAV", "Show the on-screen gamepad (touch screens)");

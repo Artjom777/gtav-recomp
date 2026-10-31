@@ -28,6 +28,24 @@
 #include "safe_read.h"
 #ifndef _WIN32
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#include <mach/mach.h>
+#include <malloc/malloc.h>
+#include <objc/message.h>
+#include <objc/runtime.h>
+#if TARGET_OS_IPHONE
+#include <os/proc.h>
+#endif
+extern "C" void* MTLCreateSystemDefaultDevice(void);
+// Bytes the process has allocated on the (only) Metal device: MoltenVK's buffers and textures.
+static uint64_t MetalAllocatedBytes() {
+  static void* device = MTLCreateSystemDefaultDevice();
+  if (!device) return 0;
+  using Fn = uint64_t (*)(void*, SEL);
+  return reinterpret_cast<Fn>(objc_msgSend)(device, sel_registerName("currentAllocatedSize"));
+}
+#endif
 #endif
 
 #include <atomic>
@@ -80,6 +98,15 @@ REXCVAR_DEFINE_BOOL(gtav_native_pm4_scan, false, "GTAV",
                     "Diagnostic: log ALU constant writes found in the PM4 stream between draws (tree orbs)");
 REXCVAR_DEFINE_INT32(gtav_native_layout_probe, 0, "GTAV",
                      "Log objects and register shadow for the first draws of this guest frame");
+
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+#define GTAV_FENCE_WAIT_MS_DEFAULT 1000  // the phone records slowly: 100 ms timed out every few frames
+#else
+#define GTAV_FENCE_WAIT_MS_DEFAULT 100
+#endif
+REXCVAR_DEFINE_INT32(gtav_native_fence_wait_ms, GTAV_FENCE_WAIT_MS_DEFAULT, "GTAV",
+                     "Native renderer: longest wait of the game at a GPU fence for the renderer (a timeout lets the "
+                     "game reuse memory a queued frame still reads: one-frame slabs)");
 
 namespace gtav::native {
 namespace {
@@ -618,6 +645,26 @@ void FenceCopiesRecorded(uint64_t frame) {
     g_copy_floor = frame + 1;
     DrainIncomingCopies();
     while (!g_pending_copies.empty() && g_pending_copies.front().frame <= frame) g_pending_copies.pop_front();
+#if defined(__APPLE__)
+    if (frame % 120 == 0) {
+      // phys_footprint is what jetsam counts; os_proc_available_memory is the headroom left (iOS).
+      task_vm_info_data_t vm{};
+      mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
+      if (task_info(mach_task_self(), TASK_VM_INFO, task_info_t(&vm), &n) == KERN_SUCCESS) {
+#if TARGET_OS_IPHONE
+        malloc_statistics_t ms{};
+        malloc_zone_statistics(nullptr, &ms);
+        REXLOG_INFO("[native] memory at frame {}: footprint {} MB, available {} MB, compressed {} MB; Metal {} MB, "
+                    "malloc {} MB",
+                    frame, vm.phys_footprint >> 20, os_proc_available_memory() >> 20, vm.compressed >> 20,
+                    MetalAllocatedBytes() >> 20, ms.size_in_use >> 20);
+#else
+        REXLOG_INFO("[native] memory at frame {}: footprint {} MB, compressed {} MB", frame, vm.phys_footprint >> 20,
+                    vm.compressed >> 20);
+#endif
+      }
+    }
+#endif
     if (frame % 300 == 0) {
       auto& st = g_copy_stats;
       REXLOG_INFO("[native] fence copies per 300 frames: {} draws ({} KB), GPU waited for the renderer {} times "

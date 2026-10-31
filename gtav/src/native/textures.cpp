@@ -26,7 +26,19 @@ namespace xenos = rex::graphics::xenos;
 using plume::RenderFormat;
 using plume::RenderSwizzle;
 
-enum class Convert { kNone, k565, k1555, k4444, k2_10_10_10 };
+enum class Convert { kNone, k565, k1555, k4444, k2_10_10_10, kBC1, kBC2, kBC3, kBC4, kBC5 };
+
+// Apple's phone GPUs have no BC (DXT) formats: on iOS block-compressed textures are decoded on the
+// CPU. A block row of the guest becomes the block's 4 texel rows, one after the other, so a decoded
+// block row is `cols * host_bytes_per_block` bytes like every other conversion here.
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+constexpr bool kDecodeBC = true;
+#else
+constexpr bool kDecodeBC = false;
+#endif
 
 struct HostFormat {
   RenderFormat format;
@@ -36,11 +48,26 @@ struct HostFormat {
 
 bool GetHostFormat(xenos::TextureFormat format, HostFormat* out) {
   switch (rex::graphics::GetBaseFormat(format)) {
-    case xenos::TextureFormat::k_DXT1: *out = {RenderFormat::BC1_UNORM, Convert::kNone, 8}; return true;
-    case xenos::TextureFormat::k_DXT2_3: *out = {RenderFormat::BC2_UNORM, Convert::kNone, 16}; return true;
-    case xenos::TextureFormat::k_DXT4_5: *out = {RenderFormat::BC3_UNORM, Convert::kNone, 16}; return true;
-    case xenos::TextureFormat::k_DXT5A: *out = {RenderFormat::BC4_UNORM, Convert::kNone, 8}; return true;
-    case xenos::TextureFormat::k_DXN: *out = {RenderFormat::BC5_UNORM, Convert::kNone, 16}; return true;
+    case xenos::TextureFormat::k_DXT1:
+      *out = kDecodeBC ? HostFormat{RenderFormat::R8G8B8A8_UNORM, Convert::kBC1, 64}
+                       : HostFormat{RenderFormat::BC1_UNORM, Convert::kNone, 8};
+      return true;
+    case xenos::TextureFormat::k_DXT2_3:
+      *out = kDecodeBC ? HostFormat{RenderFormat::R8G8B8A8_UNORM, Convert::kBC2, 64}
+                       : HostFormat{RenderFormat::BC2_UNORM, Convert::kNone, 16};
+      return true;
+    case xenos::TextureFormat::k_DXT4_5:
+      *out = kDecodeBC ? HostFormat{RenderFormat::R8G8B8A8_UNORM, Convert::kBC3, 64}
+                       : HostFormat{RenderFormat::BC3_UNORM, Convert::kNone, 16};
+      return true;
+    case xenos::TextureFormat::k_DXT5A:
+      *out = kDecodeBC ? HostFormat{RenderFormat::R8_UNORM, Convert::kBC4, 16}
+                       : HostFormat{RenderFormat::BC4_UNORM, Convert::kNone, 8};
+      return true;
+    case xenos::TextureFormat::k_DXN:
+      *out = kDecodeBC ? HostFormat{RenderFormat::R8G8_UNORM, Convert::kBC5, 32}
+                       : HostFormat{RenderFormat::BC5_UNORM, Convert::kNone, 16};
+      return true;
     case xenos::TextureFormat::k_8_8_8_8: *out = {RenderFormat::R8G8B8A8_UNORM, Convert::kNone, 4}; return true;
     case xenos::TextureFormat::k_8: *out = {RenderFormat::R8_UNORM, Convert::kNone, 1}; return true;
     case xenos::TextureFormat::k_8_8: *out = {RenderFormat::R8G8_UNORM, Convert::kNone, 2}; return true;
@@ -94,8 +121,89 @@ void SwapEndian(uint8_t* data, uint32_t size, xenos::Endian endian) {
 
 uint8_t Expand(uint32_t v, uint32_t bits) { return uint8_t(v * 255 / ((1u << bits) - 1)); }
 
-// Converts one row of guest texels (already host-endian) into host texels.
+// BC colour endpoints + indices (8 bytes) -> 4x4 RGBA8, row r of the block at out + r * pitch.
+void DecodeBC1Colour(const uint8_t* b, uint8_t* out, size_t pitch, bool allow_punch_through) {
+  const uint16_t c0 = uint16_t(b[0] | b[1] << 8), c1 = uint16_t(b[2] | b[3] << 8);
+  uint8_t pal[4][4];
+  auto rgb = [](uint16_t c, uint8_t* o) {
+    o[0] = Expand(c >> 11, 5), o[1] = Expand((c >> 5) & 0x3F, 6), o[2] = Expand(c & 0x1F, 5), o[3] = 255;
+  };
+  rgb(c0, pal[0]);
+  rgb(c1, pal[1]);
+  if (c0 > c1 || !allow_punch_through) {
+    for (int k = 0; k < 3; k++) {
+      pal[2][k] = uint8_t((2 * pal[0][k] + pal[1][k] + 1) / 3);
+      pal[3][k] = uint8_t((pal[0][k] + 2 * pal[1][k] + 1) / 3);
+    }
+    pal[2][3] = pal[3][3] = 255;
+  } else {
+    for (int k = 0; k < 3; k++) pal[2][k] = uint8_t((pal[0][k] + pal[1][k] + 1) / 2);
+    pal[2][3] = 255;
+    pal[3][0] = pal[3][1] = pal[3][2] = pal[3][3] = 0;
+  }
+  const uint32_t idx = uint32_t(b[4] | b[5] << 8 | b[6] << 16 | uint32_t(b[7]) << 24);
+  for (int y = 0; y < 4; y++)
+    for (int x = 0; x < 4; x++) std::memcpy(out + y * pitch + x * 4, pal[(idx >> (2 * (y * 4 + x))) & 3], 4);
+}
+
+// BC4 block (8 bytes) -> 16 values, written at out + (y * pitch + x * stride).
+void DecodeBC4(const uint8_t* b, uint8_t* out, size_t pitch, size_t stride) {
+  uint8_t v[8];
+  v[0] = b[0];
+  v[1] = b[1];
+  if (v[0] > v[1]) {
+    for (int i = 1; i < 7; i++) v[i + 1] = uint8_t(((7 - i) * v[0] + i * v[1] + 3) / 7);
+  } else {
+    for (int i = 1; i < 5; i++) v[i + 1] = uint8_t(((5 - i) * v[0] + i * v[1] + 2) / 5);
+    v[6] = 0;
+    v[7] = 255;
+  }
+  uint64_t idx = 0;
+  for (int i = 0; i < 6; i++) idx |= uint64_t(b[2 + i]) << (8 * i);
+  for (int y = 0; y < 4; y++)
+    for (int x = 0; x < 4; x++) out[y * pitch + x * stride] = v[(idx >> (3 * (y * 4 + x))) & 7];
+}
+
+// One guest block row of `blocks` BC blocks -> 4 host texel rows (each blocks * 4 texels wide).
+void DecodeBCRow(Convert c, const uint8_t* src, uint8_t* dst, uint32_t blocks) {
+  const size_t texel_bytes = c == Convert::kBC4 ? 1 : c == Convert::kBC5 ? 2 : 4;
+  const size_t pitch = size_t(blocks) * 4 * texel_bytes;
+  for (uint32_t i = 0; i < blocks; i++) {
+    uint8_t* o = dst + size_t(i) * 4 * texel_bytes;
+    switch (c) {
+      case Convert::kBC1: DecodeBC1Colour(src + 8 * i, o, pitch, true); break;
+      case Convert::kBC2: {
+        const uint8_t* b = src + 16 * i;
+        DecodeBC1Colour(b + 8, o, pitch, false);
+        for (int y = 0; y < 4; y++)
+          for (int x = 0; x < 4; x++) {
+            const uint8_t a = (b[y * 2 + x / 2] >> (4 * (x & 1))) & 0xF;
+            o[y * pitch + x * 4 + 3] = uint8_t(a * 17);
+          }
+        break;
+      }
+      case Convert::kBC3: {
+        const uint8_t* b = src + 16 * i;
+        DecodeBC1Colour(b + 8, o, pitch, false);
+        DecodeBC4(b, o + 3, pitch, 4);
+        break;
+      }
+      case Convert::kBC4: DecodeBC4(src + 8 * i, o, pitch, 1); break;
+      case Convert::kBC5:
+        DecodeBC4(src + 16 * i, o, pitch, 2);
+        DecodeBC4(src + 16 * i + 8, o + 1, pitch, 2);
+        break;
+      default: break;
+    }
+  }
+}
+
+// Converts one row of guest texels (already host-endian) into host texels (a block row for BC).
 void ConvertRow(Convert c, const uint8_t* src, uint8_t* dst, uint32_t texels) {
+  if (c >= Convert::kBC1) {
+    DecodeBCRow(c, src, dst, texels);
+    return;
+  }
   for (uint32_t i = 0; i < texels; i++) {
     if (c == Convert::k2_10_10_10) {
       uint32_t v;

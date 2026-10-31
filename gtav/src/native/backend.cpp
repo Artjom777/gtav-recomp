@@ -30,6 +30,9 @@
 #include <map>
 #include <tuple>
 #include <chrono>
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#endif
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -237,7 +240,12 @@ constexpr uint32_t kSamplerDescriptors = 1024;
 // kOverflow: where a resource goes when the heap is full even after evicting (never sampled on
 // purpose; it used to land on kNull2D, so every "no texture" slot showed the newest texture).
 constexpr uint32_t kNull2D = 0, kNull3D = 1, kNullCube = 2, kOverflow = 3, kFirstTextureDescriptor = 4;
+// Smaller chunks on the phone: three frames in flight each kept 64 MB chunks mostly empty.
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+constexpr uint64_t kUploadChunk = 32ull << 20;
+#else
 constexpr uint64_t kUploadChunk = 64ull << 20;
+#endif
 // Tallest render target: GTA V stacks its four 640x640 sun shadow cascades in one 640x2560 depth
 // surface, so 2048 rows lost the far cascade (distant scenery shadowed by garbage wedges).
 constexpr uint32_t kMaxTargetRows = 4096;
@@ -855,7 +863,15 @@ class PipelineCompiler {
     std::lock_guard lock(mutex_);
     if (!started_) {
       started_ = true;
-      for (int i = 0; i < 3; i++) std::thread([this, device] { Worker(device); }).detach();
+      for (int i = 0; i < 3; i++)
+        std::thread([this, device] {
+#if defined(__APPLE__)
+          // Same class as the guest threads (the SDK runs them USER_INTERACTIVE): a lower one
+          // starved behind them on the phone's two performance cores.
+          pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+          Worker(device);
+        }).detach();
     }
     queue_.push_back(std::move(job));
     cv_.notify_one();
@@ -871,10 +887,24 @@ class PipelineCompiler {
         job = std::move(queue_.front());
         queue_.pop_front();
       }
+      auto t0 = std::chrono::steady_clock::now();
       job->result = device->createGraphicsPipeline(job->desc);
       job->done.store(true, std::memory_order_release);
+      double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+      {
+        std::lock_guard lock(mutex_);
+        stat_ms_ += ms;
+        stat_max_ms_ = std::max(stat_max_ms_, ms);
+        if (++stat_n_ % 50 == 0) {
+          REXLOG_INFO("[native] pipeline compiles: {} done, avg {:.0f} ms (max {:.0f}) over the last 50, {} queued",
+                      stat_n_, stat_ms_ / 50, stat_max_ms_, queue_.size());
+          stat_ms_ = stat_max_ms_ = 0;
+        }
+      }
     }
   }
+  uint64_t stat_n_ = 0;
+  double stat_ms_ = 0, stat_max_ms_ = 0;
   std::mutex mutex_;
   std::condition_variable cv_;
   std::deque<std::shared_ptr<PipelineJob>> queue_;
@@ -2109,9 +2139,17 @@ struct Backend::Impl {
       if (t.texture) total += t.bytes;
     uint64_t buffer_bytes = 0;
     for (const auto& [key, b] : buffers) buffer_bytes += b.buffer ? b.size : 0;
-    if (frame % 1800 == 0)
-      REXLOG_INFO("[native] caches: {} textures {:.0f} MB (budget {} MB), {} buffers {:.0f} MB", textures.size(),
-                  total / 1048576.0, budget >> 20, buffers.size(), buffer_bytes / 1048576.0);
+    if (frame % 600 == 0) {
+      size_t upload_chunks = upload.chunks.size();
+      for (const auto& p : parked) upload_chunks += p.upload.chunks.size();
+      uint64_t target_bytes = 0;
+      for (const auto& [key, t] : targets)
+        if (t.texture) target_bytes += uint64_t(t.width) * t.height * std::max(1u, t.msaa) * 4;
+      REXLOG_INFO("[native] caches: {} textures {:.0f} MB (budget {} MB), {} buffers {:.0f} MB; {} upload chunks "
+                  "({} MB), {} render targets (~{} MB at 4 B/px)",
+                  textures.size(), total / 1048576.0, budget >> 20, buffers.size(), buffer_bytes / 1048576.0,
+                  upload_chunks, (upload_chunks * kUploadChunk) >> 20, targets.size(), target_bytes >> 20);
+    }
     if (total <= budget) return;
     constexpr uint64_t kMinIdle = 120;
     std::vector<std::pair<uint64_t, uint64_t>> idle;  // used_frame, key
