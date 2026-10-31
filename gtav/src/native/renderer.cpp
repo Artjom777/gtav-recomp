@@ -1259,11 +1259,18 @@ class Renderer {
     timing_.Add(ms(record_end - record_start), ms(wait_end - wait_start));
     last_record_ms_ = ms(record_end - record_start);
     ab_slot_phase_[slot] = ab_phase_;
-    // Hitch log: a present more than 25 ms after the previous one, with what this frame cost.
+    // Hitch log: a present more than 25 ms after the previous one (50 ms on phones, where 30 fps
+    // frames are 33 ms: every frame was a "hitch" and the log grew by megabytes a minute), with what
+    // this frame cost.
+#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
+    constexpr double kHitchMs = 50.0;
+#else
+    constexpr double kHitchMs = 25.0;
+#endif
     double interval = last_present_.time_since_epoch().count() ? ms(present_end - last_present_) : 0;
     last_present_ = present_end;
     if (backend_ok_) MaybeSavePipelineCache(backend_.LastStats().pipelines_created);
-    if (interval > 25.0 && backend_ok_) {
+    if (interval > kHitchMs && backend_ok_) {
       auto st = backend_.LastStats();
       REXLOG_INFO("[native] hitch {:.1f} ms at guest frame {}: record {:.1f} ms, wait {:.1f} ms, {} new pipelines, "
                   "{} textures, {} draws (misses: shaders {:.1f} pipelines {:.1f} textures {:.1f} ms; resolves {:.1f} ms)",

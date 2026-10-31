@@ -6,7 +6,7 @@
 --gtav_native=on --gpu_skip_rendering=true --gpu_skip_rendering_lag_ms=6
 --vsync=false --gtav_native_vsync=true --gtav_fps_limit=30
 --audio_device_frames=256
---log_level=info --log_file=logs/gtav.log --log_max_file_size_mb=64 --log_max_files=2
---gtav_native_texture_budget_mb=384
+--log_level=info --log_file=logs/gtav.log --log_max_file_size_mb=16 --log_max_files=2
+--gtav_native_texture_budget_mb=192
 --window_presenter=false
 --gtav_native_fetch_resolves=false

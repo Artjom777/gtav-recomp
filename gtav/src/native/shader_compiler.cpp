@@ -44,6 +44,10 @@
 #endif
 REXCVAR_DEFINE_BOOL(gtav_native_compile, GTAV_NATIVE_COMPILE_DEFAULT, "GTAV",
                     "Compile shaders that have no precompiled SPIR-V in the background (tools/ next to the exe)");
+// iOS: shaders without SPIR-V are still written to shader_cache/<name>.bin, for the Mac to translate
+// (tools/ios: the iPhone step pulls them and pushes the SPIR-V back).
+REXCVAR_DEFINE_BOOL(gtav_native_save_missing_shaders, !GTAV_NATIVE_COMPILE_DEFAULT, "GTAV",
+                    "Without --gtav_native_compile: still save shaders that have no SPIR-V to shader_cache/");
 REXCVAR_DECLARE(std::string, gtav_native_spirv_dir);
 
 namespace gtav::native {
@@ -271,12 +275,12 @@ static void IntakeWorker() {
         std::fclose(f);
       }
     }
-    Enqueue(item.name);
+    if (REXCVAR_GET(gtav_native_compile)) Enqueue(item.name);
   }
 }
 
 void OnShaderCreated(const uint8_t* container, size_t size, uint64_t hash, bool pixel) {
-  if (!REXCVAR_GET(gtav_native_compile)) return;
+  if (!REXCVAR_GET(gtav_native_compile) && !REXCVAR_GET(gtav_native_save_missing_shaders)) return;
   std::string name = fmt::format("{}_{:016X}", pixel ? "ps" : "vs", hash);
   std::lock_guard lock(g_mutex);
   if (!g_seen.insert(name).second) return;

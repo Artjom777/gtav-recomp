@@ -62,6 +62,9 @@
 #include <sched.h>
 #include <unistd.h>
 #endif
+#if GTAV_MOBILE && defined(__APPLE__)
+#include <os/proc.h>
+#endif
 #include <vector>
 
 REXCVAR_DECLARE(std::string, gtav_native_spirv_dir);
@@ -80,6 +83,13 @@ REXCVAR_DEFINE_INT32(gtav_native_texture_recheck_frames, 4, "GTAV",
 REXCVAR_DEFINE_INT32(gtav_native_texture_recheck_frames, 30, "GTAV",
                      "Frames between full re-checks of a large texture (spot checks in between)");
 #endif
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+#define GTAV_TEXTURE_SAMPLE_FRAMES_DEFAULT 1
+#else
+#define GTAV_TEXTURE_SAMPLE_FRAMES_DEFAULT 1
+#endif
+REXCVAR_DEFINE_INT32(gtav_native_texture_sample_frames, GTAV_TEXTURE_SAMPLE_FRAMES_DEFAULT, "GTAV",
+                     "Frames between the sampled checks of a large cached texture (1: every frame it is used)");
 REXCVAR_DEFINE_BOOL(gtav_native_exact_cache, false, "GTAV",
                     "Check cached vertex/index buffers and textures with a full content hash every frame "
                     "(no sampled-hash shortcut for large ones)");
@@ -131,6 +141,20 @@ REXCVAR_DEFINE_DOUBLE(gtav_native_farpin_scale, 1.0, "GTAV",
 REXCVAR_DEFINE_STRING(gtav_native_skip_ps, "", "GTAV", "Diagnostic: drop draws with these pixel shader hashes");
 REXCVAR_DEFINE_INT32(gtav_native_texture_budget_mb, 1024, "GTAV",
                      "Decoded texture cache budget: textures idle for 2 s are released above it (unified memory)");
+// iPhone: the vertex/index buffer cache had no limit and reached 18,000 buffers (140 MB of Metal
+// memory plus driver objects) within minutes of driving; the app was killed at ~2.2 GB.
+#if GTAV_MOBILE
+#define GTAV_BUFFER_BUDGET_DEFAULT 96
+#define GTAV_LOW_MEMORY_DEFAULT 600
+#else
+#define GTAV_BUFFER_BUDGET_DEFAULT 0
+#define GTAV_LOW_MEMORY_DEFAULT 0
+#endif
+REXCVAR_DEFINE_INT32(gtav_native_buffer_budget_mb, GTAV_BUFFER_BUDGET_DEFAULT, "GTAV",
+                     "Cached vertex/index buffer budget: buffers idle for 2 s are released above it (0: no limit)");
+REXCVAR_DEFINE_INT32(gtav_native_low_memory_mb, GTAV_LOW_MEMORY_DEFAULT, "GTAV",
+                     "iOS: below this much memory left before the OS kills the app, the texture and buffer caches "
+                     "shrink to half their budgets and release what was idle for 0.5 s (0: off)");
 REXCVAR_DEFINE_BOOL(gtav_native_lightvol_keep, true, "GTAV",
                     "Light-volume stencil marks keep the stencil where the volume is behind the scene "
                     "(no holes in the clouds over the sky)");
@@ -1635,7 +1659,8 @@ struct Backend::Impl {
   std::unordered_map<uint64_t, CachedTexture> textures;
   std::unordered_map<uint64_t, uint32_t> samplers;  // desc hash -> descriptor index
   std::vector<std::unique_ptr<RenderSampler>> sampler_objects;
-  std::unordered_map<uint64_t, CachedBuffer> buffers;  // never erased: entries keep their address
+  // Erased only by the buffer budget (EvictTexturesOverBudget), which then clears buffer_memo.
+  std::unordered_map<uint64_t, CachedBuffer> buffers;
   // Direct-mapped memo in front of `buffers` (~4,000 lookups a frame were 6% of the render thread).
   std::array<std::pair<uint64_t, CachedBuffer*>, 4096> buffer_memo{};
   // PreHash: full hashes taken this frame (hashed ahead next frame) and the ones for this frame.
@@ -1658,7 +1683,7 @@ struct Backend::Impl {
     for (size_t i = 0; i < prehash_now.size(); i++) {
       auto& it = prehash_now[i];
       if (it.guest) {
-        auto& b = buffers[it.key];  // never erased
+        auto& b = buffers[it.key];  // (the memo is not used here: no address kept)
         b.pre_frame = frame, b.pre_index = i, b.pre_guest = it.guest, b.pre_size = it.size;
       } else if (auto t = textures.find(it.key); t != textures.end()) {
         t->second.pre_frame = frame, t->second.pre_index = i;
@@ -2157,12 +2182,50 @@ struct Backend::Impl {
   // GB) before that: on a unified-memory Mac with 8 GB the whole system swapped.
   void EvictTexturesOverBudget() {
     if (frame % 60) return;
-    const uint64_t budget = uint64_t(std::max(64, REXCVAR_GET(gtav_native_texture_budget_mb))) << 20;
+    // Low memory (iOS jetsam headroom): half the budgets, and anything idle for 30 frames may go.
+    bool low_memory = false;
+#if GTAV_MOBILE && defined(__APPLE__)
+    if (const int32_t low = REXCVAR_GET(gtav_native_low_memory_mb); low > 0)
+      low_memory = os_proc_available_memory() < (uint64_t(low) << 20);
+#endif
+    if (low_memory && low_memory_logs++ < 20)
+      REXLOG_INFO("[native] low memory: caches shrink to half their budgets");
+    const uint64_t min_idle = low_memory ? 30 : 120;
+    uint64_t budget = uint64_t(std::max(64, REXCVAR_GET(gtav_native_texture_budget_mb))) << 20;
+    if (low_memory) budget /= 2;
     uint64_t total = 0;
     for (const auto& [key, t] : textures)
       if (t.texture) total += t.bytes;
     uint64_t buffer_bytes = 0;
     for (const auto& [key, b] : buffers) buffer_bytes += b.buffer ? b.size : 0;
+    // Buffers: released entries are erased (169,000 empty ones after an hour of driving) and the
+    // memo in front of the map forgets them; the next use converts the guest data again.
+    if (uint64_t bbudget = uint64_t(std::max(0, REXCVAR_GET(gtav_native_buffer_budget_mb))) << 20;
+        bbudget && buffer_bytes > (low_memory ? bbudget / 2 : bbudget)) {
+      if (low_memory) bbudget /= 2;
+      std::vector<std::pair<uint64_t, uint64_t>> idle_buffers;  // checked_frame, key
+      for (auto& [key, b] : buffers)
+        if (!b.buffer || frame - b.checked_frame >= min_idle)
+          idle_buffers.emplace_back(b.buffer ? b.checked_frame : 0, key);
+      std::sort(idle_buffers.begin(), idle_buffers.end());
+      uint64_t freed = 0;
+      size_t released = 0;
+      for (auto& [used, key] : idle_buffers) {
+        auto it = buffers.find(key);
+        if (it->second.buffer) {
+          if (buffer_bytes - freed <= bbudget * 4 / 5) break;
+          freed += it->second.size;
+          dead_buffers.push_back(std::move(it->second.buffer));  // an in-flight frame may read it
+          released++;
+        }
+        buffers.erase(it);
+      }
+      buffer_memo.fill({});
+      if (released && (buffer_budget_logs++ < 20 || buffer_budget_logs % 100 == 0))
+        REXLOG_INFO("[native] buffer budget: released {} buffers ({:.0f} MB), {:.0f} MB cached", released,
+                    freed / 1048576.0, (buffer_bytes - freed) / 1048576.0);
+      buffer_bytes -= freed;
+    }
     if (frame % 600 == 0) {
       size_t upload_chunks = upload.chunks.size();
       for (const auto& p : parked) upload_chunks += p.upload.chunks.size();
@@ -2175,10 +2238,9 @@ struct Backend::Impl {
                   upload_chunks, (upload_chunks * kUploadChunk) >> 20, targets.size(), target_bytes >> 20);
     }
     if (total <= budget) return;
-    constexpr uint64_t kMinIdle = 120;
     std::vector<std::pair<uint64_t, uint64_t>> idle;  // used_frame, key
     for (const auto& [key, t] : textures)
-      if (frame - t.used_frame >= kMinIdle && (t.texture || t.failed)) idle.emplace_back(t.used_frame, key);
+      if (frame - t.used_frame >= min_idle && (t.texture || t.failed)) idle.emplace_back(t.used_frame, key);
     std::sort(idle.begin(), idle.end());
     uint64_t released = 0, freed_bytes = 0;
     for (const auto& [used, key] : idle) {
@@ -2197,7 +2259,7 @@ struct Backend::Impl {
       REXLOG_INFO("[native] texture budget: released {} textures ({:.0f} MB), {} cached ({:.0f} MB)", released,
                   freed_bytes / 1048576.0, textures.size(), (total - freed_bytes) / 1048576.0);
   }
-  uint32_t budget_logs = 0;
+  uint32_t budget_logs = 0, buffer_budget_logs = 0, low_memory_logs = 0;
 
   void EvictTextures() {
     EvictTexturesOverBudget();
@@ -2794,6 +2856,11 @@ struct Backend::Impl {
     // get a full hash, larger ones a sampled hash (and a full one every 30 frames).
     constexpr uint64_t kSmallTexture = 64 << 10;
     if (t.texture && (t.checked_frame == frame || t.sample_frame == frame)) return t.descriptor;
+    // Large textures: the sampled check every N frames (iPhone: each check faults ~20 cold pages of
+    // guest memory back in, 15-17 ms a frame in the open world).
+    if (const uint64_t every = uint64_t(std::max(1, REXCVAR_GET(gtav_native_texture_sample_frames)));
+        every > 1 && t.texture && t.bytes > kSmallTexture && t.sample_frame != ~0ull && frame - t.sample_frame < every)
+      return t.descriptor;
     const bool watching = write_watch::Enabled() && !REXCVAR_GET(gtav_native_exact_cache);
     // Watched copies still get a full check every 64 frames: writes the watch cannot see (the
     // SDK writing guest memory through its raw physical view) were seen about once in 3 million
