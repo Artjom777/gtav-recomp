@@ -130,7 +130,8 @@ const int g_mvk_concurrent_compile = setenv("MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRE
 // they are opt-in (=1) until checked on Adreno.
 const bool g_plume_input_attachments = (plume::g_colorInputAttachments = [] {
   const char* e = std::getenv("GTAV_NATIVE_FETCH_RESOLVE");
-#ifdef __ANDROID__
+  // iPhone: they strobed the whole screen white (A15 / MoltenVK); off as on Android.
+#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
   return e && std::string(e) != "0";
 #else
   return !e || std::string(e) != "0";
@@ -370,6 +371,17 @@ class Renderer {
 #ifndef _WIN32
   // Settings menu input (menu.h queues it while the menu is open): the native window's mouse and
   // the navigation keys.
+  // Mouse (and touch-made mouse) events are in window points; the menu is laid out in swap chain
+  // pixels (iPhone: 2.9 pixels a point).
+  static float PixelDensity(SDL_WindowID id) {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    if (SDL_Window* w = SDL_GetWindowFromID(id)) return SDL_GetWindowPixelDensity(w);
+#else
+    (void)id;
+#endif
+    return 1.0f;
+  }
+
   static void MenuInput(const SDL_Event* e) {
     switch (e->type) {
       // Controller: RB + Back (View) opens or closes the menu (in either order); while it is
@@ -402,9 +414,16 @@ class Renderer {
         menu::OnKey(key, down);
         break;
       }
-      case SDL_EVENT_MOUSE_MOTION: menu::OnMouseMove(e->motion.x, e->motion.y); break;
+      case SDL_EVENT_MOUSE_MOTION: {
+        const float k = PixelDensity(e->motion.windowID);
+        menu::OnMouseMove(e->motion.x * k, e->motion.y * k);
+        break;
+      }
       case SDL_EVENT_MOUSE_BUTTON_DOWN:
       case SDL_EVENT_MOUSE_BUTTON_UP: {
+        // A tap arrives as button down / up with no motion before it: move the pointer there first.
+        const float k = PixelDensity(e->button.windowID);
+        menu::OnMouseMove(e->button.x * k, e->button.y * k);
         int b = e->button.button == SDL_BUTTON_LEFT ? 0 : e->button.button == SDL_BUTTON_RIGHT ? 1 : 2;
         menu::OnMouseButton(b, e->type == SDL_EVENT_MOUSE_BUTTON_DOWN);
         break;

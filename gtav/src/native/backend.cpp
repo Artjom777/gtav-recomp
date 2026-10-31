@@ -109,7 +109,7 @@ REXCVAR_DEFINE_INT32(gtav_native_dump_rt_count, 150, "GTAV",
                      "Frame dumps: number of per-draw snapshots of --gtav_native_dump_rt (~2.7 MB each at 720p)");
 // The iPhone compiles pipelines several times slower (MoltenVK + Metal on an A15): wait longer before
 // a draw is skipped, so a new effect costs a hitch instead of a frame with holes in it.
-#if defined(__APPLE__) && TARGET_OS_IPHONE
+#if 0  // tried on the iPhone: 120 ms let the renderer fall behind (2 GB of fence copies per 300 frames)
 #define GTAV_PIPELINE_WAIT_DEFAULT 120.0
 #else
 #define GTAV_PIPELINE_WAIT_DEFAULT 40.0

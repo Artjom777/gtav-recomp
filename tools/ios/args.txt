@@ -9,3 +9,4 @@
 --log_level=info --log_file=logs/gtav.log --log_max_file_size_mb=64 --log_max_files=2
 --gtav_native_texture_budget_mb=384
 --window_presenter=false
+--gtav_native_fetch_resolves=false
