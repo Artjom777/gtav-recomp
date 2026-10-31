@@ -435,6 +435,20 @@ static std::vector<ByteArena> g_spare_fence_arenas;
 static std::mutex g_copy_mutex;
 static std::condition_variable g_copy_cv;
 static std::deque<PendingCopy> g_pending_copies;
+// Draws are queued here by the game's render thread under a lock of their own: g_copy_mutex is
+// held by the command processor through its copies and waits (the game's D3D thread spent ~16% of
+// its time blocked on it). Moved into g_pending_copies (DrainIncomingCopies) under g_copy_mutex.
+static std::mutex g_incoming_mutex;
+static std::vector<PendingCopy> g_incoming_copies, g_incoming_spare;
+static void DrainIncomingCopies() {  // g_copy_mutex held
+  {
+    std::lock_guard lock(g_incoming_mutex);
+    if (g_incoming_copies.empty()) return;
+    std::swap(g_incoming_copies, g_incoming_spare);
+  }
+  for (const auto& p : g_incoming_spare) g_pending_copies.push_back(p);
+  g_incoming_spare.clear();
+}
 static std::map<std::pair<uint64_t, uint32_t>, FenceCopy> g_fence_copies;  // (frame, draw)
 static uint64_t g_copy_floor = 0;           // frames below this were recorded
 static uint64_t g_recording = ~0ull;        // frame being recorded
@@ -449,6 +463,7 @@ static struct {
 
 static void FenceReached(uint32_t value) {
   std::unique_lock lock(g_copy_mutex);
+  DrainIncomingCopies();
   while (!g_pending_copies.empty() && int32_t(value - g_pending_copies.front().fence) >= 0) {
     const PendingCopy& p = g_pending_copies.front();
     if (p.frame < g_copy_floor) {
@@ -597,6 +612,7 @@ void FenceCopiesRecorded(uint64_t frame) {
     std::lock_guard lock(g_copy_mutex);
     g_recording = ~0ull;
     g_copy_floor = frame + 1;
+    DrainIncomingCopies();
     while (!g_pending_copies.empty() && g_pending_copies.front().frame <= frame) g_pending_copies.pop_front();
     if (frame % 300 == 0) {
       auto& st = g_copy_stats;
@@ -754,8 +770,8 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
     PendingCopy p{GuestFrame(), uint32_t(g_packet.draws.size()), be32(dev + kDevFence), d.indexed, d.index32,
                   d.base_vertex, d.start, d.count, d.index_address, d.index_size, {}};
     std::copy(std::begin(d.streams), std::end(d.streams), p.streams);
-    std::lock_guard lock(g_copy_mutex);
-    g_pending_copies.push_back(p);
+    std::lock_guard lock(g_incoming_mutex);
+    g_incoming_copies.push_back(p);
   }
   g_packet.commands.push_back({CommandKind::kDraw, uint32_t(g_packet.draws.size()), WritePointer(device)});
   g_packet.draws.push_back(d);
