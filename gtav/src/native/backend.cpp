@@ -94,6 +94,9 @@ REXCVAR_DEFINE_BOOL(gtav_native_slot_targets, false, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_native_defer_writebacks, true, "GTAV",
                     "Native renderer: write small resolves back to guest memory at the end of the frame instead of "
                     "right after each resolve (fewer render passes)");
+REXCVAR_DEFINE_BOOL(gtav_native_skip_depth_restore, true, "GTAV",
+                    "Native renderer: skip GTA V's depth restore strips (EDRAM aliasing trick; native "
+                    "depth targets keep their contents)");
 REXCVAR_DEFINE_BOOL(gtav_native_fragment_barriers, true, "GTAV",
                     "Native renderer: render target transitions wait at the fragment stage only");
 REXCVAR_DEFINE_INT32(gtav_native_skip_resolves, 0, "GTAV",
@@ -3392,6 +3395,13 @@ struct Backend::Impl {
         !live.empty() && live.find(fmt::format("{:016X}", d.vs_hash)) != std::string::npos)
       return;
     if (!skip_vs.empty() && skip_vs.find(fmt::format("{:016X}", d.vs_hash)) != std::string::npos) return;
+    // GTA V restores its depth buffer after EDRAM reuse by drawing 23 strips of 32 rows whose
+    // colour targets alias the depth surface (bases 000, 020, ... with depth at the base before).
+    // Native targets never lose their contents, so the restore has nothing to do here; drawn, it
+    // was 25 render passes into separate targets that nothing reads (~1 ms of GPU on the M1).
+    if (d.ps_hash == 0xF1490AFF1455E54Full && d.vs_hash == 0x5A4385B7FE6CD154ull &&
+        REXCVAR_GET(gtav_native_skip_depth_restore))
+      return;
     RenderShader* vs = Shader(d.vs_hash, false);
     RenderShader* ps = Shader(d.ps_hash, true);
     if (!vs || d.count == 0 || d.element_count == 0) {
