@@ -84,7 +84,7 @@ the phone once (about 15-25 minutes), and the phone installs the game files from
    deleted afterwards.
 Objects missing on the phone? Copy the phone's Android/data/com.gtavrecomp.app/files/shader_cache
 folder to <game folder>/android/shader_cache, press "Build for Android" again (a few minutes) and
-choose the new pack on the phone; the game files stay. A newer GTAV.apk needs a new pack (the app
+choose the new pack on the phone (long-press the app icon, "Run setup again"); the game files stay. A newer GTAV.apk needs a new pack (the app
 says so).
 
 Everything made from your files stays in the game folder (data/, gtav_game.dylib, iphone/GTAV.ipa

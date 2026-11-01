@@ -80,7 +80,11 @@ public class SetupActivity extends Activity {
             startGame();
             return;
         }
-        if (packCurrent() == null && nativeIsDataInstalled(home().getAbsolutePath())) {
+        addSetupShortcut();
+        // "Run setup again" (long-press the app icon) opens this screen even when the game is
+        // installed: to choose a newer pack (README: objects missing -> Build for Android again).
+        boolean again = getIntent() != null && getIntent().getBooleanExtra(EXTRA_SETUP, false);
+        if (!again && packCurrent() == null && nativeIsDataInstalled(home().getAbsolutePath())) {
             startGame();
             return;
         }
@@ -90,6 +94,28 @@ public class SetupActivity extends Activity {
         }
         setContentView(buildUi());
         refresh();
+    }
+
+    private static final String EXTRA_SETUP = "com.gtavrecomp.app.SETUP";
+
+    /** The launcher shortcut "Run setup again" (dynamic, so the APK needs no resources). */
+    private void addSetupShortcut() {
+        try {
+            android.content.pm.ShortcutManager sm = getSystemService(android.content.pm.ShortcutManager.class);
+            if (sm == null) return;
+            Intent i = new Intent(this, SetupActivity.class)
+                .setAction(Intent.ACTION_MAIN)
+                .putExtra(EXTRA_SETUP, true)
+                .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TASK | Intent.FLAG_ACTIVITY_NEW_TASK);
+            android.content.pm.ShortcutInfo info = new android.content.pm.ShortcutInfo.Builder(this, "setup")
+                .setShortLabel("Run setup again")
+                .setLongLabel("Run setup again (new game pack)")
+                .setIntent(i)
+                .build();
+            sm.setDynamicShortcuts(java.util.Collections.singletonList(info));
+        } catch (Exception e) {
+            Log.w(TAG, "shortcut: " + e);
+        }
     }
 
     // --- state ----------------------------------------------------------------------------------

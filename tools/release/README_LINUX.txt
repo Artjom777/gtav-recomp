@@ -85,7 +85,7 @@ the phone once (about 15-30 minutes), and the phone installs the game files from
    can be deleted afterwards.
 Objects missing on the phone? Copy the phone's Android/data/com.gtavrecomp.app/files/shader_cache
 folder to android/shader_cache here, press "Build for Android" again (a few minutes) and choose the
-new pack on the phone; the game files stay. A newer GTAV.apk needs a new pack (the app says so).
+new pack on the phone (long-press the app icon, "Run setup again"); the game files stay. A newer GTAV.apk needs a new pack (the app says so).
 Known issues on Android: some cutscenes in the prologue play without their centre channel (lines
 of dialogue are missing); about 20-28 fps, lower once the phone gets hot; the touch controls are
 basic (a controller works better).
