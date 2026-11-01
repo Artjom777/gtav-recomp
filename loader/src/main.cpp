@@ -4,7 +4,8 @@
 // Update 27; the launcher copies and checks the files, recompiles the game executable on this PC
 // and starts the game. Later runs start the game directly.
 // "Build for iPhone" (or "gtav_launcher.exe --iphone"): from the installed game, iphone\GTAV.ipa for
-// Sideloadly / AltStore (install.h RunIphoneBuild); the phone installs the game files itself.
+// Sideloadly / AltStore (install.h RunIphoneBuild); "Build for Android" (--android):
+// android\gtav-android-pack.zip for the APK (RunAndroidBuild). The phones install the game files.
 #include <windows.h>
 #include <commctrl.h>
 #include <shobjidl.h>
@@ -36,6 +37,7 @@ enum : int {
   kIdStage = 204,
   kIdLog = 205,
   kIdIphone = 206,
+  kIdAndroid = 207,
 };
 constexpr UINT kMsgLog = WM_APP + 1, kMsgStage = WM_APP + 2, kMsgProgress = WM_APP + 3,
                kMsgDone = WM_APP + 4, kMsgAsk = WM_APP + 5;
@@ -46,8 +48,8 @@ const wchar_t* kRowHints[3] = {
     L"the TU file (e.g. tu00000009_00000000) or a folder with default.xexp + update.rpf"};
 
 fs::path g_root;
-HWND g_wnd, g_edit[3], g_install, g_play, g_cancel, g_progress, g_stage, g_log, g_iphone;
-bool g_iphone_job = false;  // the running job is the iPhone build
+HWND g_wnd, g_edit[3], g_install, g_play, g_cancel, g_progress, g_stage, g_log, g_iphone, g_android;
+int g_phone_job = 0;  // the running job: 0 install, 1 iPhone build, 2 Android build
 HFONT g_font;
 std::atomic<bool> g_busy{false}, g_cancelled{false};
 std::thread g_worker;
@@ -158,6 +160,7 @@ void SetBusy(bool busy) {
   }
   EnableWindow(g_install, !busy);
   EnableWindow(g_iphone, !busy && IsInstalled(g_root));
+  EnableWindow(g_android, !busy && IsInstalled(g_root));
   EnableWindow(g_cancel, busy);
   EnableWindow(g_play, !busy && IsInstalled(g_root));
 }
@@ -178,7 +181,7 @@ void StartInstall() {
   SaveInputs();
   SetWindowTextW(g_log, L"");
   g_cancelled = false;
-  g_iphone_job = false;
+  g_phone_job = 0;
   SetBusy(true);
   if (g_worker.joinable()) g_worker.join();
   g_worker = std::thread([in] {
@@ -189,16 +192,16 @@ void StartInstall() {
   });
 }
 
-void StartIphone() {
+void StartPhone(bool android) {
   SetWindowTextW(g_log, L"");
   g_cancelled = false;
-  g_iphone_job = true;
+  g_phone_job = android ? 2 : 1;
   SetBusy(true);
   if (g_worker.joinable()) g_worker.join();
-  g_worker = std::thread([] {
+  g_worker = std::thread([android] {
     WindowUi ui;
     std::wstring error;
-    bool ok = RunIphoneBuild(g_root, g_root, ui, &error);
+    bool ok = android ? RunAndroidBuild(g_root, g_root, ui, &error) : RunIphoneBuild(g_root, g_root, ui, &error);
     PostMessageW(g_wnd, kMsgDone, ok, reinterpret_cast<LPARAM>(new std::wstring(error)));
   });
 }
@@ -234,6 +237,7 @@ void CreateControls() {
   g_install = Make(L"BUTTON", L"Install", BS_DEFPUSHBUTTON | WS_TABSTOP, 16, 250, 120, 30, kIdInstall);
   g_cancel = Make(L"BUTTON", L"Cancel", WS_TABSTOP, 144, 250, 100, 30, kIdCancel);
   g_iphone = Make(L"BUTTON", L"Build for iPhone", WS_TABSTOP, 252, 250, 150, 30, kIdIphone);
+  g_android = Make(L"BUTTON", L"Build for Android", WS_TABSTOP, 410, 250, 160, 30, kIdAndroid);
   g_play = Make(L"BUTTON", L"Play", WS_TABSTOP, 604, 250, 120, 30, kIdPlay);
   g_stage = Make(L"STATIC", L"", SS_ENDELLIPSIS, 16, 292, 708, 18, kIdStage);
   g_progress = Make(PROGRESS_CLASSW, L"", 0, 16, 314, 708, 18, kIdProgress);
@@ -263,8 +267,8 @@ LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         if (!p.empty()) SetWindowTextW(g_edit[id - kIdFolder], p.c_str());
       } else if (id == kIdInstall) {
         StartInstall();
-      } else if (id == kIdIphone) {
-        StartIphone();
+      } else if (id == kIdIphone || id == kIdAndroid) {
+        StartPhone(id == kIdAndroid);
       } else if (id == kIdCancel) {
         g_cancelled = true;
         SetWindowTextW(g_stage, L"Cancelling...");
@@ -299,10 +303,14 @@ LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
     case kMsgDone: {
       std::unique_ptr<std::wstring> err(reinterpret_cast<std::wstring*>(lp));
       SetBusy(false);
-      if (wp && g_iphone_job) {
-        // Show GTAV.ipa in Explorer: the next step is dragging it into Sideloadly.
-        SetWindowTextW(g_stage, L"iPhone build finished: install iphone\\GTAV.ipa with Sideloadly.");
-        std::wstring arg = L"/select,\"" + (g_root / L"iphone" / L"GTAV.ipa").wstring() + L"\"";
+      if (wp && g_phone_job) {
+        // Show the result in Explorer: the next step is dragging it into Sideloadly / onto the phone.
+        const bool android = g_phone_job == 2;
+        SetWindowTextW(g_stage, android ? L"Android build finished: copy android\\gtav-android-pack.zip and your "
+                                          L"disc files to the phone."
+                                        : L"iPhone build finished: install iphone\\GTAV.ipa with Sideloadly.");
+        fs::path out = android ? g_root / L"android" / L"gtav-android-pack.zip" : g_root / L"iphone" / L"GTAV.ipa";
+        std::wstring arg = L"/select,\"" + out.wstring() + L"\"";
         ShellExecuteW(hw, nullptr, L"explorer.exe", arg.c_str(), nullptr, SW_SHOWNORMAL);
       } else if (wp) {
         SetWindowTextW(g_stage, L"Setup finished. Press Play.");
@@ -382,13 +390,14 @@ int Unattended() {
   return ok ? 0 : 1;
 }
 
-// "--iphone": the iPhone build without a window (data\logs\iphone_unattended.txt).
-int IphoneUnattended() {
+// "--iphone" / "--android": the phone builds without a window (data\logs\<phone>_unattended.txt).
+int PhoneUnattended(bool android) {
   std::error_code ec;
   fs::create_directories(g_root / L"data" / L"logs", ec);
-  FileUi ui(g_root / L"data" / L"logs" / L"iphone_unattended.txt");
+  FileUi ui(g_root / L"data" / L"logs" / (android ? L"android_unattended.txt" : L"iphone_unattended.txt"));
   std::wstring error;
-  bool ok = Preflight(g_root, &error) && RunIphoneBuild(g_root, g_root, ui, &error);
+  bool ok = Preflight(g_root, &error) && (android ? RunAndroidBuild(g_root, g_root, ui, &error)
+                                                  : RunIphoneBuild(g_root, g_root, ui, &error));
   ui.Log(ok ? L"done" : L"error: " + error);
   return ok ? 0 : 1;
 }
@@ -404,7 +413,8 @@ fs::path ExeDir() {
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int show) {
   g_root = ExeDir();
   if (cmdline && wcsstr(cmdline, L"--unattended")) return Unattended();
-  if (cmdline && wcsstr(cmdline, L"--iphone")) return IphoneUnattended();
+  if (cmdline && wcsstr(cmdline, L"--iphone")) return PhoneUnattended(false);
+  if (cmdline && wcsstr(cmdline, L"--android")) return PhoneUnattended(true);
   bool setup = cmdline && wcsstr(cmdline, L"--setup");
   // The common case: installed, start the game and get out of the way.
   if (!setup && IsInstalled(g_root) && !(GetKeyState(VK_SHIFT) & 0x8000)) {
