@@ -120,6 +120,8 @@ def check_needed(out):
     for p in sorted(out.rglob("*")):
         if not p.is_file() or p.read_bytes()[:4] != b"\x7fELF":
             continue
+        if p.relative_to(out).parts[0] == "android":  # phone libraries (bionic), linked against only
+            continue
         d = subprocess.run(["readelf", "-d", str(p)], capture_output=True, text=True).stdout
         for line in d.splitlines():
             if "(NEEDED)" in line:
