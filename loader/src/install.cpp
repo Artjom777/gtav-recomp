@@ -1442,7 +1442,11 @@ class Installer {
     std::map<std::string, fs::path> bins;  // name -> container
     for (const fs::path& dir : {phone_cache, data_ / L"shader_cache"}) {
       for (auto it = fs::directory_iterator(dir, ec); !ec && it != fs::directory_iterator(); it.increment(ec)) {
-        if (it->path().extension() == ".bin") bins[it->path().stem().string()] = it->path();
+        // Shader containers only (ps_/vs_<hash>.bin): the phone's shader_cache also holds the renderer's
+        // pipeline caches (pipelines.bin, vk_pipelines.bin) when the player copies the whole folder.
+        if (const std::string stem = it->path().stem().string();
+            it->path().extension() == ".bin" && (stem.rfind("ps_", 0) == 0 || stem.rfind("vs_", 0) == 0))
+          bins[stem] = it->path();
       }
       ec.clear();
     }

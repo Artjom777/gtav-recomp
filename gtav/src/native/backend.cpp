@@ -68,6 +68,7 @@
 #include <vector>
 
 REXCVAR_DECLARE(std::string, gtav_native_spirv_dir);
+REXCVAR_DECLARE(bool, gtav_native_compile);
 REXCVAR_DECLARE(bool, gtav_native_flicker_catch);
 REXCVAR_DEFINE_INT32(gtav_native_dump_rt, 0x2D0, "GTAV",
                      "Frame dumps: EDRAM base of the color target snapshotted after every draw (0x2D0 = scene HDR)");
@@ -234,6 +235,9 @@ REXCVAR_DEFINE_INT32(gtav_native_fetch_debug, 0, "GTAV",
 REXCVAR_DEFINE_INT32(gtav_native_max_anisotropy, 16, "GTAV",
                      "Native renderer (live): cap on the anisotropic filtering the game asks for (1 = off; "
                      "samplers are cached per setting)");
+REXCVAR_DEFINE_INT32(gtav_native_texture_min_lod, 0, "GTAV",
+                     "Native renderer (live): mip levels skipped at the top of mipmapped textures (0 = full "
+                     "resolution, 1 = half; cuts texture bandwidth on phones)");
 REXCVAR_DEFINE_INT32(gtav_native_msaa_draws, 0, "GTAV",
                      "Diagnostic (live): log every draw into a multisampled target for the next N frames "
                      "(shaders, primitive, count, target, blend, depth state)");
@@ -3115,6 +3119,11 @@ struct Backend::Impl {
     s.minLOD = float((words[4] >> 2) & 15);
     s.maxLOD = base_map ? s.minLOD + 0.25f : float((words[4] >> 6) & 15);
     if (s.maxLOD < s.minLOD) s.maxLOD = s.minLOD;
+    // --gtav_native_texture_min_lod: skip the largest mip levels of mipmapped textures (Metal has no
+    // sampler LOD bias, MoltenVK ignores mipLodBias; a min LOD clamp works). Each level quarters the
+    // bytes a fetch reads: the prologue's snow terrain (73 fetches a pixel) is bandwidth bound on phones.
+    if (const int32_t skip = REXCVAR_GET(gtav_native_texture_min_lod); skip > 0 && !base_map && s.maxLOD > s.minLOD)
+      s.minLOD = std::min(s.minLOD + float(skip), s.maxLOD);
     s.mipLODBias = float(int32_t(words[4] << 10) >> 22) / 32.0f;
     if (REXCVAR_GET(gtav_native_point_float32)) {
       switch (words[1] & 0x3F) {
@@ -3629,6 +3638,7 @@ struct Backend::Impl {
   };
   std::unordered_map<uint64_t, FailedPipeline> failed_pipelines;
   bool pipeline_failed = false;  // the last Pipeline() returned null for a failed compile
+  const bool can_compile_shaders = REXCVAR_GET(gtav_native_compile);
   RenderPipeline* FinishPipeline(uint64_t key, std::unique_ptr<RenderPipeline> result) {
     if (!result) {
       auto& f = failed_pipelines[key];
@@ -4073,10 +4083,13 @@ struct Backend::Impl {
     RenderShader* ps = Shader(d.ps_hash, true);
     if (!vs || d.count == 0 || d.element_count == 0) {
       stat_skipped++;
-      if (!vs && d.count && d.element_count) NoteLost(lost_vs, "vs", d, r);
+      if (!vs && d.count && d.element_count && can_compile_shaders) NoteLost(lost_vs, "vs", d, r);
       return;
     }
-    if (!ps && d.ps_hash) NoteLost(lost_ps, "ps", d, r);
+    // A shader that will never arrive (iPhone: no shader compiler, gtav_native_compile off) is not
+    // waited for: holding frames for it froze the picture to ~1 frame a second in the prologue,
+    // whose shaders the PC had not seen (they are saved to shader_cache for the next PC run).
+    if (!ps && d.ps_hash && can_compile_shaders) NoteLost(lost_ps, "ps", d, r);
     RenderTopologyInfo topo = Topology(d.primitive);
     if (topo.skip) {
       stat_skipped++;
