@@ -231,6 +231,12 @@ REXCVAR_DEFINE_BOOL(gtav_native_fetch_resolves, true, "GTAV",
                     "Native renderer: in-pass colour resolves when available (macOS; GTAV_NATIVE_FETCH_RESOLVE=0 at start: off)");
 REXCVAR_DEFINE_INT32(gtav_native_fetch_debug, 0, "GTAV",
                      "Diagnostic: in-pass resolves store 1 magenta, 2 source + red, 3 source with alpha 1, 4 a green clear");
+REXCVAR_DEFINE_INT32(gtav_native_max_anisotropy, 16, "GTAV",
+                     "Native renderer (live): cap on the anisotropic filtering the game asks for (1 = off; "
+                     "samplers are cached per setting)");
+REXCVAR_DEFINE_INT32(gtav_native_msaa_draws, 0, "GTAV",
+                     "Diagnostic (live): log every draw into a multisampled target for the next N frames "
+                     "(shaders, primitive, count, target, blend, depth state)");
 REXCVAR_DEFINE_INT32(gtav_native_seqdiag, 0, "GTAV",
                      "Diagnostic (GTAV_NATIVE_PASS_STATS): log the command sequence of the next frame when set to 1");
 REXCVAR_DEFINE_INT32(gtav_native_fetch_max_draws, 1, "GTAV",
@@ -2420,6 +2426,7 @@ struct Backend::Impl {
   }
   std::string seq_passes;
   bool seqdiag = false;
+  uint32_t msaa_draws_frames = 0;  // --gtav_native_msaa_draws countdown
   std::string seq_note;
 
   void Transition(RenderCommandList* list, RenderTexture* t, RenderTextureLayout layout) {
@@ -3102,8 +3109,9 @@ struct Backend::Impl {
       s.minFilter = ((words[3] >> 21) & 3) == 1 ? RenderFilter::LINEAR : RenderFilter::NEAREST;
       s.mipmapMode = mip_filter == 1 ? RenderMipmapMode::LINEAR : RenderMipmapMode::NEAREST;
     }
-    s.anisotropyEnabled = aniso >= 2;
-    s.maxAnisotropy = s.anisotropyEnabled ? 1u << (aniso - 1) : 1;
+    s.maxAnisotropy = aniso >= 2 ? 1u << (aniso - 1) : 1;
+    s.maxAnisotropy = std::min<uint32_t>(s.maxAnisotropy, uint32_t(std::max(1, REXCVAR_GET(gtav_native_max_anisotropy))));
+    s.anisotropyEnabled = s.maxAnisotropy >= 2;
     s.minLOD = float((words[4] >> 2) & 15);
     s.maxLOD = base_map ? s.minLOD + 0.25f : float((words[4] >> 6) & 15);
     if (s.maxLOD < s.minLOD) s.maxLOD = s.minLOD;
@@ -4556,6 +4564,14 @@ struct Backend::Impl {
       std::memcpy(&dump_draws[at], vsc.cpu, kAluSize);
       std::memcpy(&dump_draws[at + 1024], psc.cpu, kAluSize);
     }
+    if (msaa_draws_frames && ((bind_count && bind_color[0] && bind_color[0]->msaa) || (depth && depth->msaa))) {
+      const RenderTarget* t = bind_count && bind_color[0] ? bind_color[0] : depth;
+      uint32_t bc = regs::Read(r, regs::RB_BLENDCONTROL0), dc = regs::Read(r, regs::RB_DEPTHCONTROL);
+      REXLOG_INFO("[native] MSAADRAW frame {} vs {:016X} ps {:016X} prim {} count {} target {}x{} msaa {} fmt {} "
+                  "colors {} depth {} blend {:08X} depthctl {:08X}",
+                  frame, d.vs_hash, d.ps_hash, d.primitive, d.count, t->width, t->height, t->msaa, int(t->format),
+                  bind_count, depth ? 1 : 0, bc, dc);
+    }
     const RenderFramebuffer* fb_before = bound_fb;
     BindTargets(list, bind_color, bind_count, depth);
     if (bound_fb != fb_before) {  // a new render pass: rebind conservatively
@@ -5806,6 +5822,11 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
     s.snapshot_budget = 3;
   }
   s.seqdiag = s.pass_stats && f.index && (f.index % 3000 == 0 || REXCVAR_GET(gtav_native_seqdiag));
+  if (s.msaa_draws_frames) s.msaa_draws_frames--;
+  if (int32_t n = REXCVAR_GET(gtav_native_msaa_draws); n > 0) {
+    s.msaa_draws_frames = uint32_t(n);
+    rex::cvar::SetFlagByName("gtav_native_msaa_draws", "0");
+  }
   if (REXCVAR_GET(gtav_native_seqdiag)) rex::cvar::SetFlagByName("gtav_native_seqdiag", "0");
   std::string seq;
   uint32_t seq_draws = 0;
