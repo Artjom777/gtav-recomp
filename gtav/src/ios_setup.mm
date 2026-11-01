@@ -48,8 +48,10 @@ int Classify(const fs::path& p) {
   const bool dir = fs::is_directory(p, ec);
   if (dir || p.extension() == ".iso" || p.extension() == ".ISO") {
     if (auto disc = loader::OpenDisc(p.wstring(), &err)) {
-      if (disc->Find("default.xex") && disc->Find("xbox360b.rpf")) return kDisc2;
+      // As install.cpp OpenInputs: Disc 1 carries the install packages (and a default.xex and
+      // xbox360b.rpf of its own, so it is tested first); Disc 2 has the play data.
       if (disc->Find("content/0000000000000000/545408A7/00000002/545408A700000000")) return kDisc1;
+      if (disc->Find("default.xex") && disc->Find("xbox360b.rpf") && disc->Find("audio_rel.rpf")) return kDisc2;
       if (disc->Find("disc002/default.xexp") || disc->Find("default.xexp")) return kTu;
     }
     return -1;

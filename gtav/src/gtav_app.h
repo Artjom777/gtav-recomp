@@ -110,6 +110,9 @@ class GtavApp : public rex::ReXApp {
     paths.game_data_root = data / "game";
     paths.update_data_root = data / "update";
     paths.user_data_root = data / "user";
+    // As the SDK derives it from --user_data_root (user/cache); its default under $HOME/.local is
+    // outside the sandbox's writable Documents (create_directories threw: the app aborted).
+    paths.cache_root = data / "user" / "cache";
     if (gtav::ios_setup::DataInstalled()) return paths;
     gtav::ios_setup::Show([paths, resume] { resume(paths); });
     return std::nullopt;
