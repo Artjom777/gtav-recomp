@@ -235,6 +235,14 @@ REXCVAR_DEFINE_INT32(gtav_native_fetch_debug, 0, "GTAV",
 REXCVAR_DEFINE_INT32(gtav_native_max_anisotropy, 16, "GTAV",
                      "Native renderer (live): cap on the anisotropic filtering the game asks for (1 = off; "
                      "samplers are cached per setting)");
+#if GTAV_MOBILE
+#define GTAV_HOLD_MAX_DEFAULT 15
+#else
+#define GTAV_HOLD_MAX_DEFAULT 60
+#endif
+REXCVAR_DEFINE_INT32(gtav_native_hold_max_frames, GTAV_HOLD_MAX_DEFAULT, "GTAV",
+                     "Native renderer (live): longest run of frames --gtav_native_hold_lost_frames repeats before "
+                     "showing live frames (with the draws still compiling missing) until a complete frame");
 REXCVAR_DEFINE_INT32(gtav_native_texture_min_lod, 0, "GTAV",
                      "Native renderer (live): mip levels skipped at the top of mipmapped textures (0 = full "
                      "resolution, 1 = half; cuts texture bandwidth on phones)");
@@ -5434,6 +5442,7 @@ struct Backend::Impl {
   std::unique_ptr<RenderTexture> held;
   std::unique_ptr<RenderTextureView> held_view;
   uint32_t held_descriptor = 0, held_width = 0, held_height = 0, held_frames = 0, held_run = 0;
+  bool hold_spent = false;  // the hold ran out during this run of lost frames: live frames until a complete one
   RenderFormat held_format = RenderFormat::UNKNOWN;
   bool held_valid = false;
   RenderTexture* HoldFront(RenderCommandList* list, ResolvedTexture& front, bool lost, uint32_t* descriptor) {
@@ -5441,8 +5450,14 @@ struct Backend::Impl {
       held_valid = false;
       return nullptr;
     }
-    // A long run of lost frames (a loading burst) shows the live frame again after ~1 s.
-    if (lost && held_valid && held_run < 60) {
+    // A long run of lost frames (a loading burst, or one pipeline the iPhone's Metal compiler took
+    // 30 s over) shows live frames once the hold is used up, until a complete frame arrives. (It used
+    // to show one live frame and hold again: 60 frozen, 1 live, a frame a second for as long as the
+    // compile took.) Phones hold for half a second, desktops for one.
+    if (!lost) hold_spent = false;
+    if (lost && held_valid && !hold_spent && held_run >= uint32_t(std::max(1, REXCVAR_GET(gtav_native_hold_max_frames))))
+      hold_spent = true;
+    if (lost && held_valid && !hold_spent) {
       held_run++;
       if (++held_frames <= 10 || held_frames % 100 == 0)
         REXLOG_INFO("[native] frame lost draws: showing the previous frame instead ({} so far)", held_frames);
