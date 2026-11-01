@@ -67,8 +67,29 @@ GTA V's folder, shader_cache. To fix them: copy that folder to <game folder>/iph
 on the Mac, press "Build for iPhone" again (only the shaders are redone, a few minutes) and
 install the new GTAV.ipa over the old one (the game files on the phone stay).
 
-Everything made from your files stays in the game folder (data/ and gtav_game.dylib). Do not share
-it: it contains Rockstar Games' copyrighted work. To uninstall, delete GTAV.app and the game folder.
+Android (experimental)
+----------------------
+Play GTA V on an Android phone with a recent Snapdragon (tested: Galaxy S23 FE, Snapdragon 8 Gen 1)
+and about 40 GB free during setup. The app has no game in it: this Mac builds your game code for
+the phone once (about 15-25 minutes), and the phone installs the game files from your discs.
+1. Install and play the game on the Mac for a while first (the phone gets the shaders the Mac has
+   seen: drive around, go indoors).
+2. Hold Option while opening GTAV.app and press "Build for Android". Finder then shows the
+   game folder's android/ folder with GTAV.apk and gtav-android-pack.zip.
+3. Copy GTAV.apk, gtav-android-pack.zip, your Disc 1 ISO, Disc 2 ISO and the TU file to the phone
+   (for example its Download folder; Android File Transfer or a USB stick).
+4. On the phone, open GTAV.apk to install it (allow installing apps from that source).
+5. Open GTA V, choose the four files and press Install. It copies and checks about 16 GB, then
+   starts the game. Keep the app open while it installs. The disc images and the pack can be
+   deleted afterwards.
+Objects missing on the phone? Copy the phone's Android/data/com.gtavrecomp.app/files/shader_cache
+folder to <game folder>/android/shader_cache, press "Build for Android" again (a few minutes) and
+choose the new pack on the phone; the game files stay. A newer GTAV.apk needs a new pack (the app
+says so).
+
+Everything made from your files stays in the game folder (data/, gtav_game.dylib, iphone/GTAV.ipa
+and android/gtav-android-pack.zip). Do not share any of it: it contains Rockstar Games' copyrighted
+work. (GTAV.apk as downloaded holds no game and is fine to share.) To uninstall, delete GTAV.app and the game folder.
 
 This project is free software under the GNU GPL, version 3 or later (LICENSES/gtav-recomp-GPL-3.0.txt).
 Source code: https://github.com/andrewnakas/gtav-recomp. The complete source of every program in

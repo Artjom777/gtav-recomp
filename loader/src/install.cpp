@@ -1297,6 +1297,12 @@ class Installer {
     const fs::path zip = out / L"gtav-android-pack.zip";
     if (!WriteZip(pack, "", zip, [](const std::string&, const fs::path&) { return false; }))
       return SetError(L"Could not write " + zip.wstring());
+    // macOS: the package (with the APK) is inside GTAV.app; put the APK next to the pack, so the one
+    // folder Finder shows holds both files for the phone. (Windows / Linux: it is that folder.)
+    if (const fs::path apk = root_ / L"android" / L"GTAV.apk"; !fs::equivalent(root_, home_, ec)) {
+      fs::copy_file(apk, out / L"GTAV.apk", fs::copy_options::overwrite_existing, ec);
+      if (ec) return SetError(L"Could not copy GTAV.apk next to the pack: " + Widen(ec.message()));
+    }
     fs::remove_all(data_ / L"build", ec);
     Log(L"---- Android build finished: " + zip.wstring());
     ui_.Progress(1.0);

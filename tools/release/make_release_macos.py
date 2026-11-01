@@ -153,6 +153,7 @@ def main():
     ap.add_argument("--sdk", default=str(SDK / "out" / "install" / "mac-arm64"))
     ap.add_argument("--zip", action="store_true")
     ap.add_argument("--ios-shell", help="tools/ios/make_shell.sh output folder (the iPhone step's ios/)")
+    ap.add_argument("--android", help="tools/android/make_shell.sh output (built on Linux): the Android step's android/ folder")
     ap.add_argument("--allow-newer-os", action="store_true", help="skip the macOS 15 floor check (testing)")
     a = ap.parse_args()
     sdk_install = Path(a.sdk)
@@ -218,6 +219,17 @@ def main():
         shutil.copytree(Path(a.ios_shell), pkg / "ios")
         ios_dir = pkg / "ios" / "GTAV.app"
         check_ios_shell(ios_dir)
+
+    if a.android:
+        # The Android step (install.cpp RunAndroid): the public APK without game code, the APK's own
+        # libgtav_fast.so / librexruntime.so to link against, interface lists and simde; built on Linux
+        # by tools/android/make_shell.sh, copied as it is (same checks as make_release_linux.py).
+        android = Path(a.android)
+        for f in ("GTAV.apk", "link/libgtav_fast.so", "link/librexruntime.so", "interface/gtav_game.exports",
+                  "interface/gtav_hooks.h", "include/simde/x86/sse4.1.h", "LICENSES/simde.txt"):
+            if not (android / f).is_file():
+                sys.exit(f"--android: missing {f}")
+        shutil.copytree(android, pkg / "android")
 
     llvm = Path(a.llvm)
     copy(llvm / "bin" / "clang-19", pkg / "tools/llvm/bin/clang++", True)
