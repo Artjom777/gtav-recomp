@@ -50,6 +50,37 @@ every recompiled shader), recording on several threads (secondary command buffer
 loads per pass (LOAD_OP_CLEAR/DONT_CARE where a pass starts with a full clear), less charging heat
 (Game Booster "Pause USB Power Delivery", or play unplugged).
 
+## Release layout (11-01): the APK holds no game code
+
+The owner's rule: nothing Rockstar-derived is published (Take-Two / re3). The developer APK
+(`build_apk.sh`) has the recompiled game inside libmain.so (~300 MB) and must stay private.
+The public one (`RELEASE=1 build_apk.sh`, packaged by `tools/android/make_shell.sh dist/android`):
+
+| library | what | from |
+|---|---|---|
+| libmain.so (41 KB) | shim: SDL calls its SDL_main; it dlopens `<files>/libgtav_game.so` and calls SDL_main in libgtav_fast.so | src/android_main_shim.cpp |
+| libgtav_fast.so | all our code (renderer, hooks, bridge), `GTAV_GAME_DLL=ON`; the 2931 game functions it calls stay undefined | build/android-dll |
+| libgtav_setup.so | setup screen's data install (install.cpp RunDataInstall over JNI) | src/android_setup_jni.cpp |
+| librexruntime.so, librexgpu-xenos.so, libc++_shared.so | SDK, as before | |
+| libgtav_game.so | **not in the APK**: the player's game code, from their PC | Build for Android |
+
+Binding: bionic resolves undefined symbols inside the tree one dlopen loads (game ->
+libgtav_fast -> librexruntime -> libc), so the game finds the hooks/bridge and libgtav_fast finds
+the game functions, both at load (`-z now`). The game library must be in private storage
+(`getFilesDir()`): shared storage is noexec.
+
+Player flow: PC launcher "Build for Android" / `--android` (install.cpp RunAndroid: codegen +
+reference check, freestanding aarch64-linux-android30 compile with the bundled LLVM 19, lld
+`-flavor gnu` against `android/link/`, Adreno shaders through adreno_shader_fix.cpp) ->
+`android/gtav-android-pack.zip` (libgtav_game.so, spirv/, expected.txt, pack.txt with the hash of
+the libgtav_fast.so it fits). On the phone SetupActivity takes the pack and the three disc files
+(SAF; the installer reads `/proc/self/fd/N`), unpacks, installs `data/{game,update,user}` into the
+external files dir, then starts GameActivity, which then passes those roots and the built-in
+release flags.
+
+Not done yet: a phone test of the whole flow; on-device codegen/compile (clang/lld/dxc for
+Android: tools/android/build_llvm.sh exists, building downloaded LLVM needs the owner's OK).
+
 ## Build and run (from Linux, phone on adb)
 
 ```sh
