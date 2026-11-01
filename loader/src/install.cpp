@@ -37,7 +37,13 @@
 extern char** environ;
 #endif
 #ifdef __APPLE__
+#include <TargetConditionals.h>
 #include <sys/sysctl.h>
+#endif
+// The iPhone app's setup screen uses the copy stages only (RunDataInstall): iOS cannot start
+// processes, so nothing here that spawns one (codegen, clang, the game) runs there.
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+#define LOADER_NO_SPAWN 1
 #endif
 
 #include <algorithm>
@@ -438,13 +444,19 @@ struct Child {
   pid_t pid = -1;
   int status = -1;
   bool Start(const Args& args, const fs::path& cwd, const fs::path& log) {
+#ifdef LOADER_NO_SPAWN
+    (void)args, (void)cwd, (void)log;
+    return false;
+#endif
     std::vector<std::string> narrow = NarrowArgs(args);
     std::vector<char*> argv = Argv(narrow);
     posix_spawn_file_actions_t fa;
     posix_spawn_file_actions_init(&fa);
     posix_spawn_file_actions_addopen(&fa, 1, log.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     posix_spawn_file_actions_adddup2(&fa, 1, 2);
+#ifndef LOADER_NO_SPAWN
     posix_spawn_file_actions_addchdir_np(&fa, cwd.c_str());
+#endif
     int err = posix_spawn(&pid, argv[0], &fa, nullptr, argv.data(), environ);
     posix_spawn_file_actions_destroy(&fa);
     if (err != 0) {
@@ -533,10 +545,37 @@ class Installer {
     return true;
   }
 
+  // Game data only (the iPhone app's setup screen: its game code and shaders were built on the
+  // player's Mac): the same checked copies into <home>/data, no codegen.
+  bool RunData(const fs::path& expected, std::wstring* error) {
+    error_ = error;
+    data_only_ = true;
+    std::error_code ec;
+    fs::create_directories(data_ / L"logs", ec);
+    log_.open(data_ / L"logs" / L"install.log", std::ios::app);
+    Log(L"---- game data install started");
+    if (!expected_.Load(expected, error)) return false;
+    if (!OpenInputs()) return false;
+    if (!CheckSpace()) return false;
+    LoadDone();
+    copy_total_ = expected_.TotalBytes();
+    if (!CopyDisc2() || !CopyTitleUpdate() || !CopyInstallPartitions()) return Fail();
+    if (!ReviewMismatches()) return false;
+    std::ofstream(data_ / L"data_installed.txt") << kDataVersion << "\n";
+    fs::remove(data_ / L"install_state.txt", ec);
+    ui_.Progress(1.0);
+    ui_.Stage(L"Done.");
+    Log(L"---- game data install finished");
+    return true;
+  }
+
  private:
   // Progress budget: copying 0..0.55, codegen ..0.70, check ..0.72, compile ..0.97, link ..1.
   static constexpr double kCopyEnd = 0.55, kCodegenEnd = 0.70, kCheckEnd = 0.72,
                           kCompileEnd = 0.97;
+
+  static constexpr char kDataVersion[] = "gtav-recomp data 1";
+  bool data_only_ = false;  // RunData: copying is the whole progress bar
 
   bool Fail() {
     if (ui_.Cancelled() && error_->empty()) *error_ = L"Cancelled.";
@@ -617,7 +656,7 @@ class Installer {
       uint64_t QuadPart;
     } free_bytes = {uint64_t(sv.f_bavail) * sv.f_frsize};
 #endif
-    uint64_t need = expected_.TotalBytes() + (3ull << 30);  // + codegen and objects
+    uint64_t need = expected_.TotalBytes() + (data_only_ ? (512ull << 20) : (3ull << 30));  // + codegen and objects
     // Files already in place (an interrupted earlier run) count as done.
     auto have = [&](const fs::path& p, uint64_t size) {
       std::error_code ec;
@@ -630,7 +669,7 @@ class Installer {
     if (auto* e = Find(expected_.tu, "default.xexp")) have(data_ / L"game" / L"default.xexp", e->size);
     if (auto* e = Find(expected_.tu, "update.rpf")) have(data_ / L"update" / L"update.rpf", e->size);
     if (free_bytes.QuadPart < need)
-      return SetError(L"Not enough free space next to the launcher: " + Gb(need) + L" needed, " +
+      return SetError(L"Not enough free space for the game: " + Gb(need) + L" needed, " +
                       Gb(free_bytes.QuadPart) + L" free.");
     return true;
   }
@@ -695,7 +734,7 @@ class Installer {
 
   void Report() {
     double f = copy_total_ ? double(copied_) / double(copy_total_) : 0;
-    ui_.Progress(std::min(f, 1.0) * kCopyEnd);
+    ui_.Progress(std::min(f, 1.0) * (data_only_ ? 1.0 : kCopyEnd));
   }
 
   bool CopyDisc2() {
@@ -1011,29 +1050,31 @@ class Installer {
     std::wstring err;
     if (!SyncRuntime(root_, home_, &err)) return SetError(err);  // the shader tools in <home>/tools
     const fs::path out = home_ / L"iphone", app = out / L"Payload" / L"GTAV.app";
-    // Built before from this same package: only the shaders (new ones the phone saved) are redone.
+    // Built before from this same package: only the shaders (new ones the phone saved) are redone
+    // and the ipa repacked; reinstalling it keeps the game data in the app's Documents.
     std::string a, b;
     uint64_t sa = 0, sb = 0;
-    const bool app_current = fs::exists(out / L"GTAV.ipa", ec) && fs::exists(app / L"gtav_game.dylib", ec) &&
-                             HashFile(app / L"gtav", &a, &sa) && HashFile(shell / L"gtav", &b, &sb) && a == b;
+    const bool app_current = fs::exists(app / L"gtav_game.dylib", ec) && HashFile(app / L"gtav", &a, &sa) &&
+                             HashFile(shell / L"gtav", &b, &sb) && a == b;
     if (app_current) {
-      Log(L"GTAV.ipa is current: translating new shaders only");
-      if (!IphoneShaders(out / L"Documents" / L"spirv")) return Fail();
-      std::ofstream(out / L"Documents" / L"args.txt") << kIphoneArgs;
-      ui_.Progress(1.0);
-      ui_.Stage(L"Done: the shaders in iphone/Documents/spirv are up to date (copy spirv to the phone).");
-      return true;
+      Log(L"The iPhone app is current: translating new shaders only");
+    } else {
+      if (!expected_.Load(root_ / L"tools" / L"game_dll" / L"expected.txt", error)) return false;
+      if (!Codegen() || !CheckGenerated() || !Compile()) return Fail();
+      fs::remove_all(out / L"Payload", ec);
+      fs::create_directories(app, ec);
+      fs::copy(shell, app, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+      if (ec) return SetError(L"Could not copy the iPhone app: " + Widen(ec.message()));
+      if (!LinkIphone(app / L"gtav_game.dylib")) return Fail();
     }
-    if (!expected_.Load(root_ / L"tools" / L"game_dll" / L"expected.txt", error)) return false;
-    if (!Codegen() || !CheckGenerated() || !Compile()) return Fail();
-
-    fs::remove_all(out / L"Payload", ec);
-    fs::create_directories(app, ec);
-    fs::copy(shell, app, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
-    if (ec) return SetError(L"Could not copy the iPhone app: " + Widen(ec.message()));
-    if (!LinkIphone(app / L"gtav_game.dylib")) return Fail();
-    if (!IphoneShaders(out / L"Documents" / L"spirv")) return Fail();
-    std::ofstream(out / L"Documents" / L"args.txt") << kIphoneArgs;
+    // Everything the phone needs but its game files is inside the app: shaders, the known-good
+    // hashes its setup screen checks the discs against, and the default arguments.
+    if (!IphoneShaders(app / L"spirv")) return Fail();
+    fs::copy_file(root_ / L"tools" / L"game_dll" / L"expected.txt", app / L"expected.txt",
+                  fs::copy_options::overwrite_existing, ec);
+    if (ec) return SetError(L"Could not copy expected.txt into the iPhone app");
+    std::ofstream(app / L"args.txt") << kIphoneArgs;
+    fs::remove_all(out / L"Documents", ec);  // (earlier builds' layout)
 
     ui_.Stage(L"Packing GTAV.ipa...");
     fs::remove(out / L"GTAV.ipa", ec);
@@ -1048,14 +1089,14 @@ class Installer {
     fs::remove_all(data_ / L"build", ec);
     Log(L"---- iPhone build finished: " + (out / L"GTAV.ipa").wstring());
     ui_.Progress(1.0);
-    ui_.Stage(L"Done: iphone/GTAV.ipa and iphone/Documents in the game folder (see the README).");
+    ui_.Stage(L"Done: iphone/GTAV.ipa in the game folder. Install it with Sideloadly or AltStore.");
     return true;
   }
 
  private:
-  // Documents/args.txt on the phone: the game folder's data/ subfolders copied into Documents.
+  // The app's own args.txt (the SDK reads it before Documents/args.txt). No data roots: the setup
+  // screen installs the game data into Documents/data (gtav_app.h OnFinalizePaths).
   static constexpr char kIphoneArgs[] =
-      "--game_data_root=game\n--user_data_root=user\n--update_data_root=update\n"
       "--gpu_plugin=xenos --headless=true\n"
       "--gtav_native=on --gpu_skip_rendering=true --gpu_skip_rendering_lag_ms=6\n"
       "--vsync=false --gtav_native_vsync=true --gtav_fps_limit=30\n"
@@ -1375,6 +1416,20 @@ class Installer {
 
 }  // namespace
 
+bool RunDataInstall(const fs::path& home, const fs::path& expected, const InstallInputs& in, InstallUi& ui,
+                    std::wstring* error) {
+  Installer inst(home, home, in, ui);
+  return inst.RunData(expected, error);
+}
+
+bool IsDataInstalled(const fs::path& home) {
+  std::ifstream f(home / "data" / "data_installed.txt");
+  std::string line;
+  std::error_code ec;
+  return std::getline(f, line) && line == "gtav-recomp data 1" &&
+         fs::exists(home / "data" / "game" / "default.xex", ec);
+}
+
 bool IsInstalled(const fs::path& root) {
   std::error_code ec;
   if (!fs::exists(root / kGameLib, ec)) return false;
@@ -1593,7 +1648,9 @@ bool LaunchGame(const fs::path& root, std::wstring* error, const std::vector<std
   posix_spawn_file_actions_init(&fa);
   posix_spawn_file_actions_addopen(&fa, 1, out.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
   posix_spawn_file_actions_adddup2(&fa, 1, 2);
+#ifndef LOADER_NO_SPAWN
   posix_spawn_file_actions_addchdir_np(&fa, root.c_str());
+#endif
   posix_spawnattr_t attr;
   posix_spawnattr_init(&attr);
   posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);

@@ -139,9 +139,19 @@ shaders from its installed game (loader/src/install.cpp `RunIphone`):
   `data/shader_cache` (+ `iphone/shader_cache` copied back from the phone) through XenosRecomp, the
   UBO rewrite (tools/android/ubo_constants.py ported to C++; its 3,653 outputs are byte-identical
   to make_spirv.sh) and dxc, then `iphone/GTAV.ipa` (unsigned, for Sideloadly / AltStore) and
-  `iphone/Documents/{args.txt,spirv}`. The player copies those and data/{game,update,user} into
-  the app's Documents in Finder (README_MACOS.txt "iPhone"). A second run with a current ipa
-  only translates new shaders (seconds).
+  everything else the phone needs inside the app (below). A second run with a current app only
+  translates new shaders and repacks the ipa (README_MACOS.txt "iPhone").
+- **On-phone game data install** (as the Skate 3 iOS app's ISO wizard): the ipa carries no game
+  files; it holds the game library, `spirv/`, `expected.txt` and `args.txt` (the SDK reads the
+  bundle's args.txt, then Documents/args.txt). With no `--game_data_root`, GtavApp::OnFinalizePaths
+  (gtav_app.h) holds the start and shows the UIKit setup screen (gtav/src/ios_setup.mm): it finds
+  Disc 1 / Disc 2 ISOs (or extracted folders) and the TU27 STFS file in Documents (or Inbox) by
+  content, or takes picks from the Files picker (security-scoped, e.g. a USB drive), then runs the
+  installer's copy stages (install.cpp `RunDataInstall`: Disc 2 + TU into Documents/data/{game,
+  update}, the Disc 1 install partitions into data/user, every file hashed against expected.txt,
+  resumable) and resumes the boot with those roots. Afterwards it offers to delete disc images from
+  Documents. install.cpp + sources.cpp compile into the iOS exe (`LOADER_NO_SPAWN`: no process
+  starts there). A dev build's Documents/args.txt with data roots skips all this.
 - On the phone, shaders without SPIR-V are skipped and saved to Documents/shader_cache
   (`gtav_native_save_missing_shaders`) for the next Mac run.
 - Test (2026-10-31, M1 8 GB): shipped v0.1.0-macos package + iOS shell, game folder linked to the

@@ -51,8 +51,19 @@ inline std::filesystem::path ExeDir() {
 #endif
 }
 
-// SPIR-V of the game's shaders (census output): <exe dir>/spirv.
-inline std::string DefaultSpirvDir() { return (ExeDir() / "spirv").string(); }
+// SPIR-V of the game's shaders (census output): <exe dir>/spirv. iPhone release: inside the app
+// bundle (the player's Mac translated them into the ipa); a Documents/spirv (dev builds) wins.
+inline std::string DefaultSpirvDir() {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+  std::error_code ec;
+  if (!std::filesystem::is_directory(ExeDir() / "spirv", ec)) {
+    char buf[4096];
+    uint32_t size = sizeof(buf);
+    if (_NSGetExecutablePath(buf, &size) == 0) return (std::filesystem::path(buf).parent_path() / "spirv").string();
+  }
+#endif
+  return (ExeDir() / "spirv").string();
+}
 
 // Dumps and probe output: <exe dir>/logs/<sub>.
 inline std::string LogPath(const std::string& sub) { return (ExeDir() / "logs" / sub).string(); }

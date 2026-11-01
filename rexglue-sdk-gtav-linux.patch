@@ -3125,7 +3125,7 @@ index dc0b4c2..0742758 100644
    }
    return EXIT_SUCCESS;
 diff --git a/src/ui/windowed_app_main_sdl.cpp b/src/ui/windowed_app_main_sdl.cpp
-index 77bb1dc..363633c 100644
+index 77bb1dc..4b57917 100644
 --- a/src/ui/windowed_app_main_sdl.cpp
 +++ b/src/ui/windowed_app_main_sdl.cpp
 @@ -22,6 +22,11 @@
@@ -3140,7 +3140,7 @@ index 77bb1dc..363633c 100644
  #if REX_PLATFORM_WIN32
  #ifndef WIN32_LEAN_AND_MEAN
  #define WIN32_LEAN_AND_MEAN
-@@ -124,6 +129,72 @@ int WINAPI wWinMain(HINSTANCE hinstance, HINSTANCE hinstance_prev, LPWSTR comman
+@@ -124,6 +129,80 @@ int WINAPI wWinMain(HINSTANCE hinstance, HINSTANCE hinstance_prev, LPWSTR comman
    return RunWindowedApp(static_cast<int>(argv_ptrs.size()), argv_ptrs.data());
  }
  
@@ -3186,11 +3186,8 @@ index 77bb1dc..363633c 100644
 +  for (int i = 0; i < argc; ++i) {
 +    g_ios_args.emplace_back(argv[i]);
 +  }
-+  if (const char* home = std::getenv("HOME")) {
-+    // Relative paths in args.txt (game data, logs) are relative to Documents: the container's
-+    // absolute path changes with every install.
-+    chdir((std::string(home) + "/Documents").c_str());
-+    std::ifstream file(std::string(home) + "/Documents/args.txt");
++  auto read_args = [](const std::string& path) {
++    std::ifstream file(path);
 +    std::string line;
 +    while (std::getline(file, line)) {
 +      if (auto hash = line.find('#'); hash != std::string::npos) {
@@ -3202,6 +3199,17 @@ index 77bb1dc..363633c 100644
 +        g_ios_args.push_back(word);
 +      }
 +    }
++  };
++  // The app's own defaults (args.txt inside the bundle, next to the executable) first, then the
++  // player's Documents/args.txt, whose settings come later and so win.
++  if (argc > 0) {
++    read_args((std::filesystem::path(argv[0]).parent_path() / "args.txt").string());
++  }
++  if (const char* home = std::getenv("HOME")) {
++    // Relative paths in args.txt (game data, logs) are relative to Documents: the container's
++    // absolute path changes with every install.
++    chdir((std::string(home) + "/Documents").c_str());
++    read_args(std::string(home) + "/Documents/args.txt");
 +  }
 +  for (auto& arg : g_ios_args) {
 +    g_ios_argv.push_back(arg.data());

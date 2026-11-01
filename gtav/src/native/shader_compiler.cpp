@@ -80,7 +80,11 @@ fs::path SpirvDirPath() {
   return dir.empty() ? fs::path(DefaultSpirvDir()) : fs::path(dir);
 }
 // Next to the SPIR-V dir: build/shader_cache in a dev tree, data/shader_cache in a release install.
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+fs::path CacheDir() { return ExeDir() / "shader_cache"; }  // Documents: the bundle is read-only
+#else
 fs::path CacheDir() { return SpirvDirPath().parent_path() / "shader_cache"; }
+#endif
 
 // Runs a command line without a console window; true on exit code 0.
 bool Run(const std::vector<std::string>& args) {

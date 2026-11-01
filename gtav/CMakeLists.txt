@@ -389,4 +389,9 @@ endif()
 if(GTAV_IOS)
     # Memory log: the Metal device's allocated size (capture.cpp).
     target_link_libraries(gtav PRIVATE "-framework Metal" objc)
+    # Setup screen: installs the game data on the phone with the PC/Mac installer's copy stages.
+    enable_language(OBJCXX)
+    target_sources(gtav PRIVATE src/ios_setup.mm ../loader/src/install.cpp ../loader/src/sources.cpp)
+    set_source_files_properties(src/ios_setup.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    target_link_libraries(gtav PRIVATE "-framework UIKit" "-framework UniformTypeIdentifiers")
 endif()
