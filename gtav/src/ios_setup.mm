@@ -409,6 +409,9 @@ NSMutableArray<NSURL*>* g_scoped;  // security-scoped picks, held for the proces
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }
 @end
 
+// NSProcessInfo.thermalState for the memory log line (native/capture.cpp): 0 nominal .. 3 critical.
+extern "C" int gtav_ios_thermal_state() { return int(NSProcessInfo.processInfo.thermalState); }
+
 namespace gtav::ios_setup {
 
 fs::path DataRoot() { return Documents() / "data"; }

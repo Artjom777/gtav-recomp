@@ -189,7 +189,8 @@ REXCVAR_DEFINE_BOOL(gtav_native_point_float32, GTAV_POINT_FLOAT32_DEFAULT, "GTAV
                     "Native renderer: nearest filtering for 32-bit float and depth (24_8) texture fetches (GPUs "
                     "without linear filtering for R32F / D32)");
 // Android: 0.75 (GPU -4..9 ms a frame on the throttled S23 FE; the SPIR-V there carries the constant).
-#ifdef __ANDROID__
+// iPhone: 0.75 too (13 mini: the 4-target G-buffer pass 9.9 -> 2.2 ms; owner: smoother, looks fine).
+#if GTAV_MOBILE
 #define GTAV_RENDER_SCALE_DEFAULT 0.75
 #else
 #define GTAV_RENDER_SCALE_DEFAULT 1.0
