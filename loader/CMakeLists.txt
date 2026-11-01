@@ -53,3 +53,21 @@ else()
         message(WARNING "gtk+-3.0 headers not found: the Linux launcher is built without its setup window")
     endif()
 endif()
+
+# The phone builds (RunIphone, RunAndroid) translate shaders with the Adreno passes, C++ ports of
+# tools/android/ubo_constants.py and lower_int64.py; the int64 lowering needs SPIRV-Tools (static,
+# from the SDK's thirdparty tree).
+target_sources(gtav_launcher PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../gtav/src/native/adreno_shader_fix.cpp)
+set(_gtav_tp ${CMAKE_CURRENT_SOURCE_DIR}/../rexglue-sdk/thirdparty)
+if(EXISTS ${_gtav_tp}/spirv-tools/CMakeLists.txt)
+    set(SPIRV-Headers_SOURCE_DIR ${_gtav_tp}/spirv-headers)
+    set(SPIRV_SKIP_TESTS ON CACHE BOOL "" FORCE)
+    set(SPIRV_SKIP_EXECUTABLES ON CACHE BOOL "" FORCE)
+    set(SPIRV_WERROR OFF CACHE BOOL "" FORCE)
+    set(SKIP_SPIRV_TOOLS_INSTALL ON CACHE BOOL "" FORCE)
+    add_subdirectory(${_gtav_tp}/spirv-tools spirv-tools EXCLUDE_FROM_ALL)
+    target_compile_definitions(gtav_launcher PRIVATE GTAV_HAVE_SPIRV_TOOLS=1)
+    target_link_libraries(gtav_launcher PRIVATE SPIRV-Tools-static)
+else()
+    message(WARNING "rexglue-sdk/thirdparty/spirv-tools missing: the launcher cannot build for Android")
+endif()

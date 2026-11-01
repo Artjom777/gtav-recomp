@@ -51,6 +51,7 @@ extern char** environ;
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -61,6 +62,7 @@ extern char** environ;
 #include <vector>
 
 #include "sources.h"
+#include "../../gtav/src/native/adreno_shader_fix.h"
 
 namespace fs = std::filesystem;
 
@@ -531,24 +533,27 @@ uint32_t Crc32(uint32_t crc, const uint8_t* p, size_t n) {
   return ~crc;
 }
 
-bool WriteIpa(const fs::path& payload, const fs::path& ipa) {
+// The folder dir as a stored zip, every entry under prefix ("Payload/" for the ipa, "" for the
+// Android pack). exec(leaf name, path) marks the files that get mode 755.
+template <typename ExecFn>
+bool WriteZip(const fs::path& dir, const std::string& prefix, const fs::path& ipa, ExecFn exec_fn) {
   struct Item {
     std::string name;  // zip path ('/' separators, directories end in '/')
     fs::path path;
     bool dir, exec;
   };
-  std::vector<Item> items = {{"Payload/", payload, true, false}};
+  std::vector<Item> items;
+  if (!prefix.empty()) items.push_back({prefix, dir, true, false});
   std::error_code ec;
-  for (auto it = fs::recursive_directory_iterator(payload, ec); !ec && it != fs::recursive_directory_iterator();
+  for (auto it = fs::recursive_directory_iterator(dir, ec); !ec && it != fs::recursive_directory_iterator();
        it.increment(ec)) {
-    std::string rel = "Payload/" + fs::relative(it->path(), payload).generic_string();
+    std::string rel = prefix + fs::relative(it->path(), dir).generic_string();
     const std::string leaf = it->path().filename().string();
     if (leaf.rfind("._", 0) == 0 || leaf == ".DS_Store") continue;  // AppleDouble files break signing
     if (it->is_directory()) {
       items.push_back({rel + "/", it->path(), true, false});
     } else if (it->is_regular_file()) {
-      bool exec = leaf == "gtav" || it->path().extension() == ".dylib";
-      items.push_back({rel, it->path(), false, exec});
+      items.push_back({rel, it->path(), false, exec_fn(leaf, it->path())});
     }
   }
   if (ec) return false;
@@ -602,6 +607,12 @@ bool WriteIpa(const fs::path& payload, const fs::path& ipa) {
   if (!z || items.size() > 0xFFFF) return false;
   fs::rename(tmp, ipa, ec);
   return !ec;
+}
+
+bool WriteIpa(const fs::path& payload, const fs::path& ipa) {
+  return WriteZip(payload, "Payload/", ipa, [](const std::string& leaf, const fs::path& p) {
+    return leaf == "gtav" || p.extension() == ".dylib";
+  });
 }
 
 //-----------------------------------------------------------------------------
@@ -1025,10 +1036,12 @@ class Installer {
 
   bool Compile() {
     fs::path gen = data_ / L"build" / L"generated" / L"default";
-    fs::path obj = data_ / L"build" / (ios_ ? L"obj_ios" : L"obj");
+    fs::path obj = data_ / L"build" / (ios_ ? L"obj_ios" : android_ ? L"obj_android" : L"obj");
     fs::path fsdir = root_ / L"tools" / L"game_dll" / L"fs";
-    // iPhone: the iOS shell's own hook header (package ios/interface).
-    fs::path iface = ios_ ? root_ / L"ios" / L"interface" : root_ / L"tools" / L"game_dll" / L"interface";
+    // iPhone / Android: the phone shell's own hook header (package ios/ or android/ interface).
+    fs::path iface = ios_       ? root_ / L"ios" / L"interface"
+                     : android_ ? root_ / L"android" / L"interface"
+                                : root_ / L"tools" / L"game_dll" / L"interface";
     std::error_code ec;
     fs::create_directories(obj, ec);
     for (auto [src, name] : {std::pair{fsdir, L"gtav_pch.h"}, {fsdir, L"layout_check.h"},
@@ -1044,7 +1057,7 @@ class Installer {
     }
     sources.push_back(fsdir / L"game_dll.cpp");
 #ifndef __APPLE__
-    if (!ios_) sources.push_back(fsdir / L"fs_crt.cpp");  // x86 memcpy & co.; Apple takes libSystem's
+    if (!ios_ && !android_) sources.push_back(fsdir / L"fs_crt.cpp");  // x86 memcpy & co.; arm64 takes the system's
 #endif
 
     fs::path clang = root_ / L"tools" / L"llvm" / L"bin" / kClang;
@@ -1057,6 +1070,15 @@ class Installer {
                L"-O2", L"-std=gnu++23", L"-mcpu=apple-a14", L"-fno-exceptions", L"-fno-rtti",
                L"-fno-threadsafe-statics", L"-fno-math-errno", L"-w", L"-isystem",
                (root_ / L"ios" / L"include").wstring()};
+    } else if (android_) {
+      // Android phones, from any host: aarch64, API 30, ARMv8.2 (LSE atomics; Snapdragon 845 and
+      // newer). Freestanding like the others: no NDK headers; simde from the package's android/.
+      // Keep in sync with tools/game_dll/build_game_dll.py (CXXFLAGS_ANDROID).
+      flags = {L"--target=aarch64-linux-android30", L"-nostdinc++", L"-nostdlibinc", L"-fPIC",
+               L"-fno-semantic-interposition", L"-fno-stack-protector", L"-O2", L"-std=gnu++23",
+               L"-march=armv8.2-a+lse+rcpc+dotprod", L"-fno-exceptions", L"-fno-rtti",
+               L"-fno-threadsafe-statics", L"-fno-math-errno", L"-w", L"-isystem",
+               (root_ / L"android" / L"include").wstring()};
     } else {
 #ifdef _WIN32
     flags = {L"--target=x86_64-pc-windows-msvc", L"-nostdinc++", L"-nostdlibinc", L"-O2",
@@ -1178,7 +1200,7 @@ class Installer {
     }
     // Everything the phone needs but its game files is inside the app: shaders, the known-good
     // hashes its setup screen checks the discs against, and the default arguments.
-    if (!IphoneShaders(app / L"spirv")) return Fail();
+    if (!PhoneShaders(app / L"spirv", false)) return Fail();
     fs::copy_file(root_ / L"tools" / L"game_dll" / L"expected.txt", app / L"expected.txt",
                   fs::copy_options::overwrite_existing, ec);
     if (ec) return SetError(L"Could not copy expected.txt into the iPhone app");
@@ -1206,6 +1228,113 @@ class Installer {
       "--gtav_native_texture_budget_mb=192\n"
       "--window_presenter=false\n"
       "--gtav_native_fetch_resolves=false\n";
+
+  // The Android build: as the iPhone build, for aarch64 Android. The APK (public download, no game
+  // code) dlopens libgtav_game.so from its private storage; this computer makes the game library
+  // and the shaders from the player's installed game and packs them, with the known-good hashes
+  // the phone's setup screen checks the discs against, into android/gtav-android-pack.zip. The
+  // phone installs the game files itself from the player's discs.
+ public:
+  bool RunAndroid(std::wstring* error) {
+    error_ = error;
+    android_ = true;
+    std::error_code ec;
+    fs::create_directories(data_ / L"logs", ec);
+    log_.open(data_ / L"logs" / L"android.log", std::ios::app);
+    Log(L"---- Android build");
+    if (!IsInstalled(home_))
+      return SetError(L"Set up the game on this computer first (Install), then build for Android.");
+    const fs::path pkg = root_ / L"android";
+    for (const fs::path f : {pkg / L"link" / L"libgtav_fast.so", pkg / L"link" / L"librexruntime.so",
+                             pkg / L"interface" / L"gtav_game.exports", pkg / L"interface" / L"gtav_hooks.h",
+                             pkg / L"include" / L"simde" / L"x86" / L"sse4.1.h"}) {
+      if (!fs::exists(f, ec))
+        return SetError(L"This download has no Android files (" + fs::relative(f, root_).wstring() + L" is missing).");
+    }
+#ifdef __APPLE__
+    std::wstring err;
+    if (!SyncRuntime(root_, home_, &err)) return SetError(err);  // the shader tools in <home>/tools
+#endif
+    const fs::path out = home_ / L"android", pack = out / L"pack";
+    // The pack belongs to one APK build: its libgtav_fast.so (the hooks the game library binds to).
+    std::string shell_hash;
+    uint64_t shell_size = 0;
+    if (!HashFile(pkg / L"link" / L"libgtav_fast.so", &shell_hash, &shell_size))
+      return SetError(L"Could not read android/link/libgtav_fast.so");
+    std::string built;
+    {
+      std::ifstream m(pack / L"pack.txt");
+      for (std::string line; std::getline(m, line);)
+        if (line.rfind("shell ", 0) == 0) built = line.substr(6);
+    }
+    if (built == shell_hash && fs::exists(pack / L"libgtav_game.so", ec)) {
+      Log(L"The Android game library is current: translating new shaders only");
+    } else {
+      if (!expected_.Load(root_ / L"tools" / L"game_dll" / L"expected.txt", error)) return false;
+      fs::remove_all(pack, ec);
+      fs::create_directories(pack, ec);
+      if (!Codegen() || !CheckGenerated() || !Compile()) return Fail();
+      if (!LinkAndroid(pack / L"libgtav_game.so")) return Fail();
+    }
+    if (!PhoneShaders(pack / L"spirv", true)) return Fail();
+    fs::copy_file(root_ / L"tools" / L"game_dll" / L"expected.txt", pack / L"expected.txt",
+                  fs::copy_options::overwrite_existing, ec);
+    if (ec) return SetError(L"Could not copy expected.txt into the Android pack");
+    std::ofstream(pack / L"pack.txt", std::ios::trunc) << "gtav-recomp android pack 1\nshell " << shell_hash << "\n";
+
+    ui_.Stage(L"Packing gtav-android-pack.zip...");
+    const fs::path zip = out / L"gtav-android-pack.zip";
+    if (!WriteZip(pack, "", zip, [](const std::string&, const fs::path&) { return false; }))
+      return SetError(L"Could not write " + zip.wstring());
+    fs::remove_all(data_ / L"build", ec);
+    Log(L"---- Android build finished: " + zip.wstring());
+    ui_.Progress(1.0);
+    ui_.Stage(L"Done: android/gtav-android-pack.zip in the game folder. Copy it and your disc files to the "
+              L"phone, then open GTA V there and press Install.");
+    return true;
+  }
+
+ private:
+  // As the Linux Link(), against the APK's own libgtav_fast.so (hooks, bridge) and
+  // librexruntime.so (kernel imports): their DT_NEEDED entries put bionic (memcpy & co., log2f) in
+  // the same dlopen'd tree. Every package's lld is one multi-format binary: -flavor gnu = ld.lld.
+  bool LinkAndroid(const fs::path& out) {
+    ui_.Stage(L"Linking libgtav_game.so for Android...");
+    fs::path build = data_ / L"build";
+    fs::path pkg = root_ / L"android";
+    fs::path rsp = build / L"link_android.rsp";
+    {
+      std::ofstream f(rsp);
+      for (auto& o : objects_) {
+        std::u8string g = o.generic_u8string();  // lld reads UTF-8, GNU-style (a backslash escapes)
+        f << "\"" << std::string(g.begin(), g.end()) << "\"\n";
+      }
+    }
+    fs::path log = data_ / L"logs" / L"link_android.log";
+#ifdef _WIN32
+    const fs::path lld = root_ / L"tools" / L"llvm" / L"bin" / L"lld-link.exe";
+#elif defined(__APPLE__)
+    const fs::path lld = root_ / L"tools" / L"llvm" / L"bin" / L"ld64.lld";
+#else
+    const fs::path lld = root_ / L"tools" / L"llvm" / L"bin" / L"ld.lld";
+#endif
+    auto gen = [](const fs::path& p) { return p.generic_wstring(); };
+    fs::path tmp = out;
+    tmp += ".new";
+    Args cmd = {lld.wstring(), L"-flavor", L"gnu", L"-shared", L"-soname", L"libgtav_game.so", L"-Bsymbolic",
+                L"-z", L"now", L"-z", L"relro", L"-z", L"noexecstack", L"-z", L"max-page-size=16384",
+                L"--hash-style=gnu", L"-O1",
+                L"--version-script=" + gen(pkg / L"interface" / L"gtav_game.exports"), L"-o", gen(tmp),
+                L"@" + gen(rsp), gen(pkg / L"link" / L"libgtav_fast.so"), gen(pkg / L"link" / L"librexruntime.so")};
+    Child c;
+    if (!c.Start(cmd, build, log)) return SetError(L"Could not start ld.lld");
+    if (c.Poll(INFINITE) != 0) return SetError(L"Linking failed:\n" + Widen(Tail(log, 1500)));
+    std::error_code ec;
+    fs::rename(tmp, out, ec);
+    if (ec) return SetError(L"Could not put libgtav_game.so in place: " + Widen(ec.message()));
+    Log(L"Built libgtav_game.so for Android");
+    return true;
+  }
 
   bool LinkIphone(const fs::path& out) {
     ui_.Stage(L"Linking gtav_game.dylib for iPhone...");
@@ -1248,56 +1377,6 @@ class Installer {
     return true;
   }
 
-  // Shader constants from uniform buffers instead of device-address loads (tools/android/
-  // ubo_constants.py, which this follows exactly: the phone's GPU win). Empty on a load it cannot map.
-  static std::string UboConstants(std::string text) {
-    auto sub = [](const std::string& in, const std::regex& re, auto&& fn) {
-      std::string outs;
-      auto last = in.cbegin();
-      for (std::sregex_iterator it(in.cbegin(), in.cend(), re), end; it != end; ++it) {
-        outs.append(last, (*it)[0].first);
-        outs += fn(*it);
-        last = (*it)[0].second;
-      }
-      outs.append(last, in.cend());
-      return outs;
-    };
-    auto alu = [](const std::string& stage) { return stage == "Vertex" ? std::string("g_VSC") : std::string("g_PSC"); };
-    static const std::regex alu_off(
-        R"(vk::RawBufferLoad<float4>\(g_PushConstants\.(Vertex|Pixel)ShaderConstants \+ (\d+), 0x10\))");
-    static const std::regex alu_idx(
-        R"(vk::RawBufferLoad<float4>\(g_PushConstants\.(Vertex|Pixel)ShaderConstants \+ (\(.*?\)) \* 16, 0x10\))");
-    static const std::regex shared(
-        R"(vk::RawBufferLoad<(uint|float|int)>\(g_PushConstants\.SharedConstants \+ (\d+)(?: \+ (\d+))?\))");
-    static const std::regex color(
-        R"(vk::RawBufferLoad<float4>\(g_PushConstants\.SharedConstants \+ (\d+) \+ \(INDEX\) \* 16\))");
-    static const std::regex left_alu(R"(RawBufferLoad<[^>]*>\(g_PushConstants\.(Vertex|Pixel)ShaderConstants)");
-    static const std::regex left_shared(R"(RawBufferLoad<[^>]*>\(g_PushConstants\.SharedConstants \+ \d)");
-    text = sub(text, alu_off, [&](const std::smatch& m) {
-      return alu(m[1]) + ".c[" + std::to_string(std::stoul(m[2]) / 16) + "]";
-    });
-    text = sub(text, alu_idx, [&](const std::smatch& m) { return alu(m[1]) + ".c[" + m[2].str() + "]"; });
-    text = sub(text, shared, [](const std::smatch& m) {
-      unsigned long off = std::stoul(m[2]) + (m[3].matched ? std::stoul(m[3]) : 0);
-      std::string cast = m[1] == "uint" ? "" : m[1] == "float" ? "asfloat" : "asint";
-      return cast + "(g_SC.u[" + std::to_string(off / 16) + "][" + std::to_string(off % 16 / 4) + "])";
-    });
-    text = sub(text, color, [](const std::smatch& m) {
-      return "asfloat(g_SC.u[" + std::to_string(std::stoul(m[1]) / 16) + " + (INDEX)])";
-    });
-    for (size_t at; (at = text.find("(uint)(")) != std::string::npos;) text.replace(at, 7, "(");
-    if (std::regex_search(text, left_alu) || std::regex_search(text, left_shared)) return {};
-    static const std::string anchor = "[[vk::push_constant]] ConstantBuffer<PushConstants> g_PushConstants;";
-    if (size_t at = text.find(anchor); at != std::string::npos && text.find("g_VSC;") == std::string::npos)
-      text.insert(at + anchor.size(),
-                  "\n\nstruct XenosAluConstants { float4 c[256]; };\n"
-                  "struct XenosSharedConstants { uint4 u[112]; };\n"
-                  "[[vk::binding(0, 4)]] ConstantBuffer<XenosAluConstants> g_VSC;\n"
-                  "[[vk::binding(1, 4)]] ConstantBuffer<XenosAluConstants> g_PSC;\n"
-                  "[[vk::binding(2, 4)]] ConstantBuffer<XenosSharedConstants> g_SC;\n");
-    return text;
-  }
-
   static std::string ReadText(const fs::path& p) {
     std::ifstream f(p, std::ios::binary);
     std::stringstream ss;
@@ -1305,11 +1384,14 @@ class Installer {
     return ss.str();
   }
 
-  // Every shader in data/shader_cache (made by the game on this Mac) and iphone/shader_cache (saved
-  // by the phone: copy the phone's Documents/shader_cache there) -> SPIR-V for the phone, as
-  // tools/ios/make_spirv.sh does with the same XenosRecomp and dxc the Mac game uses.
-  bool IphoneShaders(const fs::path& spirv) {
-    ui_.Stage(L"Translating the shaders for iPhone...");
+  // Every shader in data/shader_cache (made by the game on this computer) and <phone>/shader_cache
+  // (saved by the phone: copy its shader_cache there) -> SPIR-V for the phone, as
+  // tools/ios/make_spirv.sh and tools/android/make_spirv.sh do with the same XenosRecomp and dxc the
+  // desktop game uses. Android (Adreno) also: 1ull shifts made 32-bit in shader_common.h, every
+  // shader's constants from uniform buffers, and 64-bit integers lowered to uvec2 afterwards
+  // (adreno_shader_fix.cpp: byte-identical to the Python passes).
+  bool PhoneShaders(const fs::path& spirv, bool android) {
+    ui_.Stage(android ? L"Translating the shaders for Android..." : L"Translating the shaders for iPhone...");
 #ifdef __APPLE__
     const fs::path tools = home_ / L"tools";  // SyncRuntime's copy
 #else
@@ -1320,7 +1402,8 @@ class Installer {
 #else
     const wchar_t *kXr = L"XenosRecomp", *kDxc = L"dxc";
 #endif
-    const fs::path work = data_ / L"build" / L"spirv_ios";
+    const fs::path work = data_ / L"build" / (android ? L"spirv_android" : L"spirv_ios");
+    const fs::path phone_cache = home_ / (android ? L"android" : L"iphone") / L"shader_cache";
     std::error_code ec;
     fs::create_directories(spirv, ec);
     fs::create_directories(work, ec);
@@ -1330,21 +1413,34 @@ class Installer {
     common = std::regex_replace(common, f2, "float2(vk::RawBufferLoad<float>($1$2), vk::RawBufferLoad<float>($1$2 + 4))");
     if (common.empty() || common.find("RawBufferLoad<float2>") != std::string::npos)
       return SetError(L"Unexpected shader_common.h in " + tools.wstring());
+    if (android) {
+      // The Adreno compiler asserts on 64-bit shifts (tfetchTexcoord).
+      const std::string from = "(1ull << semanticIndex)";
+      size_t at = common.find(from);
+      if (at == std::string::npos) return SetError(L"Unexpected shader_common.h (no 1ull shift) in " + tools.wstring());
+      common.replace(at, from.size(), "(1u << semanticIndex)");
+    }
     std::ofstream(work / L"shader_common.h", std::ios::binary) << common;
 
     std::map<std::string, fs::path> bins;  // name -> container
-    for (const fs::path& dir : {home_ / L"iphone" / L"shader_cache", data_ / L"shader_cache"}) {
+    for (const fs::path& dir : {phone_cache, data_ / L"shader_cache"}) {
       for (auto it = fs::directory_iterator(dir, ec); !ec && it != fs::directory_iterator(); it.increment(ec)) {
         if (it->path().extension() == ".bin") bins[it->path().stem().string()] = it->path();
       }
       ec.clear();
     }
     if (bins.empty())
-      return SetError(L"No shaders yet: play on this Mac for a while first (the game saves every shader "
-                      L"it meets in data/shader_cache), then build for iPhone again.");
+      return SetError(L"No shaders yet: play on this computer for a while first (the game saves every "
+                      L"shader it meets in data/shader_cache), then build for the phone again.");
     Log(L"Translating " + Num(bins.size()) + L" shaders");
-    // The sky dome rendered white with uniform-buffer constants on the iPhone (cause not found).
-    static const std::set<std::string> kNoUbo = {"ps_6A340C638FB8D4C2", "vs_5338696E6825DEA1"};
+    // The sky dome rendered white with uniform-buffer constants on the iPhone (cause not found);
+    // Android takes every shader's constants from uniform buffers (make_spirv.sh).
+    static const std::set<std::string> kNoUboIos = {"ps_6A340C638FB8D4C2", "vs_5338696E6825DEA1"};
+    // The tile override (shader_compiler.cpp kVariants, backend.cpp TileOverride).
+    static const std::string kTileShader = "ps_D258EBE32001470C", kTileSuffix = "_tiles2";
+    static const std::pair<std::string, std::string> kTileEdits[] = {
+        {"r0.y = select(r0.y > 0.0, c255.x, c255.y);", "r0.y = c255.x;"},
+        {"oC0.z = select(r0.w > 0.0, r1.x, c255.z);", "oC0.z = select(r0.w > 0.0, max(r1.x, 0.0625), c255.z);"}};
     std::vector<std::pair<std::string, fs::path>> items(bins.begin(), bins.end());
     std::atomic<size_t> next{0}, done{0}, failed{0}, made{0};
     std::atomic<bool> stop{false};
@@ -1359,6 +1455,19 @@ class Installer {
       Child c;
       if (!c.Start(cmd, work, log) || c.Poll(INFINITE) != 0) return false;
       std::error_code e;
+      if (android) {
+        // No shaderInt64 on Adreno (Vulkan 1.1): 64-bit integers -> uvec2.
+        std::string bytes = ReadText(tmp);
+        std::vector<uint32_t> words(bytes.size() / 4);
+        if (!words.empty()) std::memcpy(words.data(), bytes.data(), words.size() * 4);
+        std::string err;
+        if (words.empty() || !gtav::adreno::LowerInt64(words, &err)) {
+          std::ofstream(log, std::ios::app) << "lower_int64: " << err << "\n";
+          return false;
+        }
+        std::ofstream(tmp, std::ios::binary | std::ios::trunc)
+            .write(reinterpret_cast<const char*>(words.data()), std::streamsize(words.size() * 4));
+      }
       fs::rename(tmp, out, e);
       return !e;
     };
@@ -1366,7 +1475,7 @@ class Installer {
       const bool pixel = name.rfind("ps_", 0) == 0;
       const fs::path out = spirv / (name + ".spv"), hlsl = work / (name + ".hlsl"), log = work / (name + ".log");
       std::error_code e;
-      if (fs::exists(out, e) && (name != "ps_D258EBE32001470C" || fs::exists(spirv / (name + "_tiles.spv"), e)))
+      if (fs::exists(out, e) && (name != kTileShader || fs::exists(spirv / (name + kTileSuffix + ".spv"), e)))
         return true;
       made++;
       Child xr;
@@ -1376,20 +1485,27 @@ class Installer {
           xr.Poll(INFINITE) != 0)
         return false;
       std::string text = ReadText(hlsl);
-      if (!kNoUbo.count(name)) text = UboConstants(text);
-      if (text.empty()) return false;
+      if (android || !kNoUboIos.count(name)) {
+        std::string err;
+        if (!gtav::adreno::UboConstants(text, &err)) {
+          std::ofstream(log, std::ios::app) << err << "\n";
+          return false;
+        }
+      }
       std::ofstream(hlsl, std::ios::binary | std::ios::trunc) << text;
       if (!pixel && text.find("= vfetchIndirect(") != std::string::npos) std::ofstream(spirv / (name + ".indirect"));
-      // Variant (shader_compiler.cpp kVariants): every sun-lighting tile takes the penumbra path.
-      if (name == "ps_D258EBE32001470C") {
-        const std::string find = "r0.y = select(r0.y > 0.0, c255.x, c255.y);";
-        size_t at = text.find(find);
-        if (at == std::string::npos) return false;
+      // Variant (shader_compiler.cpp kVariants): every sun-lighting tile takes the penumbra path,
+      // and fully shadowed tiles still get the per-pixel sun draw (no light 16x16 squares).
+      if (name == kTileShader) {
         std::string t = text;
-        t.replace(at, find.size(), "r0.y = c255.x;");
-        fs::path th = work / (name + "_tiles.hlsl");
+        for (auto& [find, repl] : kTileEdits) {
+          size_t at = t.find(find);
+          if (at == std::string::npos) return false;
+          t.replace(at, find.size(), repl);
+        }
+        fs::path th = work / (name + kTileSuffix + ".hlsl");
         std::ofstream(th, std::ios::binary) << t;
-        if (!dxc(th, spirv / (name + "_tiles.spv"), true, log)) return false;
+        if (!dxc(th, spirv / (name + kTileSuffix + ".spv"), true, log)) return false;
       }
       bool ok = dxc(hlsl, out, pixel, log);
       fs::remove(hlsl, e);
@@ -1535,7 +1651,8 @@ class Installer {
   std::vector<std::wstring> mismatches_;
   std::vector<fs::path> objects_;
   uint64_t copy_total_ = 0, copied_ = 0;
-  bool ios_ = false;  // RunIphone: Compile for arm64 iOS
+  bool ios_ = false;      // RunIphone: Compile for arm64 iOS
+  bool android_ = false;  // RunAndroid: Compile for aarch64 Android
 };
 
 }  // namespace
@@ -1718,6 +1835,11 @@ bool RunInstall(const fs::path& root, const fs::path& home, const InstallInputs&
 bool RunIphoneBuild(const fs::path& root, const fs::path& home, InstallUi& ui, std::wstring* error) {
   Installer inst(root, home, InstallInputs{}, ui);
   return inst.RunIphone(error);
+}
+
+bool RunAndroidBuild(const fs::path& root, const fs::path& home, InstallUi& ui, std::wstring* error) {
+  Installer inst(root, home, InstallInputs{}, ui);
+  return inst.RunAndroid(error);
 }
 
 bool LaunchGame(const fs::path& root, std::wstring* error, const std::vector<std::wstring>& extra) {

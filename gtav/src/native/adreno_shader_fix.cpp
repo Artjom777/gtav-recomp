@@ -579,6 +579,11 @@ bool LowerInt64(std::vector<uint32_t>& spirv, std::string* error) {
   spvContextDestroy(ctx);
   return ok;
 }
+#else
+bool LowerInt64(std::vector<uint32_t>&, std::string* error) {
+  if (error) *error = "built without SPIRV-Tools";
+  return false;
+}
 #endif
 
 }  // namespace gtav::adreno

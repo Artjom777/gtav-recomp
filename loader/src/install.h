@@ -37,6 +37,11 @@ bool IsDataInstalled(const std::filesystem::path& home);
 // Windows / Linux: both the launcher's folder.
 bool RunIphoneBuild(const std::filesystem::path& root, const std::filesystem::path& home, InstallUi& ui,
                     std::wstring* error);
+// The Android build, from any desktop system: libgtav_game.so (aarch64 Android, against the APK's
+// libgtav_fast.so), the shaders for Adreno and expected.txt in <home>/android/gtav-android-pack.zip.
+// The APK (no game code) imports the pack and installs the game files from the discs itself.
+bool RunAndroidBuild(const std::filesystem::path& root, const std::filesystem::path& home, InstallUi& ui,
+                     std::wstring* error);
 
 // root = the folder holding the launcher, gtav_fast.exe and tools\ (Linux: gtav_fast, tools/).
 bool IsInstalled(const std::filesystem::path& root);
