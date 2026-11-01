@@ -22,11 +22,27 @@
 #include <mutex>
 #include <unordered_map>
 
-#ifdef __ANDROID__
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
 REXCVAR_DEFINE_BOOL(gtav_touch_controls, true, "GTAV", "Show the on-screen gamepad (touch screens)");
 #else
 REXCVAR_DEFINE_BOOL(gtav_touch_controls, false, "GTAV", "Show the on-screen gamepad (touch screens)");
 #endif
+// iPhone: rounded corners and the notch eat the edges of the screen, and the controls were too
+// small to hit without looking: bigger, and moved in from the sides.
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+#define GTAV_TOUCH_SCALE_DEFAULT 1.3
+#define GTAV_TOUCH_INSET_DEFAULT 0.16
+#else
+#define GTAV_TOUCH_SCALE_DEFAULT 1.0
+#define GTAV_TOUCH_INSET_DEFAULT 0.0
+#endif
+REXCVAR_DEFINE_DOUBLE(gtav_touch_scale, GTAV_TOUCH_SCALE_DEFAULT, "GTAV",
+                      "On-screen gamepad: size of the controls and their distance from the screen sides");
+REXCVAR_DEFINE_DOUBLE(gtav_touch_inset, GTAV_TOUCH_INSET_DEFAULT, "GTAV",
+                      "On-screen gamepad: extra distance of the controls from the left / right edges (screen heights)");
 
 namespace gtav::native::touch {
 namespace {
@@ -81,18 +97,32 @@ std::atomic<float> g_w{0}, g_h{0};
 std::atomic<uint32_t> g_packet{0};
 std::atomic<bool> g_watch_added{false};
 
+float Scale() { return float(std::clamp(REXCVAR_GET(gtav_touch_scale), 0.5, 2.0)); }
+float Inset() { return float(std::clamp(REXCVAR_GET(gtav_touch_inset), 0.0, 0.5)); }
+
 float CenterX(int i, float w, float h) {
   const Control& c = kControls[i];
+  const float s = Scale();
   if (c.kind == kMenu) return w * 0.5f;
-  if (c.button == X_INPUT_GAMEPAD_BACK) return w * 0.5f - 0.13f * h;
-  if (c.button == X_INPUT_GAMEPAD_START) return w * 0.5f + 0.13f * h;
-  return c.x < 0 ? w + c.x * h : c.x * h;
+  if (c.button == X_INPUT_GAMEPAD_BACK) return w * 0.5f - 0.13f * s * h;
+  if (c.button == X_INPUT_GAMEPAD_START) return w * 0.5f + 0.13f * s * h;
+  const float from_edge = (std::fabs(c.x) * s + Inset()) * h;
+  return c.x < 0 ? w - from_edge : from_edge;
 }
+
+// Rows keep their order from top to bottom; scaled up, they are squeezed back onto the screen.
+float CenterY(int i, float h) {
+  const Control& c = kControls[i];
+  const float r = c.r * Scale();
+  return std::clamp(c.y, r + 0.02f, 1.0f - r - 0.02f) * h;
+}
+
+float Radius(int i, float h) { return kControls[i].r * Scale() * h; }
 
 int Hit(float x, float y, float w, float h) {
   for (int i = 0; i < kControlCount; i++) {
-    float dx = x - CenterX(i, w, h), dy = y - kControls[i].y * h;
-    float r = kControls[i].r * h * 1.25f;  // fingers are wide: a little slack
+    float dx = x - CenterX(i, w, h), dy = y - CenterY(i, h);
+    float r = Radius(i, h) * 1.25f;  // fingers are wide: a little slack
     if (dx * dx + dy * dy <= r * r) return i;
   }
   return kNone;
@@ -155,7 +185,7 @@ void Fill(X_INPUT_GAMEPAD* pad) {
       else
         buttons |= c.button;
     } else if (h > 0) {
-      float dx = (f.x - f.x0) / (kStickRadius * h), dy = -(f.y - f.y0) / (kStickRadius * h);
+      float dx = (f.x - f.x0) / (kStickRadius * Scale() * h), dy = -(f.y - f.y0) / (kStickRadius * Scale() * h);
       float len = std::sqrt(dx * dx + dy * dy);
       if (len > 1.0f) dx /= len, dy /= len;
       if (f.owner == kLeftStick) lx = dx, ly = dy;
@@ -261,8 +291,8 @@ void Draw(ImDrawList* list, float w, float h) {
   const bool menu_open = menu::IsOpen();
   for (int i = 0; i < kControlCount; i++) {
     if (menu_open && kControls[i].kind != kMenu) continue;
-    ImVec2 c(CenterX(i, w, h), kControls[i].y * h);
-    float r = kControls[i].r * h;
+    ImVec2 c(CenterX(i, w, h), CenterY(i, h));
+    float r = Radius(i, h);
     list->AddCircleFilled(c, r, held[i] ? fill_on : fill, 32);
     list->AddCircle(c, r, edge, 32, 2.0f);
     const char* label = kControls[i].label;
@@ -272,7 +302,7 @@ void Draw(ImDrawList* list, float w, float h) {
   }
   for (auto& s : sticks) {
     if (!s.on) continue;
-    float R = kStickRadius * h;
+    float R = kStickRadius * Scale() * h;
     list->AddCircle(ImVec2(s.x0, s.y0), R, edge, 48, 2.0f);
     float dx = s.x - s.x0, dy = s.y - s.y0, len = std::sqrt(dx * dx + dy * dy);
     if (len > R) dx *= R / len, dy *= R / len;

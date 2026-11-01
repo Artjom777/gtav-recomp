@@ -5,6 +5,7 @@
 //   ./gtav_launcher --setup DISC1 DISC2 TU  setup in the terminal with these paths
 //   ./gtav_launcher --cli [--setup]         terminal setup even with a desktop (paths asked for)
 //   ./gtav_launcher --unattended            setup from data/launcher.ini, no questions (testing)
+//   ./gtav_launcher --iphone                after setup: iphone/GTAV.ipa for Sideloadly / AltStore
 //   ./gtav_launcher -- ARGS...              pass ARGS to the game (for example --vulkan_device=1)
 //
 // Setup is the same as on Windows and macOS (install.cpp): the player's own Disc 1, Disc 2 and
@@ -413,8 +414,15 @@ class SetupWindow : public InstallUi {
     g.gtk_box_set_spacing(GTK_BOX(buttons), 8);
     install_ = g.gtk_button_new_with_label("Install");
     play_ = g.gtk_button_new_with_label("Play");
+    // Phone builds from the installed game (install.h RunIphoneBuild / RunAndroidBuild).
+    iphone_ = g.gtk_button_new_with_label("Build for iPhone");
+    android_ = g.gtk_button_new_with_label("Build for Android");
     Connect(install_, "clicked", +[](GtkButton*, gpointer self) { static_cast<SetupWindow*>(self)->InstallClicked(); }, this);
     Connect(play_, "clicked", +[](GtkButton*, gpointer self) { static_cast<SetupWindow*>(self)->Play(); }, this);
+    Connect(iphone_, "clicked", +[](GtkButton*, gpointer self) { static_cast<SetupWindow*>(self)->PhoneClicked(false); }, this);
+    Connect(android_, "clicked", +[](GtkButton*, gpointer self) { static_cast<SetupWindow*>(self)->PhoneClicked(true); }, this);
+    g.gtk_container_add(GTK_CONTAINER(buttons), iphone_);
+    g.gtk_container_add(GTK_CONTAINER(buttons), android_);
     g.gtk_container_add(GTK_CONTAINER(buttons), install_);
     g.gtk_container_add(GTK_CONTAINER(buttons), play_);
     g.gtk_box_pack_start(GTK_BOX(box), buttons, FALSE, FALSE, 0);
@@ -483,8 +491,50 @@ class SetupWindow : public InstallUi {
       g.gtk_widget_set_sensitive(folder_[i], !busy);
       g.gtk_editable_set_editable(GTK_EDITABLE(paths_[i]), !busy);
     }
+    const bool installed = IsInstalled(g_root);
     g.gtk_button_set_label(GTK_BUTTON(install_), busy ? "Cancel" : "Install");
-    g.gtk_widget_set_sensitive(play_, !busy && IsInstalled(g_root));
+    g.gtk_widget_set_sensitive(install_, !busy || phone_ < 0);
+    g.gtk_widget_set_sensitive(play_, !busy && installed);
+    g.gtk_widget_set_sensitive(iphone_, (!busy && installed) || (busy && phone_ == 0));
+    g.gtk_widget_set_sensitive(android_, (!busy && installed) || (busy && phone_ == 1));
+    g.gtk_button_set_label(GTK_BUTTON(iphone_), busy && phone_ == 0 ? "Cancel" : "Build for iPhone");
+    g.gtk_button_set_label(GTK_BUTTON(android_), busy && phone_ == 1 ? "Cancel" : "Build for Android");
+  }
+
+  // Build for iPhone / Android: the game's own install must be done first (the button is greyed
+  // out until then). Runs on a thread like the install; the same button cancels it.
+  void PhoneClicked(bool android) {
+    if (busy_) {
+      cancelled_ = true;
+      g.gtk_label_set_text(GTK_LABEL(stage_), "Cancelling...");
+      return;
+    }
+    cancelled_ = false;
+    last_ = -1;
+    phone_ = android ? 1 : 0;
+    SetBusy(true);
+    std::thread([this, android] {
+      std::wstring err;
+      bool ok = android ? RunAndroidBuild(g_root, g_root, *this, &err) : RunIphoneBuild(g_root, g_root, *this, &err);
+      std::string e = Narrow(err);
+      OnMain([this, ok, e, android] { PhoneFinished(ok, e, android); });
+    }).detach();
+  }
+
+  void PhoneFinished(bool ok, const std::string& error, bool android) {
+    phone_ = -1;
+    SetBusy(false);
+    if (ok) {
+      g.gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(progress_), 1.0);
+      return;  // the build's last Stage() says where the file is
+    }
+    if (cancelled_) {
+      g.gtk_label_set_text(GTK_LABEL(stage_), "Cancelled.");
+      if (quit_when_stopped_) g.gtk_widget_destroy(window_);
+      return;
+    }
+    g.gtk_label_set_text(GTK_LABEL(stage_), android ? "Android build stopped." : "iPhone build stopped.");
+    ErrorBox(error + "\n\n(log: " + (g_root / "data" / "logs" / (android ? "android.log" : "iphone.log")).string() + ")");
   }
 
   void Choose(GtkButton* button, bool folder) {
@@ -583,6 +633,9 @@ class SetupWindow : public InstallUi {
   GtkWidget* log_ = nullptr;
   GtkWidget* install_ = nullptr;
   GtkWidget* play_ = nullptr;
+  GtkWidget* iphone_ = nullptr;
+  GtkWidget* android_ = nullptr;
+  int phone_ = -1;  // the phone build running: 0 iPhone, 1 Android (-1: none, or the install)
   bool busy_ = false;
   bool quit_when_stopped_ = false;
   std::atomic<bool> cancelled_{false};
@@ -629,7 +682,7 @@ int main(int argc, char** argv) {
   if (ec) g_root = fs::absolute(argv[0]).parent_path();
   std::signal(SIGINT, [](int) { g_cancelled = 1; });
 
-  bool setup = false, unattended = false, cli = false;
+  bool setup = false, unattended = false, cli = false, iphone = false, android = false;
   std::vector<std::string> paths;
   std::vector<std::wstring> game_args;
   for (int i = 1; i < argc; ++i) {
@@ -644,8 +697,12 @@ int main(int argc, char** argv) {
       unattended = true;
     } else if (a == "--cli") {
       cli = true;
+    } else if (a == "--iphone") {
+      iphone = true;
+    } else if (a == "--android") {
+      android = true;
     } else if (a == "--help" || a == "-h") {
-      printf("usage: %s [--setup [DISC1 DISC2 TU]] [--cli] [--unattended] [-- GAME_ARGS...]\n", argv[0]);
+      printf("usage: %s [--setup [DISC1 DISC2 TU]] [--cli] [--unattended] [--iphone] [--android] [-- GAME_ARGS...]\n", argv[0]);
       return 0;
     } else if (a.rfind("--", 0) == 0) {
       fprintf(stderr, "unknown option %s (game options go after --)\n", a.c_str());
@@ -655,6 +712,32 @@ int main(int argc, char** argv) {
     }
   }
   if (unattended) return Unattended();
+  if (iphone) {
+    // The iPhone build (install.h RunIphoneBuild) from the installed game.
+    std::wstring error;
+    TermUi ui;
+    if (!Preflight(g_root, &error) || !RunIphoneBuild(g_root, g_root, ui, &error)) {
+      fprintf(stderr, "\niPhone build stopped: %s\n", Narrow(error).c_str());
+      return 1;
+    }
+    printf("\nDone: %s\nInstall it on the phone with Sideloadly or AltStore, then open GTA V there: it\n"
+           "installs the game files from your discs itself.\n",
+           (g_root / "iphone" / "GTAV.ipa").c_str());
+    return 0;
+  }
+  if (android) {
+    // The Android build (install.h RunAndroidBuild) from the installed game.
+    std::wstring error;
+    TermUi ui;
+    if (!Preflight(g_root, &error) || !RunAndroidBuild(g_root, g_root, ui, &error)) {
+      fprintf(stderr, "\nAndroid build stopped: %s\n", Narrow(error).c_str());
+      return 1;
+    }
+    printf("\nDone: %s\nCopy it and your disc files to the phone (Download folder), install the GTA V\n"
+           "APK, open it and press Install: it installs the game files from your discs itself.\n",
+           (g_root / "android" / "gtav-android-pack.zip").c_str());
+    return 0;
+  }
   if (!paths.empty()) setup = true;
   const bool window = !cli && paths.empty();
 

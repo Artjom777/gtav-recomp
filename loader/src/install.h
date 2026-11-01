@@ -26,6 +26,18 @@ class InstallUi {
   virtual bool Ask(const std::wstring& question) = 0;  // yes/no, blocks the install thread
 };
 
+// Game data only (iPhone setup screen): Disc 2 files and TU27 into home/data/{game,update}, the
+// Disc 1 install partitions into home/data/user, each checked against `expected` (expected.txt).
+bool RunDataInstall(const std::filesystem::path& home, const std::filesystem::path& expected,
+                    const InstallInputs& in, InstallUi& ui, std::wstring* error);
+bool IsDataInstalled(const std::filesystem::path& home);
+// iPhone, on any desktop system: from the installed game, <home>/iphone/GTAV.ipa (the package's iOS
+// shell with gtav_game.dylib built for iOS and the shaders translated for it; no game files: the
+// phone installs those from the player's discs). macOS: root is the package, home the game folder;
+// Windows / Linux: both the launcher's folder.
+bool RunIphoneBuild(const std::filesystem::path& root, const std::filesystem::path& home, InstallUi& ui,
+                    std::wstring* error);
+
 // root = the folder holding the launcher, gtav_fast.exe and tools\ (Linux: gtav_fast, tools/).
 bool IsInstalled(const std::filesystem::path& root);
 bool RunInstall(const std::filesystem::path& root, const InstallInputs& in, InstallUi& ui,

@@ -42,6 +42,7 @@
 #include <thread>
 #include <vector>
 #if defined(__APPLE__)
+#include <TargetConditionals.h>
 #include <pthread/qos.h>
 #endif
 
@@ -129,7 +130,8 @@ const int g_mvk_concurrent_compile = setenv("MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRE
 // they are opt-in (=1) until checked on Adreno.
 const bool g_plume_input_attachments = (plume::g_colorInputAttachments = [] {
   const char* e = std::getenv("GTAV_NATIVE_FETCH_RESOLVE");
-#ifdef __ANDROID__
+  // iPhone: they strobed the whole screen white (A15 / MoltenVK); off as on Android.
+#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
   return e && std::string(e) != "0";
 #else
   return !e || std::string(e) != "0";
@@ -369,6 +371,17 @@ class Renderer {
 #ifndef _WIN32
   // Settings menu input (menu.h queues it while the menu is open): the native window's mouse and
   // the navigation keys.
+  // Mouse (and touch-made mouse) events are in window points; the menu is laid out in swap chain
+  // pixels (iPhone: 2.9 pixels a point).
+  static float PixelDensity(SDL_WindowID id) {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    if (SDL_Window* w = SDL_GetWindowFromID(id)) return SDL_GetWindowPixelDensity(w);
+#else
+    (void)id;
+#endif
+    return 1.0f;
+  }
+
   static void MenuInput(const SDL_Event* e) {
     switch (e->type) {
       // Controller: RB + Back (View) opens or closes the menu (in either order); while it is
@@ -401,9 +414,16 @@ class Renderer {
         menu::OnKey(key, down);
         break;
       }
-      case SDL_EVENT_MOUSE_MOTION: menu::OnMouseMove(e->motion.x, e->motion.y); break;
+      case SDL_EVENT_MOUSE_MOTION: {
+        const float k = PixelDensity(e->motion.windowID);
+        menu::OnMouseMove(e->motion.x * k, e->motion.y * k);
+        break;
+      }
       case SDL_EVENT_MOUSE_BUTTON_DOWN:
       case SDL_EVENT_MOUSE_BUTTON_UP: {
+        // A tap arrives as button down / up with no motion before it: move the pointer there first.
+        const float k = PixelDensity(e->button.windowID);
+        menu::OnMouseMove(e->button.x * k, e->button.y * k);
         int b = e->button.button == SDL_BUTTON_LEFT ? 0 : e->button.button == SDL_BUTTON_RIGHT ? 1 : 2;
         menu::OnMouseButton(b, e->type == SDL_EVENT_MOUSE_BUTTON_DOWN);
         break;
@@ -468,6 +488,19 @@ class Renderer {
             r->render_window_ = static_cast<ANativeWindow*>(SDL_GetPointerProperty(
                 SDL_GetWindowProperties(r->window_), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr));
           }
+#elif defined(__APPLE__) && TARGET_OS_IPHONE
+          // iOS has one window (fullscreen): draw into the SDK's own, with a Metal view of our own
+          // on top of whatever the SDK attached to it.
+          {
+            int count = 0;
+            if (SDL_Window** windows = SDL_GetWindows(&count)) {
+              if (count > 0) {
+                r->window_ = windows[0];
+                SDL_ShowWindow(r->window_);
+              }
+              SDL_free(windows);
+            }
+          }
 #else
           r->window_ = SDL_CreateWindow(on ? "GTA V" : "GTA V - native renderer (shadow)", 1280, 720,
                                         SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE |
@@ -477,13 +510,35 @@ class Renderer {
           // Plume's Vulkan backend (MoltenVK) on macOS takes the NSWindow and a CAMetalLayer.
           if (r->window_) {
             r->metal_view_ = SDL_Metal_CreateView(r->window_);
+#if TARGET_OS_IPHONE
+            r->render_window_.window = SDL_GetPointerProperty(SDL_GetWindowProperties(r->window_),
+                                                              SDL_PROP_WINDOW_UIKIT_WINDOW_POINTER, nullptr);
+#else
             r->render_window_.window = SDL_GetPointerProperty(SDL_GetWindowProperties(r->window_),
                                                               SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, nullptr);
+#endif
             r->render_window_.view = r->metal_view_ ? SDL_Metal_GetLayer(r->metal_view_) : nullptr;
           }
 #endif
           // F9 (dump the next frame) and F10 (screenshot; marks audio captures) from any of the
           // process's windows, like the Win32 timer poll. The watch runs where the SDK pumps events.
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+          // Runs on the main thread inside the app delegate's callbacks: entering the background
+          // returns only once the renderer stopped submitting (or after 1 s).
+          SDL_AddEventWatch(
+              [](void*, SDL_Event* e) {
+                if (e->type == SDL_EVENT_WILL_ENTER_BACKGROUND) {
+                  ios_drained_ = false;
+                  ios_background_.store(true, std::memory_order_release);
+                  for (int i = 0; i < 100 && !ios_drained_.load(std::memory_order_acquire); i++)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                } else if (e->type == SDL_EVENT_DID_ENTER_FOREGROUND) {
+                  ios_background_.store(false, std::memory_order_release);
+                }
+                return true;
+              },
+              nullptr);
+#endif
           SDL_AddEventWatch(
               [](void*, SDL_Event* e) {
                 if (e->type == SDL_EVENT_KEY_DOWN && !e->key.repeat) {
@@ -926,6 +981,18 @@ class Renderer {
 #ifdef __ANDROID__
     if (!SurfaceReady()) return;
 #endif
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    // iOS stops an app that submits GPU work in the background: no frames until it is back, and
+    // the GPU drained once (the app delegate's background callback waits for that, see Init).
+    if (ios_background_.load(std::memory_order_acquire)) {
+      if (!ios_drained_.load(std::memory_order_relaxed)) {
+        RetireAll();
+        ios_drained_.store(true, std::memory_order_release);
+        REXLOG_INFO("[native] app in the background: rendering paused");
+      }
+      return;
+    }
+#endif
     if (swapchain_->needsResize()) {
       RetireAll();  // also drains the submit thread
       if (!swapchain_->resize()) {
@@ -1136,7 +1203,7 @@ class Renderer {
     }
     if (key_replay_.exchange(false)) WriteReplay(frame.index);
     if (front) {
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
       // Phone screens are wider than 16:9: keep the game's aspect ratio with black bars.
       {
         float fw = float(w), fh = float(h), vw = fw, vh = fh;
@@ -1146,7 +1213,7 @@ class Renderer {
       }
 #endif
       backend_.Blit(list_, front_descriptor, kSwapchainFormat);
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
       list_->setViewports(plume::RenderViewport(0, 0, float(w), float(h)));
 #endif
     } else {
@@ -1192,11 +1259,18 @@ class Renderer {
     timing_.Add(ms(record_end - record_start), ms(wait_end - wait_start));
     last_record_ms_ = ms(record_end - record_start);
     ab_slot_phase_[slot] = ab_phase_;
-    // Hitch log: a present more than 25 ms after the previous one, with what this frame cost.
+    // Hitch log: a present more than 25 ms after the previous one (50 ms on phones, where 30 fps
+    // frames are 33 ms: every frame was a "hitch" and the log grew by megabytes a minute), with what
+    // this frame cost.
+#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
+    constexpr double kHitchMs = 50.0;
+#else
+    constexpr double kHitchMs = 25.0;
+#endif
     double interval = last_present_.time_since_epoch().count() ? ms(present_end - last_present_) : 0;
     last_present_ = present_end;
     if (backend_ok_) MaybeSavePipelineCache(backend_.LastStats().pipelines_created);
-    if (interval > 25.0 && backend_ok_) {
+    if (interval > kHitchMs && backend_ok_) {
       auto st = backend_.LastStats();
       REXLOG_INFO("[native] hitch {:.1f} ms at guest frame {}: record {:.1f} ms, wait {:.1f} ms, {} new pipelines, "
                   "{} textures, {} draws (misses: shaders {:.1f} pipelines {:.1f} textures {:.1f} ms; resolves {:.1f} ms)",
@@ -1492,6 +1566,7 @@ class Renderer {
 #ifdef __APPLE__
   SDL_MetalView metal_view_ = nullptr;
   plume::RenderWindow render_window_ = {};
+  static inline std::atomic<bool> ios_background_{false}, ios_drained_{false};
 #elif defined(__ANDROID__)
   plume::RenderWindow render_window_ = nullptr;  // ANativeWindow* of SDLActivity's surface
 #endif

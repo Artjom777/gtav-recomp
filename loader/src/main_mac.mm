@@ -3,6 +3,8 @@
 //   open GTAV.app                 installed: start the game and quit; otherwise the setup window
 //                                 (hold Option while opening it to get the setup window anyway)
 //   GTAV --unattended [--home D]  setup from D/data/launcher.ini, no questions (testing)
+//   GTAV --iphone [--home D]      iPhone build from the installed game folder, no window
+//                                 (data/logs/iphone_unattended.txt; out: D/iphone, see install.h)
 //   GTAV --home D                 use D as the game folder (default: ~/Library/Application
 //                                 Support/GTAV Recomp, or the one picked in the window)
 //   GTAV ... -- ARGS              pass ARGS to the game
@@ -129,6 +131,17 @@ int Unattended() {
   return ok ? 0 : 1;
 }
 
+// "--iphone": RunIphoneBuild without a window, for testing and for players who prefer Terminal.
+int IphoneUnattended() {
+  std::error_code ec;
+  fs::create_directories(g_home / "data" / "logs", ec);
+  FileUi ui(g_home / "data" / "logs" / "iphone_unattended.txt");
+  std::wstring error;
+  bool ok = Preflight(g_root, &error) && RunIphoneBuild(g_root, g_home, ui, &error);
+  ui.Log(ok ? L"done" : L"error: " + error);
+  return ok ? 0 : 1;
+}
+
 }  // namespace
 
 //-----------------------------------------------------------------------------
@@ -182,6 +195,7 @@ class WindowUi : public InstallUi {
   NSProgressIndicator* _progress;
   NSTextView* _log;
   NSButton* _install;
+  NSButton* _iphone;
   NSButton* _play;
   NSButton* _browse[4];
   std::unique_ptr<WindowUi> _ui;
@@ -255,6 +269,7 @@ class WindowUi : public InstallUi {
   sv.documentView = _log;
   [_window.contentView addSubview:sv];
 
+  _iphone = [self button:@"Build for iPhone" frame:NSMakeRect(16, 14, 150, 32) action:@selector(iphone:)];
   _install = [self button:@"Install" frame:NSMakeRect(w - 236, 14, 104, 32) action:@selector(install:)];
   _play = [self button:@"Play" frame:NSMakeRect(w - 120, 14, 104, 32) action:@selector(play:)];
   _play.keyEquivalent = @"\r";
@@ -272,6 +287,7 @@ class WindowUi : public InstallUi {
   for (int i = 0; i < 3; ++i) _paths[i].editable = !busy;
   _home.editable = !busy;
   _install.title = busy ? @"Cancel" : @"Install";
+  _iphone.enabled = !busy && IsInstalled(g_home);
   _play.enabled = !busy && IsInstalled(g_home);
 }
 
@@ -351,6 +367,34 @@ class WindowUi : public InstallUi {
   return YES;
 }
 
+// iPhone build (install.h RunIphoneBuild) from the installed game folder; Install's button cancels.
+- (void)iphone:(id)sender {
+  if (_busy) return;
+  _ui = std::make_unique<WindowUi>(self);
+  g_cancelled = false;
+  [self setBusy:true];
+  WindowUi* ui = _ui.get();
+  std::thread([self, ui] {
+    std::wstring err;
+    bool ok = RunIphoneBuild(g_root, g_home, *ui, &err);
+    NSString* e = NS(err);
+    dispatch_async(dispatch_get_main_queue(), ^{
+      [self setBusy:false];
+      if (ok) {
+        [self stage:@"iPhone build finished: install GTAV.ipa with Sideloadly or AltStore."];
+        // Show GTAV.ipa in Finder: the next step is dragging it into Sideloadly.
+        [NSWorkspace.sharedWorkspace
+            activateFileViewerSelectingURLs:@[ [NSURL fileURLWithPath:NS(g_home / "iphone" / "GTAV.ipa")] ]];
+      } else if (g_cancelled) {
+        [self stage:@"Cancelled."];
+      } else {
+        [self stage:@"iPhone build stopped."];
+        ShowError(e);
+      }
+    });
+  }).detach();
+}
+
 - (void)install:(id)sender {
   if (_busy) {
     g_cancelled = true;
@@ -410,7 +454,7 @@ int main(int argc, char** argv) {
   @autoreleasepool {
     g_root = fs::path(NSBundle.mainBundle.resourcePath.UTF8String) / "gtav";
     g_home = DefaultHome();
-    bool unattended = false, setup = false;
+    bool unattended = false, setup = false, iphone = false;
     for (int i = 1; i < argc; ++i) {
       std::string a = argv[i];
       if (a == "--") {
@@ -419,6 +463,8 @@ int main(int argc, char** argv) {
       }
       if (a == "--unattended") {
         unattended = true;
+      } else if (a == "--iphone") {
+        iphone = true;
       } else if (a == "--setup") {
         setup = true;
       } else if (a == "--home" && i + 1 < argc) {
@@ -429,6 +475,7 @@ int main(int argc, char** argv) {
       // Anything else (e.g. -psn_* from old Finder launches) is ignored.
     }
     if (unattended) return Unattended();
+    if (iphone) return IphoneUnattended();
 
     [NSApplication sharedApplication];
     NSApp.activationPolicy = NSApplicationActivationPolicyRegular;

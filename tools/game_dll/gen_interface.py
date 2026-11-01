@@ -101,9 +101,12 @@ def write_macos(out_dir, hooks, imports, bridge, cc):
         f"\t.globl _{s}\n\t.p2align 2\n_{s}:\n\tbrk #1\n" for s in exports))
     if changed or not os.path.exists(stub):
         # ld64 wants libSystem in every dylib: the toolchain's clang has no default SDK path.
-        sdk = subprocess.run(["xcrun", "--show-sdk-path"], capture_output=True, text=True,
+        # GTAV_STUB_SDK=iphoneos: the iOS shell (the stub must be built for the exe's platform).
+        sdk_name = os.environ.get("GTAV_STUB_SDK", "macosx")
+        sdk = subprocess.run(["xcrun", "--sdk", sdk_name, "--show-sdk-path"], capture_output=True, text=True,
                              check=True).stdout.strip()
-        subprocess.run([cc, "-dynamiclib", "-arch", "arm64", "-isysroot", sdk, "-install_name",
+        target = ["-target", "arm64-apple-ios17.0"] if sdk_name == "iphoneos" else ["-arch", "arm64"]
+        subprocess.run([cc, "-dynamiclib"] + target + ["-isysroot", sdk, "-install_name",
                         "@rpath/gtav_game.dylib", asm, "-o", stub], check=True)
 
 

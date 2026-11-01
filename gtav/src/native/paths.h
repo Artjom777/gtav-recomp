@@ -13,6 +13,8 @@
 #endif
 #include <windows.h>
 #elif defined(__APPLE__)
+#include <TargetConditionals.h>
+#include <cstdlib>
 #include <mach-o/dyld.h>
 #elif defined(__ANDROID__)
 #include <SDL3/SDL_system.h>
@@ -25,6 +27,11 @@ inline std::filesystem::path ExeDir() {
   wchar_t buf[MAX_PATH];
   DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
   return std::filesystem::path(std::wstring(buf, n)).parent_path();
+#elif defined(__APPLE__) && TARGET_OS_IPHONE
+  // The app bundle is read-only: settings, SPIR-V, caches and logs live in the app's Documents
+  // (visible in the Files app and Finder file sharing).
+  const char* home = std::getenv("HOME");
+  return home ? std::filesystem::path(home) / "Documents" : std::filesystem::current_path();
 #elif defined(__APPLE__)
   char buf[4096];
   uint32_t size = sizeof(buf);
@@ -44,8 +51,19 @@ inline std::filesystem::path ExeDir() {
 #endif
 }
 
-// SPIR-V of the game's shaders (census output): <exe dir>/spirv.
-inline std::string DefaultSpirvDir() { return (ExeDir() / "spirv").string(); }
+// SPIR-V of the game's shaders (census output): <exe dir>/spirv. iPhone release: inside the app
+// bundle (the player's Mac translated them into the ipa); a Documents/spirv (dev builds) wins.
+inline std::string DefaultSpirvDir() {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+  std::error_code ec;
+  if (!std::filesystem::is_directory(ExeDir() / "spirv", ec)) {
+    char buf[4096];
+    uint32_t size = sizeof(buf);
+    if (_NSGetExecutablePath(buf, &size) == 0) return (std::filesystem::path(buf).parent_path() / "spirv").string();
+  }
+#endif
+  return (ExeDir() / "spirv").string();
+}
 
 // Dumps and probe output: <exe dir>/logs/<sub>.
 inline std::string LogPath(const std::string& sub) { return (ExeDir() / "logs" / sub).string(); }

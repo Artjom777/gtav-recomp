@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 9b3cdf5..c03fff2 100644
+index 9b3cdf5..b3199ce 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -158,6 +158,10 @@ if(WIN32)
@@ -13,6 +13,28 @@ index 9b3cdf5..c03fff2 100644
  elseif(UNIX AND NOT APPLE)
      if(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
          set(REX_PLATFORM "linux-amd64")
+@@ -170,6 +174,9 @@ elseif(UNIX AND NOT APPLE)
+ elseif(APPLE)
+     if(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
+         set(REX_PLATFORM "mac-amd64")
++    elseif(CMAKE_SYSTEM_NAME STREQUAL "iOS")
++        set(REX_IOS TRUE)
++        set(REX_PLATFORM "ios-arm64")
+     elseif(REX_TARGET_PROCESSOR MATCHES "aarch64|ARM64|arm64")
+         set(REX_PLATFORM "mac-arm64")
+     else()
+@@ -260,7 +267,10 @@ add_subdirectory(src/graphics)
+ add_subdirectory(src/system)
+ add_subdirectory(src/kernel)
+ add_subdirectory(src/codegen)
+-add_subdirectory(src/rexglue)
++# The codegen tool runs on the build host only; an iOS build is runtime libraries alone.
++if(NOT REX_IOS)
++    add_subdirectory(src/rexglue)
++endif()
+ 
+ # Add tests subdirectory if tests are enabled
+ if(REXGLUE_BUILD_TESTS)
 diff --git a/CMakePresets.json b/CMakePresets.json
 index 622b924..2193531 100644
 --- a/CMakePresets.json
@@ -28,6 +50,46 @@ index 622b924..2193531 100644
                  "CMAKE_OSX_ARCHITECTURES": "arm64"
              }
          },
+diff --git a/cmake/rexglue_helpers.cmake b/cmake/rexglue_helpers.cmake
+index 41e6dce..a46a433 100644
+--- a/cmake/rexglue_helpers.cmake
++++ b/cmake/rexglue_helpers.cmake
+@@ -166,7 +166,7 @@ function(rexglue_configure_target target_name)
+         unset(_plugin_target)
+     endforeach()
+ 
+-    if(APPLE AND REXGLUE_USE_VULKAN)
++    if(APPLE AND REXGLUE_USE_VULKAN AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+         _rexglue_stage_macos_vulkan_runtime(${target_name})
+     endif()
+ endfunction()
+diff --git a/cmake/rexglue_install.cmake b/cmake/rexglue_install.cmake
+index d9a64eb..cdf0918 100644
+--- a/cmake/rexglue_install.cmake
++++ b/cmake/rexglue_install.cmake
+@@ -52,11 +52,13 @@ install(TARGETS ${REXGLUE_INSTALL_TARGETS}
+ )
+ 
+ # A Debug codegen tool runs an order of magnitude slower, so only Release ships.
++if(TARGET rexglue)
+ install(TARGETS rexglue
+     EXPORT rexglueTargets
+     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+     CONFIGURATIONS Release
+ )
++endif()
+ 
+ if(REXGLUE_INSTALL_FIDELITYFX_TARGETS)
+     install(TARGETS ${REXGLUE_INSTALL_FIDELITYFX_TARGETS}
+@@ -137,7 +139,7 @@ if(REXGLUE_USE_D3D12)
+     )
+ endif()
+ 
+-if(APPLE AND REXGLUE_USE_VULKAN)
++if(APPLE AND REXGLUE_USE_VULKAN AND NOT REX_IOS)
+     install(FILES "$<TARGET_FILE:Vulkan::Loader>"
+         DESTINATION ${CMAKE_INSTALL_LIBDIR}
+         CONFIGURATIONS Release
 diff --git a/include/rex/audio/sdl/sdl_audio_driver.h b/include/rex/audio/sdl/sdl_audio_driver.h
 index f8949ca..32ce942 100644
 --- a/include/rex/audio/sdl/sdl_audio_driver.h
@@ -162,6 +224,34 @@ index 1cb3faa..a68b9cc 100644
  };
  
  /// Create a default InputSystem with SDL + NOP drivers.
+diff --git a/include/rex/platform.h b/include/rex/platform.h
+index e90418d..9f5d0f8 100644
+--- a/include/rex/platform.h
++++ b/include/rex/platform.h
+@@ -28,7 +28,12 @@
+ #include <TargetConditionals.h>
+ #endif
+ 
+-#if defined(TARGET_OS_MAC) && TARGET_OS_MAC
++// iOS is Darwin too: REX_PLATFORM_MAC stays set (BSD libc, Mach, MoltenVK on Metal) and
++// REX_PLATFORM_IOS subtracts the desktop-only pieces (AppKit, shm_open, a loader to dlopen).
++#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
++#define REX_PLATFORM_IOS 1
++#define REX_PLATFORM_MAC 1
++#elif defined(TARGET_OS_MAC) && TARGET_OS_MAC
+ #define REX_PLATFORM_MAC 1
+ #elif defined(WIN32) || defined(_WIN32)
+ #define REX_PLATFORM_WIN32 1
+@@ -47,6 +52,9 @@
+ #ifndef REX_PLATFORM_MAC
+ #define REX_PLATFORM_MAC 0
+ #endif
++#ifndef REX_PLATFORM_IOS
++#define REX_PLATFORM_IOS 0
++#endif
+ #ifndef REX_PLATFORM_WIN32
+ #define REX_PLATFORM_WIN32 0
+ #endif
 diff --git a/include/rex/system/xobject.h b/include/rex/system/xobject.h
 index 0a43f07..a9bf21f 100644
 --- a/include/rex/system/xobject.h
@@ -1107,10 +1197,24 @@ index ef5bdf4..7a6cf2e 100644
 +
  }  // namespace rex
 diff --git a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
-index b52bf39..1d25fcf 100644
+index b52bf39..833df74 100644
 --- a/src/core/memory_posix.cpp
 +++ b/src/core/memory_posix.cpp
-@@ -51,10 +51,7 @@
+@@ -19,9 +19,13 @@
+ 
+ #include <fcntl.h>
+ 
++#include <rex/platform.h>
++
+ #if REX_PLATFORM_MAC
+ #include <mach/mach.h>
++#if !REX_PLATFORM_IOS
+ #include <mach/mach_vm.h>
++#endif
+ #include <mach/vm_region.h>
+ #endif  // REX_PLATFORM_MAC
+ 
+@@ -51,10 +55,7 @@
  #include <dlfcn.h>
  #include <sys/ioctl.h>
  
@@ -1122,7 +1226,7 @@ index b52bf39..1d25fcf 100644
  #endif
  
  namespace rex {
-@@ -84,32 +81,6 @@ static std::string MakeShmName(const std::filesystem::path& path) {
+@@ -84,32 +85,6 @@ static std::string MakeShmName(const std::filesystem::path& path) {
    return name;
  }
  
@@ -1155,7 +1259,40 @@ index b52bf39..1d25fcf 100644
  
  size_t page_size() {
    return getpagesize();
-@@ -432,28 +403,19 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
+@@ -278,9 +253,11 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
+ 
+   int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+ #if REX_PLATFORM_MAC
++#if !REX_PLATFORM_IOS  // iOS refuses MAP_JIT without the JIT entitlement; nothing here executes.
+   if (access == PageAccess::kExecuteReadWrite || access == PageAccess::kExecuteReadOnly) {
+     flags |= MAP_JIT;
+   }
++#endif
+   if (base_address) {
+     flags |= MAP_FIXED;
+   }
+@@ -381,9 +358,20 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
+   mach_msg_type_number_t info_count = VM_REGION_BASIC_INFO_COUNT_64;
+   mach_port_t object_name;
+ 
++#if REX_PLATFORM_IOS
++  // mach_vm.h is unsupported in the iOS SDK; vm_region_64 is the same call with vm_* types.
++  vm_address_t vm_address = static_cast<vm_address_t>(address);
++  vm_size_t vm_size = 0;
++  kern_return_t kr =
++      vm_region_64(mach_task_self(), &vm_address, &vm_size, VM_REGION_BASIC_INFO_64,
++                   reinterpret_cast<vm_region_info_t>(&info), &info_count, &object_name);
++  address = vm_address;
++  region_size = vm_size;
++#else
+   kern_return_t kr =
+       mach_vm_region(mach_task_self(), &address, &region_size, VM_REGION_BASIC_INFO_64,
+                      reinterpret_cast<vm_region_info_t>(&info), &info_count, &object_name);
++#endif
+   if (kr != KERN_SUCCESS) {
+     return false;
+   }
+@@ -432,28 +420,39 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
  FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, size_t length,
                                            PageAccess access, bool commit) {
  #if REX_PLATFORM_ANDROID
@@ -1190,10 +1327,30 @@ index b52bf39..1d25fcf 100644
    }
 -  return static_cast<FileMappingHandle>(ashmem_fd);
 +  return static_cast<FileMappingHandle>(fd);
++#elif REX_PLATFORM_IOS
++  // The iOS sandbox denies shm_open: back the guest memory with a sparse file in the app's tmp
++  // directory instead, unlinked at once (the fd keeps it alive; a crash leaves nothing behind).
++  // The views alias it with MAP_SHARED exactly as they would a shm object.
++  (void)access;
++  (void)commit;
++  const char* tmp_dir = std::getenv("TMPDIR");
++  std::filesystem::path backing = std::filesystem::path(tmp_dir ? tmp_dir : "/tmp") / path.filename();
++  int fd = open(backing.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
++  if (fd < 0) {
++    REXSYS_ERROR("guest memory backing file {} failed: {}", backing.string(), strerror(errno));
++    return kFileMappingHandleInvalid;
++  }
++  unlink(backing.c_str());
++  if (ftruncate(fd, static_cast<off_t>(length)) != 0) {
++    REXSYS_ERROR("guest memory backing file truncate to 0x{:X} failed: {}", length, strerror(errno));
++    close(fd);
++    return kFileMappingHandleInvalid;
++  }
++  return static_cast<FileMappingHandle>(fd);
  #else
    int oflag;
    switch (access) {
-@@ -483,6 +445,10 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
+@@ -483,13 +482,17 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
      shm_unlink(full_path.c_str());
      return kFileMappingHandleInvalid;
    }
@@ -1204,6 +1361,14 @@ index b52bf39..1d25fcf 100644
    return static_cast<FileMappingHandle>(ret);
  #endif
  }
+ 
+ void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::path& path) {
+   close(static_cast<int>(handle));
+-#if !REX_PLATFORM_ANDROID
++#if !REX_PLATFORM_ANDROID && !REX_PLATFORM_IOS
+   auto full_path = MakeShmName(path);
+   shm_unlink(full_path.c_str());
+ #endif
 diff --git a/src/core/seh_posix.cpp b/src/core/seh_posix.cpp
 index 5e0a932..cd75b74 100644
 --- a/src/core/seh_posix.cpp
@@ -2858,6 +3023,30 @@ index 0000000..913511e
 +
 +}  // namespace ui
 +}  // namespace rex
+diff --git a/src/ui/vulkan/vulkan_instance.cpp b/src/ui/vulkan/vulkan_instance.cpp
+index 914b311..0c76c51 100644
+--- a/src/ui/vulkan/vulkan_instance.cpp
++++ b/src/ui/vulkan/vulkan_instance.cpp
+@@ -16,6 +16,7 @@
+ #include <vector>
+ 
+ #include <rex/cvar.h>
++#include <rex/filesystem.h>
+ #include <rex/logging.h>
+ #include <rex/platform.h>
+ #include <rex/ui/vulkan/instance.h>
+@@ -50,6 +51,11 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+   ConfigureMacOSVulkanEnvironment(macos_runtime_paths);
+ 
+   std::vector<std::filesystem::path> loader_candidates = macos_runtime_paths.loader_candidates;
++#if REX_PLATFORM_IOS
++  // No loader on iOS: the app bundle carries MoltenVK itself (signed with the app).
++  loader_candidates.insert(loader_candidates.begin(),
++                           rex::filesystem::GetExecutableFolder() / "libMoltenVK.dylib");
++#endif
+   loader_candidates.emplace_back(platform::lib_names::kVulkanLoader);
+   loader_candidates.emplace_back("libvulkan.dylib");
+   loader_candidates.emplace_back("libMoltenVK.dylib");
 diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
 index 2251429..f7aeaf0 100644
 --- a/src/ui/window_sdl.cpp
@@ -2887,7 +3076,7 @@ index 2251429..f7aeaf0 100644
    SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window_);
    if (allowed_types & Surface::kTypeFlag_WaylandSurface) {
 diff --git a/src/ui/windowed_app_context_sdl.cpp b/src/ui/windowed_app_context_sdl.cpp
-index dc0b4c2..5c7de33 100644
+index dc0b4c2..0742758 100644
 --- a/src/ui/windowed_app_context_sdl.cpp
 +++ b/src/ui/windowed_app_context_sdl.cpp
 @@ -9,6 +9,9 @@
@@ -2900,7 +3089,20 @@ index dc0b4c2..5c7de33 100644
  #include <rex/ui/windowed_app_context_sdl.h>
  
  #include <cstdlib>
-@@ -91,6 +94,21 @@ int SDLWindowedAppContext::RunMainMessageLoop() {
+@@ -41,7 +44,11 @@ bool SDLWindowedAppContext::Initialize() {
+   // Picked before SDL_InitSubSystem, long before a graphics instance can say
+   // which surface extensions it has, so the cvar is the escape hatch.
+   std::string requested_driver = REXCVAR_GET(video_driver);
+-#if REX_PLATFORM_MAC
++#if REX_PLATFORM_IOS
++  if (requested_driver.empty()) {
++    requested_driver = "uikit";
++  }
++#elif REX_PLATFORM_MAC
+   // macOS presents via a CAMetalLayer surface obtained from the Cocoa driver.
+   if (requested_driver.empty()) {
+     requested_driver = "cocoa";
+@@ -91,6 +98,21 @@ int SDLWindowedAppContext::RunMainMessageLoop() {
        REXLOG_ERROR("SDL_WaitEvent failed: {}", SDL_GetError());
        return EXIT_FAILURE;
      }
@@ -2923,7 +3125,7 @@ index dc0b4c2..5c7de33 100644
    }
    return EXIT_SUCCESS;
 diff --git a/src/ui/windowed_app_main_sdl.cpp b/src/ui/windowed_app_main_sdl.cpp
-index 77bb1dc..61f94b0 100644
+index 77bb1dc..4b57917 100644
 --- a/src/ui/windowed_app_main_sdl.cpp
 +++ b/src/ui/windowed_app_main_sdl.cpp
 @@ -22,6 +22,11 @@
@@ -2938,11 +3140,112 @@ index 77bb1dc..61f94b0 100644
  #if REX_PLATFORM_WIN32
  #ifndef WIN32_LEAN_AND_MEAN
  #define WIN32_LEAN_AND_MEAN
+@@ -124,6 +129,80 @@ int WINAPI wWinMain(HINSTANCE hinstance, HINSTANCE hinstance_prev, LPWSTR comman
+   return RunWindowedApp(static_cast<int>(argv_ptrs.size()), argv_ptrs.data());
+ }
+ 
++#elif REX_PLATFORM_IOS
++
++// iOS: UIKit must own the main thread, so main() hands over to SDL_RunApp (UIApplicationMain),
++// which calls back into RunWindowedApp once the app has finished launching. An app gets no
++// command line from the home screen: arguments come from Documents/args.txt (one per line or
++// space separated, # comments), appended after any that were passed (devicectl --  args).
++#define SDL_MAIN_HANDLED
++#include <SDL3/SDL_main.h>
++#include <fstream>
++#include <sstream>
++#include <unistd.h>
++#include <cerrno>
++#include <cstdio>
++#include <cstring>
++#include <filesystem>
++
++namespace {
++std::vector<std::string> g_ios_args;
++std::vector<char*> g_ios_argv;
++
++int IosMain(int argc, char* argv[]) {
++  // Again here: SDL's app delegate changes to the (read-only) bundle directory before this runs.
++  if (const char* home = std::getenv("HOME")) {
++    std::string docs = std::string(home) + "/Documents";
++    int rc = chdir(docs.c_str());
++    char cwd[1024] = {};
++    getcwd(cwd, sizeof(cwd));
++    std::error_code ec;
++    std::filesystem::create_directories("logs", ec);
++    FILE* probe = std::fopen("logs/.probe", "w");
++    std::fprintf(stderr, "[ios] chdir(%s)=%d cwd=%s logs:%s probe:%s (%s)\n", docs.c_str(), rc, cwd,
++                 ec ? ec.message().c_str() : "ok", probe ? "ok" : "fail", probe ? "" : std::strerror(errno));
++    if (probe) std::fclose(probe);
++  }
++  return RunWindowedApp(argc, argv);
++}
++}  // namespace
++
++int main(int argc, char* argv[]) {
++  for (int i = 0; i < argc; ++i) {
++    g_ios_args.emplace_back(argv[i]);
++  }
++  auto read_args = [](const std::string& path) {
++    std::ifstream file(path);
++    std::string line;
++    while (std::getline(file, line)) {
++      if (auto hash = line.find('#'); hash != std::string::npos) {
++        line.resize(hash);
++      }
++      std::istringstream words(line);
++      std::string word;
++      while (words >> word) {
++        g_ios_args.push_back(word);
++      }
++    }
++  };
++  // The app's own defaults (args.txt inside the bundle, next to the executable) first, then the
++  // player's Documents/args.txt, whose settings come later and so win.
++  if (argc > 0) {
++    read_args((std::filesystem::path(argv[0]).parent_path() / "args.txt").string());
++  }
++  if (const char* home = std::getenv("HOME")) {
++    // Relative paths in args.txt (game data, logs) are relative to Documents: the container's
++    // absolute path changes with every install.
++    chdir((std::string(home) + "/Documents").c_str());
++    read_args(std::string(home) + "/Documents/args.txt");
++  }
++  for (auto& arg : g_ios_args) {
++    g_ios_argv.push_back(arg.data());
++  }
++  g_ios_argv.push_back(nullptr);
++  return SDL_RunApp(static_cast<int>(g_ios_args.size()), g_ios_argv.data(), IosMain, nullptr);
++}
++
+ #else
+ 
+ int main(int argc, char* argv[]) {
 diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
-index f102b56..cf06f7a 100644
+index f102b56..3030ad5 100644
 --- a/thirdparty/CMakeLists.txt
 +++ b/thirdparty/CMakeLists.txt
-@@ -234,8 +234,12 @@ add_library(imgui OBJECT
+@@ -49,7 +49,7 @@ if(REXGLUE_USE_VULKAN)
+         vulkan-headers vulkan-memory-allocator
+         spirv-headers spirv-tools glslang
+     )
+-    if(APPLE)
++    if(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+         list(APPEND REQUIRED_SUBMODULES vulkan-loader moltenvk)
+     endif()
+ endif()
+@@ -201,7 +201,9 @@ if(REXGLUE_USE_VULKAN)
+     set(VMA_ENABLE_INSTALL ON CACHE BOOL "" FORCE)
+     add_subdirectory(vulkan-memory-allocator)
+ 
+-    if(APPLE)
++    # iOS: no Vulkan loader; the app embeds a prebuilt MoltenVK (ios-arm64) and the runtime
++    # opens it from the app bundle.
++    if(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+         # Build the loader and MoltenVK revisions shipped by the pinned SDK.
+         # They remain runtime-loaded; no Vulkan implementation is linked into
+         # rexglue itself.
+@@ -234,8 +236,12 @@ add_library(imgui OBJECT
      ${IMGUI_DIR}/imgui_draw.cpp
      ${IMGUI_DIR}/imgui_tables.cpp
      ${IMGUI_DIR}/imgui_widgets.cpp
@@ -2955,12 +3258,6 @@ index f102b56..cf06f7a 100644
  target_include_directories(imgui PUBLIC
      $<BUILD_INTERFACE:${IMGUI_DIR}>
      $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-diff --git a/thirdparty/FFmpeg b/thirdparty/FFmpeg
---- a/thirdparty/FFmpeg
-+++ b/thirdparty/FFmpeg
-@@ -1 +1 @@
--Subproject commit 0604b464c7cb4ebc94940cf1f324a3b26b87717c
-+Subproject commit 0604b464c7cb4ebc94940cf1f324a3b26b87717c-dirty
 diff --git a/thirdparty/disruptorplus/include/disruptorplus/blocking_wait_strategy.hpp b/thirdparty/disruptorplus/include/disruptorplus/blocking_wait_strategy.hpp
 index 32d427d..23fd3e1 100644
 --- a/thirdparty/disruptorplus/include/disruptorplus/blocking_wait_strategy.hpp
@@ -3017,9 +3314,3 @@ index 0000000..b961317
 +#include "imgui_rex_config.h"
 +
 +thread_local ImGuiContext* RexImGuiContextTLS = nullptr;
-diff --git a/thirdparty/sdl3 b/thirdparty/sdl3
---- a/thirdparty/sdl3
-+++ b/thirdparty/sdl3
-@@ -1 +1 @@
--Subproject commit 8bf3b7215ad9fc3deb583c6a3a37c6c67f2e24e4
-+Subproject commit 8bf3b7215ad9fc3deb583c6a3a37c6c67f2e24e4-dirty

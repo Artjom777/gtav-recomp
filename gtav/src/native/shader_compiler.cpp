@@ -32,9 +32,22 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
 
-REXCVAR_DEFINE_BOOL(gtav_native_compile, true, "GTAV",
+// iOS cannot start processes: every shader comes precompiled from the Mac (spirv dir).
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+#define GTAV_NATIVE_COMPILE_DEFAULT false
+#else
+#define GTAV_NATIVE_COMPILE_DEFAULT true
+#endif
+REXCVAR_DEFINE_BOOL(gtav_native_compile, GTAV_NATIVE_COMPILE_DEFAULT, "GTAV",
                     "Compile shaders that have no precompiled SPIR-V in the background (tools/ next to the exe)");
+// iOS: shaders without SPIR-V are still written to shader_cache/<name>.bin, for the Mac to translate
+// (tools/ios: the iPhone step pulls them and pushes the SPIR-V back).
+REXCVAR_DEFINE_BOOL(gtav_native_save_missing_shaders, !GTAV_NATIVE_COMPILE_DEFAULT, "GTAV",
+                    "Without --gtav_native_compile: still save shaders that have no SPIR-V to shader_cache/");
 REXCVAR_DECLARE(std::string, gtav_native_spirv_dir);
 
 namespace gtav::native {
@@ -67,7 +80,11 @@ fs::path SpirvDirPath() {
   return dir.empty() ? fs::path(DefaultSpirvDir()) : fs::path(dir);
 }
 // Next to the SPIR-V dir: build/shader_cache in a dev tree, data/shader_cache in a release install.
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+fs::path CacheDir() { return ExeDir() / "shader_cache"; }  // Documents: the bundle is read-only
+#else
 fs::path CacheDir() { return SpirvDirPath().parent_path() / "shader_cache"; }
+#endif
 
 // Runs a command line without a console window; true on exit code 0.
 bool Run(const std::vector<std::string>& args) {
@@ -88,6 +105,9 @@ bool Run(const std::vector<std::string>& args) {
   CloseHandle(pi.hThread);
   CloseHandle(pi.hProcess);
   return code == 0;
+#elif defined(__APPLE__) && TARGET_OS_IPHONE
+  (void)args;
+  return false;
 #else
   std::string cmd;
   for (const auto& a : args) cmd += "'" + a + "' ";
@@ -276,12 +296,12 @@ static void IntakeWorker() {
         std::fclose(f);
       }
     }
-    Enqueue(item.name);
+    if (REXCVAR_GET(gtav_native_compile)) Enqueue(item.name);
   }
 }
 
 void OnShaderCreated(const uint8_t* container, size_t size, uint64_t hash, bool pixel) {
-  if (!REXCVAR_GET(gtav_native_compile)) return;
+  if (!REXCVAR_GET(gtav_native_compile) && !REXCVAR_GET(gtav_native_save_missing_shaders)) return;
   std::string name = fmt::format("{}_{:016X}", pixel ? "ps" : "vs", hash);
   std::lock_guard lock(g_mutex);
   if (!g_seen.insert(name).second) return;

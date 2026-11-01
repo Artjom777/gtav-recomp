@@ -14,7 +14,16 @@
 #include <rex/runtime.h>
 #include <rex/ui/windowed_app_context.h>
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+#include "ios_setup.h"
+#endif
+
 #include <atomic>
+#include <functional>
+#include <optional>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -90,6 +99,22 @@ class GtavApp : public rex::ReXApp {
     }).detach();
   }
   void OnShutdown() override { shutting_down_ = true; }
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+  // iPhone release: the game data is installed on the phone by the setup screen (ios_setup.h) into
+  // Documents/data, the Mac install's layout. A dev build passes its own roots in args.txt.
+  std::optional<rex::PathConfig> OnFinalizePaths(const rex::PathConfig& defaults,
+                                                 std::function<void(rex::PathConfig)> resume) override {
+    if (!defaults.game_data_root.empty()) return defaults;
+    rex::PathConfig paths = defaults;
+    const auto data = gtav::ios_setup::DataRoot();
+    paths.game_data_root = data / "game";
+    paths.update_data_root = data / "update";
+    paths.user_data_root = data / "user";
+    if (gtav::ios_setup::DataInstalled()) return paths;
+    gtav::ios_setup::Show([paths, resume] { resume(paths); });
+    return std::nullopt;
+  }
+#endif
   // void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {}
   // std::unique_ptr<rex::ui::ImGuiDialog> CreateAchievementsOverlay() override;
   // std::unique_ptr<rex::ui::AchievementNotificationDialog>

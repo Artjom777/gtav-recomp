@@ -82,6 +82,8 @@ def main():
     ap.add_argument("--android", metavar="LIB_DIR",
                     help="build libgtav_game.so for Android arm64, linked against libgtav_fast.so "
                          "and librexruntime.so in LIB_DIR")
+    ap.add_argument("--ios", action="store_true",
+                    help="macOS host: build gtav_game.dylib for the iOS app (arm64-apple-ios17, A14+)")
     a = ap.parse_args()
     android = a.android is not None
 
@@ -93,6 +95,9 @@ def main():
         clang = find_tool(a.llvm_bin, ["clang++", "clang"])
         lld = find_tool(a.llvm_bin, ["ld64.lld", "ld"])
         cxxflags, ext = CXXFLAGS_MACOS, ".o"
+        if a.ios:
+            cxxflags = [f for f in cxxflags if not f.startswith(("--target=", "-mcpu="))] + \
+                ["--target=arm64-apple-ios17.0", "-mcpu=apple-a14"]
     elif LINUX:
         clang = find_tool(a.llvm_bin, ["clang++", "clang++-20", "clang++-19"])
         lld = find_tool(a.llvm_bin, ["ld.lld", "ld.lld-20", "ld.lld-19"])
@@ -163,9 +168,16 @@ def main():
         with open(urs, "w") as f:
             f.write("\n".join(f"-U {u}" for u in undefs))
         t = time.time()
-        subprocess.run([lld] + LDFLAGS_MACOS +
+        ldflags = LDFLAGS_MACOS
+        tbd = os.path.join(ROOT, "tools", "game_dll", "libSystem.tbd")
+        if a.ios:
+            ldflags = [x for x in LDFLAGS_MACOS]
+            i = ldflags.index("-platform_version")
+            ldflags[i + 1:i + 4] = ["ios", "17.0", "17.0"]
+            tbd = os.path.join(ROOT, "tools", "game_dll", "libSystem_ios.tbd")
+        subprocess.run([lld] + ldflags +
                        ["-exported_symbols_list", os.path.join(a.interface, "gtav_game.exports"),
-                        os.path.join(ROOT, "tools", "game_dll", "libSystem.tbd"), a.runtime,
+                        tbd, a.runtime,
                         "-o", os.path.join(a.out, "gtav_game.dylib"), f"@{urs}", f"@{rsp}"],
                        check=True)
         print(f"linked gtav_game.dylib in {time.time() - t:.0f} s, total {time.time() - t0:.0f} s")

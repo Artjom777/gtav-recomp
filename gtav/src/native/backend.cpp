@@ -30,6 +30,9 @@
 #include <map>
 #include <tuple>
 #include <chrono>
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#endif
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -46,9 +49,21 @@
 #include <unordered_set>
 #include <bit>
 #include <set>
+// Phones (Android, iOS): the settings and paths measured on the Android port.
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
+#define GTAV_MOBILE 1
+#else
+#define GTAV_MOBILE 0
+#endif
 #ifdef __ANDROID__
 #include <sched.h>
 #include <unistd.h>
+#endif
+#if GTAV_MOBILE && defined(__APPLE__)
+#include <os/proc.h>
 #endif
 #include <vector>
 
@@ -61,13 +76,20 @@ REXCVAR_DEFINE_INT32(gtav_native_dump_rt_skip, 0, "GTAV",
 // Without a write watch (Android: kernel 5.10) large textures are spot-checked between full
 // checks; the game streaming new data into a texture showed as stale gray blocks for up to that
 // many frames while moving.
-#ifdef __ANDROID__
+#ifdef __ANDROID__  // (iOS keeps the Mac's 30: the phone is short of CPU time)
 REXCVAR_DEFINE_INT32(gtav_native_texture_recheck_frames, 4, "GTAV",
                      "Frames between full re-checks of a large texture (spot checks in between)");
 #else
 REXCVAR_DEFINE_INT32(gtav_native_texture_recheck_frames, 30, "GTAV",
                      "Frames between full re-checks of a large texture (spot checks in between)");
 #endif
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+#define GTAV_TEXTURE_SAMPLE_FRAMES_DEFAULT 1
+#else
+#define GTAV_TEXTURE_SAMPLE_FRAMES_DEFAULT 1
+#endif
+REXCVAR_DEFINE_INT32(gtav_native_texture_sample_frames, GTAV_TEXTURE_SAMPLE_FRAMES_DEFAULT, "GTAV",
+                     "Frames between the sampled checks of a large cached texture (1: every frame it is used)");
 REXCVAR_DEFINE_BOOL(gtav_native_exact_cache, false, "GTAV",
                     "Check cached vertex/index buffers and textures with a full content hash every frame "
                     "(no sampled-hash shortcut for large ones)");
@@ -95,7 +117,14 @@ REXCVAR_DEFINE_INT32(gtav_native_hash_threads, GTAV_HASH_THREADS_DEFAULT, "GTAV"
                      "when there is no write watch (0: hash on the render thread)");
 REXCVAR_DEFINE_INT32(gtav_native_dump_rt_count, 150, "GTAV",
                      "Frame dumps: number of per-draw snapshots of --gtav_native_dump_rt (~2.7 MB each at 720p)");
-REXCVAR_DEFINE_DOUBLE(gtav_native_pipeline_wait_ms, 40.0, "GTAV",
+// The iPhone compiles pipelines several times slower (MoltenVK + Metal on an A15): wait longer before
+// a draw is skipped, so a new effect costs a hitch instead of a frame with holes in it.
+#if 0  // tried on the iPhone: 120 ms let the renderer fall behind (2 GB of fence copies per 300 frames)
+#define GTAV_PIPELINE_WAIT_DEFAULT 120.0
+#else
+#define GTAV_PIPELINE_WAIT_DEFAULT 40.0
+#endif
+REXCVAR_DEFINE_DOUBLE(gtav_native_pipeline_wait_ms, GTAV_PIPELINE_WAIT_DEFAULT, "GTAV",
                       "Background pipeline compiles: a frame waits up to this long in total for its draws' "
                       "pipelines before skipping them (0: never wait)");
 // Live experiments for the clear-sky slabs (settable while running through logs/menu_set).
@@ -112,6 +141,20 @@ REXCVAR_DEFINE_DOUBLE(gtav_native_farpin_scale, 1.0, "GTAV",
 REXCVAR_DEFINE_STRING(gtav_native_skip_ps, "", "GTAV", "Diagnostic: drop draws with these pixel shader hashes");
 REXCVAR_DEFINE_INT32(gtav_native_texture_budget_mb, 1024, "GTAV",
                      "Decoded texture cache budget: textures idle for 2 s are released above it (unified memory)");
+// iPhone: the vertex/index buffer cache had no limit and reached 18,000 buffers (140 MB of Metal
+// memory plus driver objects) within minutes of driving; the app was killed at ~2.2 GB.
+#if GTAV_MOBILE
+#define GTAV_BUFFER_BUDGET_DEFAULT 96
+#define GTAV_LOW_MEMORY_DEFAULT 600
+#else
+#define GTAV_BUFFER_BUDGET_DEFAULT 0
+#define GTAV_LOW_MEMORY_DEFAULT 0
+#endif
+REXCVAR_DEFINE_INT32(gtav_native_buffer_budget_mb, GTAV_BUFFER_BUDGET_DEFAULT, "GTAV",
+                     "Cached vertex/index buffer budget: buffers idle for 2 s are released above it (0: no limit)");
+REXCVAR_DEFINE_INT32(gtav_native_low_memory_mb, GTAV_LOW_MEMORY_DEFAULT, "GTAV",
+                     "iOS: below this much memory left before the OS kills the app, the texture and buffer caches "
+                     "shrink to half their budgets and release what was idle for 0.5 s (0: off)");
 REXCVAR_DEFINE_BOOL(gtav_native_lightvol_keep, true, "GTAV",
                     "Light-volume stencil marks keep the stencil where the volume is behind the scene "
                     "(no holes in the clouds over the sky)");
@@ -129,7 +172,7 @@ REXCVAR_DEFINE_BOOL(gtav_native_defer_writebacks, true, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_native_skip_depth_restore, true, "GTAV",
                     "Native renderer: skip GTA V's depth restore strips (EDRAM aliasing trick; native "
                     "depth targets keep their contents)");
-#ifdef __ANDROID__
+#if GTAV_MOBILE
 #define GTAV_DRAW_CLEARS_DEFAULT false  // vkCmdClearAttachments can become a load op (gtav_native_load_clears)
 #else
 #define GTAV_DRAW_CLEARS_DEFAULT true
@@ -260,7 +303,12 @@ constexpr uint32_t kSamplerDescriptors = 1024;
 // kOverflow: where a resource goes when the heap is full even after evicting (never sampled on
 // purpose; it used to land on kNull2D, so every "no texture" slot showed the newest texture).
 constexpr uint32_t kNull2D = 0, kNull3D = 1, kNullCube = 2, kOverflow = 3, kFirstTextureDescriptor = 4;
+// Smaller chunks on the phone: three frames in flight each kept 64 MB chunks mostly empty.
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+constexpr uint64_t kUploadChunk = 32ull << 20;
+#else
 constexpr uint64_t kUploadChunk = 64ull << 20;
+#endif
 // Tallest render target: GTA V stacks its four 640x640 sun shadow cascades in one 640x2560 depth
 // surface, so 2048 rows lost the far cascade (distant scenery shadowed by garbage wedges).
 constexpr uint32_t kMaxTargetRows = 4096;
@@ -890,7 +938,22 @@ class PipelineCompiler {
     std::lock_guard lock(mutex_);
     if (!started_) {
       started_ = true;
-      for (int i = 0; i < 3; i++) std::thread([this, device] { Worker(device); }).detach();
+      // iPhone: a pipeline takes ~3 s (MoltenVK + Metal on an A15), most of it waiting on the
+      // Metal compiler service: more compiles in flight drain the backlog after an install faster.
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+      constexpr int kWorkers = 6;
+#else
+      constexpr int kWorkers = 3;
+#endif
+      for (int i = 0; i < kWorkers; i++)
+        std::thread([this, device] {
+#if defined(__APPLE__)
+          // Same class as the guest threads (the SDK runs them USER_INTERACTIVE): a lower one
+          // starved behind them on the phone's two performance cores.
+          pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+          Worker(device);
+        }).detach();
     }
     queue_.push_back(std::move(job));
     cv_.notify_one();
@@ -906,10 +969,24 @@ class PipelineCompiler {
         job = std::move(queue_.front());
         queue_.pop_front();
       }
+      auto t0 = std::chrono::steady_clock::now();
       job->result = device->createGraphicsPipeline(job->desc);
       job->done.store(true, std::memory_order_release);
+      double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+      {
+        std::lock_guard lock(mutex_);
+        stat_ms_ += ms;
+        stat_max_ms_ = std::max(stat_max_ms_, ms);
+        if (++stat_n_ % 50 == 0) {
+          REXLOG_INFO("[native] pipeline compiles: {} done, avg {:.0f} ms (max {:.0f}) over the last 50, {} queued",
+                      stat_n_, stat_ms_ / 50, stat_max_ms_, queue_.size());
+          stat_ms_ = stat_max_ms_ = 0;
+        }
+      }
     }
   }
+  uint64_t stat_n_ = 0;
+  double stat_ms_ = 0, stat_max_ms_ = 0;
   std::mutex mutex_;
   std::condition_variable cv_;
   std::deque<std::shared_ptr<PipelineJob>> queue_;
@@ -1315,6 +1392,7 @@ struct CachedTexture {
   std::unique_ptr<RenderTexture> texture;
   std::unique_ptr<RenderTextureView> view;
   uint32_t descriptor = 0;
+  RenderFormat format = RenderFormat::UNKNOWN;  // decoded host format (iOS: DXT1 is RGBA8 or 5:6:5)
   uint64_t content = 0;
   uint64_t raw_hash = 0;  // HashGuestTexture of the decoded bytes
   uint64_t checked_frame = 0;
@@ -1494,7 +1572,7 @@ struct Backend::Impl {
   RenderDevice* device = nullptr;
   std::unique_ptr<RenderDescriptorSet> texture_set, sampler_set;
   std::unique_ptr<RenderPipelineLayout> layout;
-#ifdef __ANDROID__
+#if GTAV_MOBILE
   // Constant uniform-buffer sets (layout set 4), one per combination of upload-ring buffers the
   // three constant blocks of a draw live in (almost always one chunk).
   static constexpr uint32_t kConstantSet = 4;
@@ -1619,7 +1697,8 @@ struct Backend::Impl {
   std::unordered_map<uint64_t, CachedTexture> textures;
   std::unordered_map<uint64_t, uint32_t> samplers;  // desc hash -> descriptor index
   std::vector<std::unique_ptr<RenderSampler>> sampler_objects;
-  std::unordered_map<uint64_t, CachedBuffer> buffers;  // never erased: entries keep their address
+  // Erased only by the buffer budget (EvictTexturesOverBudget), which then clears buffer_memo.
+  std::unordered_map<uint64_t, CachedBuffer> buffers;
   // Direct-mapped memo in front of `buffers` (~4,000 lookups a frame were 6% of the render thread).
   std::array<std::pair<uint64_t, CachedBuffer*>, 4096> buffer_memo{};
   // PreHash: full hashes taken this frame (hashed ahead next frame) and the ones for this frame.
@@ -1642,7 +1721,7 @@ struct Backend::Impl {
     for (size_t i = 0; i < prehash_now.size(); i++) {
       auto& it = prehash_now[i];
       if (it.guest) {
-        auto& b = buffers[it.key];  // never erased
+        auto& b = buffers[it.key];  // (the memo is not used here: no address kept)
         b.pre_frame = frame, b.pre_index = i, b.pre_guest = it.guest, b.pre_size = it.size;
       } else if (auto t = textures.find(it.key); t != textures.end()) {
         t->second.pre_frame = frame, t->second.pre_index = i;
@@ -2193,20 +2272,65 @@ struct Backend::Impl {
   // GB) before that: on a unified-memory Mac with 8 GB the whole system swapped.
   void EvictTexturesOverBudget() {
     if (frame % 60) return;
-    const uint64_t budget = uint64_t(std::max(64, REXCVAR_GET(gtav_native_texture_budget_mb))) << 20;
+    // Low memory (iOS jetsam headroom): half the budgets, and anything idle for 30 frames may go.
+    bool low_memory = false;
+#if GTAV_MOBILE && defined(__APPLE__)
+    if (const int32_t low = REXCVAR_GET(gtav_native_low_memory_mb); low > 0)
+      low_memory = os_proc_available_memory() < (uint64_t(low) << 20);
+#endif
+    if (low_memory && low_memory_logs++ < 20)
+      REXLOG_INFO("[native] low memory: caches shrink to half their budgets");
+    const uint64_t min_idle = low_memory ? 30 : 120;
+    uint64_t budget = uint64_t(std::max(64, REXCVAR_GET(gtav_native_texture_budget_mb))) << 20;
+    if (low_memory) budget /= 2;
     uint64_t total = 0;
     for (const auto& [key, t] : textures)
       if (t.texture) total += t.bytes;
     uint64_t buffer_bytes = 0;
     for (const auto& [key, b] : buffers) buffer_bytes += b.buffer ? b.size : 0;
-    if (frame % 1800 == 0)
-      REXLOG_INFO("[native] caches: {} textures {:.0f} MB (budget {} MB), {} buffers {:.0f} MB", textures.size(),
-                  total / 1048576.0, budget >> 20, buffers.size(), buffer_bytes / 1048576.0);
+    // Buffers: released entries are erased (169,000 empty ones after an hour of driving) and the
+    // memo in front of the map forgets them; the next use converts the guest data again.
+    if (uint64_t bbudget = uint64_t(std::max(0, REXCVAR_GET(gtav_native_buffer_budget_mb))) << 20;
+        bbudget && buffer_bytes > (low_memory ? bbudget / 2 : bbudget)) {
+      if (low_memory) bbudget /= 2;
+      std::vector<std::pair<uint64_t, uint64_t>> idle_buffers;  // checked_frame, key
+      for (auto& [key, b] : buffers)
+        if (!b.buffer || frame - b.checked_frame >= min_idle)
+          idle_buffers.emplace_back(b.buffer ? b.checked_frame : 0, key);
+      std::sort(idle_buffers.begin(), idle_buffers.end());
+      uint64_t freed = 0;
+      size_t released = 0;
+      for (auto& [used, key] : idle_buffers) {
+        auto it = buffers.find(key);
+        if (it->second.buffer) {
+          if (buffer_bytes - freed <= bbudget * 4 / 5) break;
+          freed += it->second.size;
+          dead_buffers.push_back(std::move(it->second.buffer));  // an in-flight frame may read it
+          released++;
+        }
+        buffers.erase(it);
+      }
+      buffer_memo.fill({});
+      if (released && (buffer_budget_logs++ < 20 || buffer_budget_logs % 100 == 0))
+        REXLOG_INFO("[native] buffer budget: released {} buffers ({:.0f} MB), {:.0f} MB cached", released,
+                    freed / 1048576.0, (buffer_bytes - freed) / 1048576.0);
+      buffer_bytes -= freed;
+    }
+    if (frame % 600 == 0) {
+      size_t upload_chunks = upload.chunks.size();
+      for (const auto& p : parked) upload_chunks += p.upload.chunks.size();
+      uint64_t target_bytes = 0;
+      for (const auto& [key, t] : targets)
+        if (t.texture) target_bytes += uint64_t(t.width) * t.height * std::max(1u, t.msaa) * 4;
+      REXLOG_INFO("[native] caches: {} textures {:.0f} MB (budget {} MB), {} buffers {:.0f} MB; {} upload chunks "
+                  "({} MB), {} render targets (~{} MB at 4 B/px)",
+                  textures.size(), total / 1048576.0, budget >> 20, buffers.size(), buffer_bytes / 1048576.0,
+                  upload_chunks, (upload_chunks * kUploadChunk) >> 20, targets.size(), target_bytes >> 20);
+    }
     if (total <= budget) return;
-    constexpr uint64_t kMinIdle = 120;
     std::vector<std::pair<uint64_t, uint64_t>> idle;  // used_frame, key
     for (const auto& [key, t] : textures)
-      if (frame - t.used_frame >= kMinIdle && (t.texture || t.failed)) idle.emplace_back(t.used_frame, key);
+      if (frame - t.used_frame >= min_idle && (t.texture || t.failed)) idle.emplace_back(t.used_frame, key);
     std::sort(idle.begin(), idle.end());
     uint64_t released = 0, freed_bytes = 0;
     for (const auto& [used, key] : idle) {
@@ -2225,7 +2349,7 @@ struct Backend::Impl {
       REXLOG_INFO("[native] texture budget: released {} textures ({:.0f} MB), {} cached ({:.0f} MB)", released,
                   freed_bytes / 1048576.0, textures.size(), (total - freed_bytes) / 1048576.0);
   }
-  uint32_t budget_logs = 0;
+  uint32_t budget_logs = 0, buffer_budget_logs = 0, low_memory_logs = 0;
 
   void EvictTextures() {
     EvictTexturesOverBudget();
@@ -2326,7 +2450,7 @@ struct Backend::Impl {
     bound_fb = nullptr;  // a barrier ends the render pass; rebind before the next draw
   }
 
-#ifdef __ANDROID__
+#if GTAV_MOBILE
   RenderDescriptorSet* ConstantSetImpl(const RenderBuffer* vs, const RenderBuffer* ps, const RenderBuffer* shared) {
     auto key = std::make_tuple(vs, ps, shared);
     auto it = ubo_sets.find(key);
@@ -2365,7 +2489,7 @@ struct Backend::Impl {
     set.end(true, kSamplerDescriptors);
     sampler_set = set.create(device);
     lb.addDescriptorSet(set);
-#ifdef __ANDROID__
+#if GTAV_MOBILE
     // Set 4: the draw's constants as dynamic uniform buffers (tools/android/ubo_constants.py):
     // VS ALU, PS ALU and shared constants, at the upload-ring offsets the push constants address.
     ubo_builder.begin();
@@ -2829,6 +2953,11 @@ struct Backend::Impl {
     // get a full hash, larger ones a sampled hash (and a full one every 30 frames).
     constexpr uint64_t kSmallTexture = 64 << 10;
     if (t.texture && (t.checked_frame == frame || t.sample_frame == frame)) return t.descriptor;
+    // Large textures: the sampled check every N frames (iPhone: each check faults ~20 cold pages of
+    // guest memory back in, 15-17 ms a frame in the open world).
+    if (const uint64_t every = uint64_t(std::max(1, REXCVAR_GET(gtav_native_texture_sample_frames)));
+        every > 1 && t.texture && t.bytes > kSmallTexture && t.sample_frame != ~0ull && frame - t.sample_frame < every)
+      return t.descriptor;
     const bool watching = write_watch::Enabled() && !REXCVAR_GET(gtav_native_exact_cache);
     // Watched copies still get a full check every 64 frames: writes the watch cannot see (the
     // SDK writing guest memory through its raw physical view) were seen about once in 3 million
@@ -2906,7 +3035,12 @@ struct Backend::Impl {
       REXLOG_INFO("[native] texture {:08X} ({}x{}, format {}) is all zero at frame {}", base & 0x1FFFFFFF,
                   dec.width, dec.height, words[1] & 0x3F, frame);
     }
+    if (t.texture && t.format != dec.format) {  // same guest texture, other host format: new texture
+      dead_textures.push_back(std::move(t.texture));
+      dead_views.push_back(std::move(t.view));
+    }
     if (!t.texture) {
+      t.format = dec.format;
       t.texture = device->createTexture(
           dec.volume ? RenderTextureDesc::Texture3D(dec.width, dec.height, dec.depth, 1, dec.format)
                      : RenderTextureDesc::Texture2D(dec.width, dec.height, dec.mip_count, dec.format));
@@ -2914,7 +3048,7 @@ struct Backend::Impl {
           dec.volume ? RenderTextureViewDesc::Texture3D(dec.format) : RenderTextureViewDesc::Texture2D(dec.format);
       view.componentMapping = dec.swizzle;
       t.view = t.texture->createTextureView(view);
-      t.descriptor = AllocDescriptor();
+      if (t.descriptor < kFirstTextureDescriptor) t.descriptor = AllocDescriptor();
       texture_set->setTexture(t.descriptor, t.texture.get(), RenderTextureLayout::SHADER_READ, t.view.get());
     }
     auto staging = upload.Allocate(dec.data.size(), 512);
@@ -4430,7 +4564,7 @@ struct Backend::Impl {
     std::memcpy(shared.cpu, shared_cpu, kSharedConstantsSize);
     uint64_t push[3] = {vsc.gpu, psc.gpu, shared.gpu};
     list->setGraphicsPushConstants(0, push, 0, sizeof(push));
-#ifdef __ANDROID__
+#if GTAV_MOBILE
     if (RenderDescriptorSet* cs = ConstantSet(vsc.buffer, psc.buffer, shared.buffer)) {
       const uint32_t offsets[3] = {uint32_t(vsc.offset), uint32_t(psc.offset), uint32_t(shared.offset)};
       list->setGraphicsDescriptorSetDynamic(cs, kConstantSet, offsets, 3);

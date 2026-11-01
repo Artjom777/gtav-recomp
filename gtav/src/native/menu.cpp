@@ -1,4 +1,8 @@
 #include "menu.h"
+
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
 #include "touch_controls.h"
 
 #include "paths.h"
@@ -104,6 +108,9 @@ void EnsureContext(uint32_t h) {
   io.LogFilename = nullptr;
   io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
   g_scale = std::max(1.0f, float(h) / 720.0f);
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+  g_scale *= 1.6f;  // a 5.4-inch screen driven by fingers: larger text and controls
+#endif
   ImFontConfig font;
   font.SizePixels = 15.0f * g_scale;
   io.Fonts->AddFontDefault(&font);
@@ -135,7 +142,13 @@ ImGuiKey ToImGui(Key key) {
 }
 
 void Build(uint32_t fps, double frame_ms) {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+  // Centred: the screen's sides are under the rounded corners and the notch.
+  const ImVec2 display = ImGui::GetIO().DisplaySize;
+  ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+#else
   ImGui::SetNextWindowPos(ImVec2(40.0f * g_scale, 40.0f * g_scale), ImGuiCond_FirstUseEver);
+#endif
   ImGui::SetNextWindowSize(ImVec2(520.0f * g_scale, 0.0f), ImGuiCond_FirstUseEver);
   bool open = true;
   if (!ImGui::Begin("Settings (Esc / B to close)", &open, ImGuiWindowFlags_NoCollapse)) {

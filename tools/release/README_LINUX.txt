@@ -50,6 +50,22 @@ Game options go after "--". On a laptop with two GPUs, pick the dedicated one wi
 Esc in game opens the settings menu (quality presets, frame rate limit, VSync, FPS counter).
 The game log is data/logs/gtav.log, the setup log data/logs/install.log.
 
+iPhone (experimental)
+---------------------
+Play GTA V on an iPhone 12 or newer (iOS 17+). The phone cannot build the game itself, so this
+PC does it once (about 15 minutes); the phone then installs the game files from your discs.
+1. Set up and play the game here for a while first (the phone gets the shaders the PC has seen:
+   drive around, go indoors).
+2. Run ./gtav_launcher --iphone. When it is done, iphone/GTAV.ipa is next to it.
+3. Install GTAV.ipa with a sideloading tool that runs on Linux (for example AltServer-Linux with
+   AltStore), or copy it to a Windows PC or Mac with Sideloadly. A free Apple ID re-signs every
+   7 days.
+4. Put your Disc 1 ISO, Disc 2 ISO and the TU file on a USB stick and plug it into the phone (or
+   copy them into GTA V's folder in the phone's Files app).
+5. Open GTA V on the phone and press Install. It copies and checks about 16 GB, then starts.
+Objects missing on the phone? Copy the phone's GTA V > shader_cache folder to iphone/shader_cache
+here, run --iphone again (a few minutes) and reinstall GTAV.ipa; the game files stay.
+
 Everything made from your files stays in this folder (data/ and gtav_game.so). Do not share it:
 it contains Rockstar Games' copyrighted work.
 
