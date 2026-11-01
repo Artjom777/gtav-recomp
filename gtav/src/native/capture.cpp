@@ -38,6 +38,9 @@
 #include <os/proc.h>
 #endif
 extern "C" void* MTLCreateSystemDefaultDevice(void);
+#if TARGET_OS_IPHONE
+extern "C" int gtav_ios_thermal_state();  // ios_setup.mm
+#endif
 // Bytes the process has allocated on the (only) Metal device: MoltenVK's buffers and textures.
 static uint64_t MetalAllocatedBytes() {
   static void* device = MTLCreateSystemDefaultDevice();
@@ -652,10 +655,13 @@ void FenceCopiesRecorded(uint64_t frame) {
 #if TARGET_OS_IPHONE
         malloc_statistics_t ms{};
         malloc_zone_statistics(nullptr, &ms);
+        // Thermal state (NSProcessInfo: 0 nominal .. 3 critical): a hot phone throttles the GPU 2x+.
+        static const char* kThermal[] = {"nominal", "fair", "serious", "critical"};
         REXLOG_INFO("[native] memory at frame {}: footprint {} MB, available {} MB, compressed {} MB; Metal {} MB, "
-                    "malloc {} MB",
+                    "malloc {} MB; thermal {}",
                     frame, vm.phys_footprint >> 20, os_proc_available_memory() >> 20, vm.compressed >> 20,
-                    MetalAllocatedBytes() >> 20, ms.size_in_use >> 20);
+                    MetalAllocatedBytes() >> 20, ms.size_in_use >> 20,
+                    kThermal[std::clamp(gtav_ios_thermal_state(), 0, 3)]);
 #else
         REXLOG_INFO("[native] memory at frame {}: footprint {} MB, compressed {} MB", frame, vm.phys_footprint >> 20,
                     vm.compressed >> 20);
