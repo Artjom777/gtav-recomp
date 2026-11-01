@@ -2552,7 +2552,7 @@ struct Backend::Impl {
 
   std::unordered_set<uint64_t> indirect_fetch_shaders;
 
-  // ps_D258EBE32001470C_tiles.spv replaces the game's tile classification while
+  // ps_D258EBE32001470C_tiles2.spv replaces the game's tile classification while
   // --gtav_native_tile_penumbra_all is on (switchable live from the menu: shader and pipeline keys
   // carry the choice).
   // Only once the variant exists: where it cannot be made (no dxc on macOS) the game's own shader
@@ -2566,7 +2566,7 @@ struct Backend::Impl {
       std::string dir = REXCVAR_GET(gtav_native_spirv_dir);
       if (dir.empty()) dir = DefaultSpirvDir();
       std::error_code ec;
-      present = std::filesystem::exists(dir + "/ps_D258EBE32001470C_tiles.spv", ec);
+      present = std::filesystem::exists(dir + "/ps_D258EBE32001470C_tiles2.spv", ec);
     }
     return present;
   }
@@ -2588,9 +2588,9 @@ struct Backend::Impl {
     if (dir.empty())
       dir = DefaultSpirvDir();
     g_spirv_preload.Start(dir, device);
-    // The tile override is <hash>_tiles.spv, a variant the shader compiler makes from the game's own
+    // The tile override is <hash>_tiles2.spv, a variant the shader compiler makes from the game's own
     // shader (shader_compiler.cpp kVariants).
-    std::string name = fmt::format("{}_{:016X}{}.spv", pixel ? "ps" : "vs", hash, tile_override ? "_tiles" : "");
+    std::string name = fmt::format("{}_{:016X}{}.spv", pixel ? "ps" : "vs", hash, tile_override ? "_tiles2" : "");
     std::string path = fmt::format("{}/{}", dir, name);
     std::unique_ptr<RenderShader> shader;
     std::vector<uint8_t> data;

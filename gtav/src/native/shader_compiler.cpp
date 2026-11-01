@@ -131,6 +131,8 @@ struct Variant {
   const char* suffix;
   const char* find;
   const char* replace;
+  const char* find2 = nullptr;  // optional second line
+  const char* replace2 = nullptr;
 };
 constexpr Variant kVariants[] = {
     // Tile classification (--gtav_native_tile_penumbra_all, Backend::TileOverride). The game adds
@@ -138,7 +140,13 @@ constexpr Variant kVariants[] = {
     // difference from the Xbox flips it and the 16x16 tile takes the cheap lit/shadowed variant
     // (blocky shadows and car reflections). The variant always sets the flag, so every non-sky
     // tile takes the full per-pixel path, which is right for uniform tiles too.
-    {"ps_D258EBE32001470C", "_tiles", "r0.y = select(r0.y > 0.0, c255.x, c255.y);", "r0.y = c255.x;"},
+    // The per-pixel sun draw also skips tiles whose largest sun visibility (oC0.z) is 0.05 or less,
+    // which the uniform draw covered: with every tile flagged, fully shadowed tiles got no sun pass
+    // and kept the target's old contents (light 16x16 squares in shade, often on the phone, whose
+    // point-sampled shadows give more exact zeros). The second line keeps non-sky tiles above it.
+    // "_tiles2": made again over an older "_tiles" variant.
+    {"ps_D258EBE32001470C", "_tiles2", "r0.y = select(r0.y > 0.0, c255.x, c255.y);", "r0.y = c255.x;",
+     "oC0.z = select(r0.w > 0.0, r1.x, c255.z);", "oC0.z = select(r0.w > 0.0, max(r1.x, 0.0625), c255.z);"},
 };
 
 bool VariantsOnDisk(const std::string& name) {
@@ -164,6 +172,15 @@ bool CompileVariants(const std::string& name, const fs::path& hlsl) {
       continue;
     }
     text.replace(at, std::strlen(v.find), v.replace);
+    if (v.find2) {
+      size_t at2 = text.find(v.find2);
+      if (at2 == std::string::npos || text.find(v.find2, at2 + 1) != std::string::npos) {
+        REXLOG_WARN("[native] shader variant {}{}: the second line to replace was not found exactly once", name, v.suffix);
+        ok = false;
+        continue;
+      }
+      text.replace(at2, std::strlen(v.find2), v.replace2);
+    }
     const fs::path out = CacheDir() / (name + v.suffix + ".hlsl");
     std::ofstream(out) << text;
     ok = CompileHlsl(out, name + v.suffix, name.rfind("ps_", 0) == 0) && ok;

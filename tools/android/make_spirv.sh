@@ -33,10 +33,12 @@ one() {
   if [ "$prof" = vs_6_0 ] && grep -q '= vfetchIndirect(' "$hlsl"; then : > "$OUT/$name.indirect"; fi
   if [ "$name" = ps_D258EBE32001470C ]; then
     sed -e 's/r0.y = select(r0.y > 0.0, c255.x, c255.y);/r0.y = c255.x;/' \
-        -e "s/r0.w = c255.w >= r0.x;/r0.w = ${TILES_SKY_TEST:-c255.w >= r0.x};/" "$hlsl" > "$WORK/${name}_tiles.hlsl"
+        -e "s/r0.w = c255.w >= r0.x;/r0.w = ${TILES_SKY_TEST:-c255.w >= r0.x};/" \
+        -e 's/oC0.z = select(r0.w > 0.0, r1.x, c255.z);/oC0.z = select(r0.w > 0.0, max(r1.x, 0.0625), c255.z);/' \
+        "$hlsl" > "$WORK/${name}_tiles.hlsl"
     "$TOOLS/dxc" -T ps_6_0 -HV 2021 -all-resources-bound -spirv -fvk-use-dx-layout -Wno-ignored-attributes \
-      -Qstrip_debug -Fo "$OUT/${name}_tiles.spv" "$WORK/${name}_tiles.hlsl" >/dev/null 2>&1 || echo "dxc fail tiles"
-    python3 -I "$LOWER" "$OUT/${name}_tiles.spv" "$OUT/${name}_tiles.spv" || echo "lower fail tiles"
+      -Qstrip_debug -Fo "$OUT/${name}_tiles2.spv" "$WORK/${name}_tiles.hlsl" >/dev/null 2>&1 || echo "dxc fail tiles"
+    python3 -I "$LOWER" "$OUT/${name}_tiles2.spv" "$OUT/${name}_tiles2.spv" || echo "lower fail tiles"
   fi
   rm -f "$hlsl"
 }
