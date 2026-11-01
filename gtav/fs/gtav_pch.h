@@ -1018,6 +1018,14 @@ extern PPCFuncMapping PPCFuncMappings[];
 
 #define REX_QUERY_TIMEBASE() gtavfs_query_timebase()
 
+// Memory barriers (sync, lwsync, eieio; codegen builders/system.cpp). x86: lwsync/eieio are only
+// compiler barriers; ARM64 (Android, iPhone, Mac) needs the dmb: the game releases its locks
+// with "lwsync; stw 0", and without it the unlock can become visible before the writes made
+// under the lock (another thread then reads a half-built list).
+#define REX_SYNC() __atomic_thread_fence(__ATOMIC_SEQ_CST)
+#define REX_LWSYNC() __atomic_thread_fence(__ATOMIC_ACQ_REL)
+#define REX_EIEIO() __atomic_thread_fence(__ATOMIC_RELEASE)
+
 inline void ppc_trap(PPCContext& ctx, u8* base, u16 trap_type) {
   if (trap_type != 25) gtavfs_trap(&ctx, base, trap_type);
 }

@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstdlib>
 #endif
 
 #include <algorithm>
@@ -490,7 +491,21 @@ std::unique_ptr<Blob> OpenFileBlob(const std::wstring& path, std::wstring* error
 }
 #else
 std::unique_ptr<Blob> OpenFileBlob(const std::wstring& path, std::wstring* error) {
-  int fd = open(Narrow(path).c_str(), O_RDONLY | O_CLOEXEC);
+  std::string n = Narrow(path);
+  int fd = -1;
+#ifdef __ANDROID__
+  // The Android setup screen passes documents from the Storage Access Framework as
+  // /proc/self/fd/<fd>. Opening that path again goes back through the shared-storage
+  // permission check, which the app fails (scoped storage, EACCES). Read the descriptor
+  // the picker granted instead.
+  constexpr const char kFdPrefix[] = "/proc/self/fd/";
+  if (n.rfind(kFdPrefix, 0) == 0) {
+    int src = atoi(n.c_str() + sizeof(kFdPrefix) - 1);
+    fd = fcntl(src, F_DUPFD_CLOEXEC, 0);
+    if (fd >= 0) lseek(fd, 0, SEEK_SET);
+  } else
+#endif
+    fd = open(n.c_str(), O_RDONLY | O_CLOEXEC);
   struct stat st = {};
   bool ok = fd >= 0 && fstat(fd, &st) == 0;
   if (ok && S_ISDIR(st.st_mode)) {

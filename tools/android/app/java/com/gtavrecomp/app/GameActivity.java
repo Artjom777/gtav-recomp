@@ -117,6 +117,17 @@ public class GameActivity extends SDLActivity {
                 Log.w(TAG, "args.txt: " + e);
             }
         }
+        // One value per flag, the last one winning (files/args.txt over the defaults): the
+        // command-line parser (CLI11) rejects a repeated option and then applies none of them.
+        java.util.LinkedHashMap<String, String> byName = new java.util.LinkedHashMap<>();
+        for (String a : args) {
+            int eq = a.indexOf('=');
+            String name = eq < 0 ? a : a.substring(0, eq);
+            if (name.startsWith("--no-")) name = "--" + name.substring(5);
+            byName.remove(name);
+            byName.put(name, a);
+        }
+        args = new ArrayList<>(byName.values());
         Log.i(TAG, "arguments: " + String.join(" ", args));
         return args.toArray(new String[0]);
     }

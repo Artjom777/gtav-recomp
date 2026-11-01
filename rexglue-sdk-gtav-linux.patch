@@ -336,11 +336,42 @@ index 50638d6..feec200 100644
  
  namespace rex {
  namespace ui {
+diff --git a/resources/templates/codegen/pch_h.inja b/resources/templates/codegen/pch_h.inja
+index 68274d2..610fab2 100644
+--- a/resources/templates/codegen/pch_h.inja
++++ b/resources/templates/codegen/pch_h.inja
+@@ -262,6 +262,12 @@ extern PPCFuncMapping PPCFuncMappings[];
+ 
+ #define REX_QUERY_TIMEBASE() rex::chrono::Clock::QueryGuestTickCount()
+ 
++// Memory barriers (sync, lwsync, eieio). x86: lwsync/eieio need no instruction, only a compiler
++// barrier; ARM64: dmb ish (lwsync orders everything but store->load, which a full dmb covers).
++#define REX_SYNC() __atomic_thread_fence(__ATOMIC_SEQ_CST)
++#define REX_LWSYNC() __atomic_thread_fence(__ATOMIC_ACQ_REL)
++#define REX_EIEIO() __atomic_thread_fence(__ATOMIC_RELEASE)
++
+ //=============================================================================
+ // Setjmp/Longjmp
+ //=============================================================================
+diff --git a/resources/templates/test/ppc_config_h.inja b/resources/templates/test/ppc_config_h.inja
+index 0c334f8..8a62c96 100644
+--- a/resources/templates/test/ppc_config_h.inja
++++ b/resources/templates/test/ppc_config_h.inja
+@@ -118,6 +118,9 @@
+   throw std::runtime_error("Unimplemented PPC instruction: " opcode)
+ 
+ #define REX_QUERY_TIMEBASE() rex::chrono::Clock::QueryGuestTickCount()
++#define REX_SYNC() __atomic_thread_fence(__ATOMIC_SEQ_CST)
++#define REX_LWSYNC() __atomic_thread_fence(__ATOMIC_ACQ_REL)
++#define REX_EIEIO() __atomic_thread_fence(__ATOMIC_RELEASE)
+ 
+ //=============================================================================
+ // Setjmp/Longjmp
 diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
-index 20a2cd8..0897aac 100644
+index 20a2cd8..a17586e 100644
 --- a/src/audio/sdl/sdl_audio_driver.cpp
 +++ b/src/audio/sdl/sdl_audio_driver.cpp
-@@ -11,7 +11,14 @@
+@@ -11,10 +11,19 @@
  
  #include <algorithm>
  #include <array>
@@ -355,7 +386,12 @@ index 20a2cd8..0897aac 100644
  
  #include <rex/assert.h>
  #include <rex/audio/conversion.h>
-@@ -24,7 +31,36 @@
++#include <cmath>
++
+ #include <rex/audio/downmix.h>
+ #include <rex/audio/flags.h>
+ #include <rex/audio/sdl/sdl_audio_driver.h>
+@@ -24,7 +33,36 @@
  #include <rex/perf/counter.h>
  #include <SDL3/SDL.h>
  
@@ -392,7 +428,7 @@ index 20a2cd8..0897aac 100644
  
  namespace rex::audio::sdl {
  
-@@ -39,6 +75,12 @@ SDLAudioDriver::~SDLAudioDriver() {
+@@ -39,6 +77,12 @@ SDLAudioDriver::~SDLAudioDriver() {
  bool SDLAudioDriver::Initialize() {
    // Set audio category for proper OS audio handling
    SDL_SetHint(SDL_HINT_AUDIO_CATEGORY, "playback");
@@ -405,7 +441,7 @@ index 20a2cd8..0897aac 100644
  
    // Set app name for audio device identification
    SDL_SetAppMetadataProperty(SDL_PROP_APP_METADATA_NAME_STRING, "rexglue");
-@@ -75,7 +117,7 @@ bool SDLAudioDriver::Initialize() {
+@@ -75,7 +119,7 @@ bool SDLAudioDriver::Initialize() {
  
    // A 1-channel device gets the stereo fold too, then SDL collapses to mono.
    // Handing it a 6ch stream instead would use SDL's own downmix.
@@ -414,7 +450,7 @@ index 20a2cd8..0897aac 100644
      SDL_DestroyAudioStream(sdl_stream_);
      sdl_stream_ = nullptr;
      desired_spec.channels = 2;
-@@ -106,9 +148,50 @@ bool SDLAudioDriver::Initialize() {
+@@ -106,9 +150,50 @@ bool SDLAudioDriver::Initialize() {
      return false;
    }
  
@@ -465,7 +501,7 @@ index 20a2cd8..0897aac 100644
  void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
    const auto input_frame = memory_->TranslateVirtual<float*>(frame_ptr);
    float* output_frame;
-@@ -139,6 +222,10 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
+@@ -139,6 +224,10 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
  }
  
  void SDLAudioDriver::Shutdown() {
@@ -476,7 +512,7 @@ index 20a2cd8..0897aac 100644
    if (sdl_stream_) {
      SDL_DestroyAudioStream(sdl_stream_);
      sdl_stream_ = nullptr;
-@@ -158,6 +245,58 @@ void SDLAudioDriver::Shutdown() {
+@@ -158,6 +247,58 @@ void SDLAudioDriver::Shutdown() {
    }
  }
  
@@ -535,21 +571,28 @@ index 20a2cd8..0897aac 100644
  void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int additional_amount,
                                   [[maybe_unused]] int total_amount) {
    SCOPE_profile_cpu_f("apu");
-@@ -178,15 +317,26 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+@@ -178,15 +319,33 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
    const StereoFold fold = GetStereoFold();
    const SurroundMix mix = GetSurroundMix();
    const float gain = GetOutputGain();
 +  // gtav: audio health, once per ~10 s of output: silence fills mean the guest delivered late
 +  // (dropouts), a deep queue means it delivered in bursts (latency).
 +  static uint32_t stat_frames = 0, stat_silence = 0, stat_max_queued = 0;
++  static float stat_peak[6] = {};
    while (additional_amount > 0) {
      static uint32_t sdl_callback_count = 0;
      std::unique_lock<std::mutex> guard(driver->frames_mutex_);
 +    stat_max_queued = std::max(stat_max_queued, uint32_t(driver->frames_queued_.size()));
 +    if (++stat_frames >= 1875) {  // 256-sample frames at 48 kHz
-+      REXAPU_INFO("audio: {} of {} frames were silence (guest late), max {} queued", stat_silence, stat_frames,
-+                  stat_max_queued);
++      // Per-channel peaks of the guest's 5.1 render (before the fold), dBFS: shows a channel the
++      // game leaves empty (FL FR FC LFE BL BR).
++      auto db = [](float p) { return p > 1e-6f ? 20.0f * std::log10(p) : -120.0f; };
++      REXAPU_INFO("audio: {} of {} frames were silence (guest late), max {} queued; peak dB "
++                  "FL {:.0f} FR {:.0f} FC {:.0f} LFE {:.0f} BL {:.0f} BR {:.0f}",
++                  stat_silence, stat_frames, stat_max_queued, db(stat_peak[0]), db(stat_peak[1]),
++                  db(stat_peak[2]), db(stat_peak[3]), db(stat_peak[4]), db(stat_peak[5]));
 +      stat_frames = stat_silence = stat_max_queued = 0;
++      for (float& p : stat_peak) p = 0;
 +    }
      if (driver->frames_queued_.empty()) {
 +      stat_silence++;
@@ -562,18 +605,23 @@ index 20a2cd8..0897aac 100644
        if (!SDL_PutAudioStreamData(stream, data, len)) {
          REXAPU_ERROR("SDL_PutAudioStreamData() failed while filling silence: {}", SDL_GetError());
          break;
-@@ -195,9 +345,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+@@ -195,9 +354,12 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
      } else {
        auto buffer = driver->frames_queued_.front();
        driver->frames_queued_.pop();
 -      if (REXCVAR_GET(audio_mute)) {
 -        std::memset(data, 0, len);
 -      } else {
++      for (uint32_t c = 0; c < 6; ++c) {
++        const float* ch = buffer + c * channel_samples_;
++        for (uint32_t i = 0; i < channel_samples_; ++i)
++          stat_peak[c] = std::max(stat_peak[c], std::fabs(rex::byte_swap(ch[i])));
++      }
 +      {
          switch (driver->sdl_device_channels_) {
            case 2:
              conversion::sequential_6_BE_to_interleaved_2_LE(data, buffer, channel_samples_, fold,
-@@ -211,6 +359,8 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+@@ -211,6 +373,8 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
              assert_unhandled_case(driver->sdl_device_channels_);
              break;
          }
@@ -582,7 +630,7 @@ index 20a2cd8..0897aac 100644
        }
        if (!SDL_PutAudioStreamData(stream, data, len)) {
          REXAPU_ERROR("SDL_PutAudioStreamData() failed: {}", SDL_GetError());
-@@ -219,8 +369,12 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+@@ -219,8 +383,12 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
        }
        driver->frames_unused_.push(buffer);
  
@@ -911,6 +959,39 @@ index 11b83be..e2bb4c2 100644
  
      // Realign the decoder's output onto the bitstream's sample numbering: the
      // samples of the frame just decoded run from kDecoderStartPadding into this
+diff --git a/src/codegen/builders/system.cpp b/src/codegen/builders/system.cpp
+index b2d70f5..a101ca6 100644
+--- a/src/codegen/builders/system.cpp
++++ b/src/codegen/builders/system.cpp
+@@ -30,21 +30,22 @@ bool build_attn(BuilderContext& ctx) {
+   return true;
+ }
+ 
++// The barriers become REX_SYNC / REX_LWSYNC / REX_EIEIO (pch_h.inja): on x86 (strongly
++// ordered) lwsync and eieio only stop the compiler moving guest loads and stores across them,
++// but ARM64 reorders stores, so a lock released with "lwsync; stw 0" would publish the unlock
++// before the writes made under the lock without a dmb.
+ bool build_sync(BuilderContext& ctx) {
+-  // Memory barrier, x86 has strong ordering so this is a no-op
+-  (void)ctx;
++  ctx.println("\tREX_SYNC();");
+   return true;
+ }
+ 
+ bool build_lwsync(BuilderContext& ctx) {
+-  // Lightweight memory barrier, x86 has strong ordering so this is a no-op
+-  (void)ctx;
++  ctx.println("\tREX_LWSYNC();");
+   return true;
+ }
+ 
+ bool build_eieio(BuilderContext& ctx) {
+-  // Enforce in-order execution of I/O, x86 has strong ordering so this is a no-op
+-  (void)ctx;
++  ctx.println("\tREX_EIEIO();");
+   return true;
+ }
+ 
 diff --git a/src/codegen/builders/vector.cpp b/src/codegen/builders/vector.cpp
 index cbdd7f7..6b9067c 100644
 --- a/src/codegen/builders/vector.cpp
