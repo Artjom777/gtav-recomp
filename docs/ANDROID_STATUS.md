@@ -107,3 +107,17 @@ wait no longer spins (poll sentinel woke it), controller pumping rate-limited.
 2. CPU recording: write watch via mprotect, or parallel stream conversion.
 3. Intermittent guest null read (sub_833CB750, once) - watch for repeats.
 4. Thermal: frame cap / vsync defaults for sustained play.
+
+## 10-31: rendering fixes and render scale
+
+- Render scale 0.75 by default on Android (gtav_native_render_scale): GPU -4..9 ms a frame when
+  throttled; the G-buffer and shadow passes are geometry-bound and do not shrink.
+- Grey/mosaic blocks on textures: new render targets and resolves start zeroed (Adreno hands out
+  recycled memory); R16G16B16A16_UNORM (not sampleable on Adreno) textures stored as SNORM; point
+  filtering for 32-bit float fetches (no linear filtering on Adreno).
+- Light 16x16 squares in shade while moving: the tile classification variant (_tiles2) now keeps
+  fully shadowed tiles in the per-pixel sun draw (they were drawn by neither sun variant). Found
+  with frame dumps (mem_*.bin) and a flat-colour view of the sun draws. Tools:
+  tools/native/count_squares.py, tools/android/walk_squares.sh --ab (live A/B in one walk).
+- Final sustained run (cool start to 44 C battery, GPU 317-492 MHz): 24-36 fps, mostly 26-35.
+- Measured off: load-op clears, record thread, coarse shading (available as cvars).
