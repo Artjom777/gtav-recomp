@@ -1735,6 +1735,12 @@ struct Backend::Impl {
     uint64_t offset, size;
   };
   std::vector<RawDump> dump_raw;
+  // Guest-layout memory images (ResolvedMemory) of the dumped frame, as the GPU wrote them.
+  struct MemDump {
+    uint32_t address;
+    uint64_t offset, size;
+  };
+  std::vector<MemDump> dump_mem;
 
   static uint32_t BytesPerTexel(RenderFormat f) {
     switch (f) {
@@ -4883,6 +4889,17 @@ struct Backend::Impl {
     }
     m.serial = r.serial;
     WriteGuestLayout(list, r, g, m.buffer.get(), m.gpu);
+    if (dumping) {
+      const uint64_t offset = (dump_raw_used + 255) & ~255ull;
+      if (offset + g.size <= kRawDumpSize) {
+        if (!dump_raw_readback) dump_raw_readback = device->createBuffer(RenderBufferDesc::ReadbackBuffer(kRawDumpSize));
+        dump_raw_used = offset + g.size;
+        list->barriers(RenderBarrierStage::COPY, RenderBufferBarrier(m.buffer.get(), RenderBufferAccess::READ));
+        list->copyBufferRegion(RenderBufferReference(dump_raw_readback.get(), offset), RenderBufferReference(m.buffer.get()),
+                               g.size);
+        dump_mem.push_back({address, offset, g.size});
+      }
+    }
     list->barriers(RenderBarrierStage::GRAPHICS, RenderBufferBarrier(m.buffer.get(), RenderBufferAccess::READ));
     return m.gpu;
   }
@@ -5915,8 +5932,14 @@ void Backend::WriteDump() {
     }
   }
   if (index) std::fclose(index);
-  if (!s.dump_raw.empty()) {
+  if (!s.dump_raw.empty() || !s.dump_mem.empty()) {
     const uint8_t* raw = static_cast<const uint8_t*>(s.dump_raw_readback->map());
+    for (const auto& m : s.dump_mem)
+      if (FILE* f = std::fopen(fmt::format("{}/mem_{:08X}.bin", dir, m.address).c_str(), "wb")) {
+        std::fwrite(raw + m.offset, 1, m.size, f);
+        std::fclose(f);
+      }
+    s.dump_mem.clear();
     for (const auto& r : s.dump_raw) {
       std::string name = fmt::format("{}/{:03}_{:08X}_f{}_{}x{}_r{}.raw", dir, r.slot, s.dump_infos[r.slot].address,
                                      r.format, r.width, r.height, r.row);
