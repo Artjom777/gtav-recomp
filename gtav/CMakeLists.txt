@@ -66,7 +66,17 @@ elseif(ANDROID)
     # Android: the game is libmain.so, which SDL's SDLActivity loads and whose SDL_main it calls
     # (tools/android). A shared library exports the rex_skip_rendering_* hooks by default.
     add_library(gtav SHARED ${GTAV_SOURCES})
-    set_target_properties(gtav PROPERTIES OUTPUT_NAME main)
+    if(GTAV_GAME_DLL)
+        # Release layout: libgtav_fast.so (no game code) is loaded by libgtav_game.so, which the
+        # player's install builds from their own discs; libmain.so (src/android_main_shim.cpp)
+        # opens it from the app's files folder and calls SDL_main here.
+        set_target_properties(gtav PROPERTIES OUTPUT_NAME gtav_fast)
+        add_library(gtav_main_shim SHARED src/android_main_shim.cpp)
+        set_target_properties(gtav_main_shim PROPERTIES OUTPUT_NAME main)
+        target_link_libraries(gtav_main_shim PRIVATE rex::runtime log)
+    else()
+        set_target_properties(gtav PROPERTIES OUTPUT_NAME main)
+    endif()
     target_link_libraries(gtav PRIVATE android log)
     target_sources(gtav PRIVATE src/android_threads.cpp)
     target_link_options(gtav PRIVATE -Wl,--wrap=pthread_create)
@@ -115,6 +125,17 @@ if(GTAV_GAME_DLL)
         target_link_options(gtav PRIVATE "${GTAV_INTERFACE_DIR}/stub/gtav_game.dylib"
                             "LINKER:-export_dynamic")
         set_target_properties(gtav PROPERTIES OUTPUT_NAME gtav_fast)
+    elseif(ANDROID)
+        # Android: no stub. The game functions stay undefined in libgtav_fast.so and bind when
+        # libmain.so dlopens libgtav_game.so: bionic resolves them in the dlopen'd tree (game ->
+        # libgtav_fast -> librexruntime), so both directions link at load (-z now).
+        get_filename_component(GTAV_LLVM_BIN "${CMAKE_NM}" DIRECTORY)
+        add_custom_command(TARGET gtav PRE_LINK
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../tools/game_dll/gen_interface.py
+                    ${GTAV_LLVM_BIN} ${CMAKE_BINARY_DIR}/CMakeFiles/gtav.dir ${GTAV_INTERFACE_DIR}
+                    $<TARGET_FILE:rex::runtime> --android
+            VERBATIM)
+        target_link_options(gtav PRIVATE -Wl,-z,undefs)
     else()
         find_program(GTAV_LLVM_NM NAMES llvm-nm llvm-nm-20 llvm-nm-19 REQUIRED)
         get_filename_component(GTAV_LLVM_BIN "${GTAV_LLVM_NM}" DIRECTORY)

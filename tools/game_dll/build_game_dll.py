@@ -8,7 +8,11 @@ Linux: compiles position-independent code and links gtav_game.so with ld.lld (ve
 gtav_game.exports, -Bsymbolic so calls between game functions stay direct); the hooks, the bridge,
 the kernel imports and log2f are left undefined for the dynamic loader.
 
-usage: build_game_dll.py LLVM_BIN GENERATED_DIR INTERFACE_DIR OUT_DIR [-j N]
+Android (--android LIB_DIR): the same freestanding build for aarch64-linux-android30 (simde for
+the SSE intrinsics, no fs_crt.cpp), linked into libgtav_game.so against LIB_DIR/libgtav_fast.so and
+LIB_DIR/librexruntime.so (DT_NEEDED: the APK's libmain.so dlopens it from the app's files folder).
+
+usage: build_game_dll.py LLVM_BIN GENERATED_DIR INTERFACE_DIR OUT_DIR [-j N] [--android LIB_DIR]
   GENERATED_DIR  codegen output (gtav_recomp.*.cpp, gtav_init.cpp, gtav_funcs*.h); its gtav_pch.h
                  is replaced by gtav/fs/gtav_pch.h, so pass a copy, not the dev tree
   INTERFACE_DIR  gtav_hooks.h, gtav_game.def, gtav_fast.def, rexruntime.def, ucrtbase.def
@@ -44,6 +48,16 @@ CXXFLAGS_MACOS = ["--target=arm64-apple-macos15", "-nostdinc++", "-nostdlibinc",
                   "-fno-math-errno", "-w"]
 LDFLAGS_MACOS = ["-arch", "arm64", "-platform_version", "macos", "15.0", "15.0", "-dylib",
                  "-install_name", "@rpath/gtav_game.dylib", "-dead_strip_dylibs", "-O1"]
+# Android arm64 (libgtav_game.so; built on the phone or on a PC): freestanding like macOS, with the
+# SSE intrinsics from simde, and linked like Linux. It needs libgtav_fast.so and librexruntime.so
+# from the APK: the hooks, the bridge and the kernel imports bind to them, memcpy & co. and log2f
+# to bionic through their dependencies, all inside the one tree libmain.so dlopens.
+CXXFLAGS_ANDROID = ["--target=aarch64-linux-android30", "-nostdinc++", "-nostdlibinc", "-fPIC",
+                    "-fno-semantic-interposition", "-fno-stack-protector", "-O2", "-std=gnu++23",
+                    "-march=armv8.2-a+lse+rcpc+dotprod", "-fno-exceptions", "-fno-rtti",
+                    "-fno-threadsafe-statics", "-fno-math-errno", "-w"]
+LDFLAGS_ANDROID = ["-shared", "-soname", "libgtav_game.so", "-Bsymbolic", "-z", "now", "-z", "relro",
+                   "-z", "noexecstack", "-z", "max-page-size=16384", "--hash-style=gnu", "-O1"]
 LINUX = sys.platform.startswith("linux")
 MACOS = sys.platform == "darwin"
 
@@ -65,9 +79,17 @@ def main():
     ap.add_argument("-j", type=int, default=os.cpu_count())
     ap.add_argument("--runtime", help="macOS: librexruntime.dylib to link the kernel imports against")
     ap.add_argument("--simde", help="macOS: folder holding simde/ (default: the SDK's thirdparty)")
+    ap.add_argument("--android", metavar="LIB_DIR",
+                    help="build libgtav_game.so for Android arm64, linked against libgtav_fast.so "
+                         "and librexruntime.so in LIB_DIR")
     a = ap.parse_args()
+    android = a.android is not None
 
-    if MACOS:
+    if android:
+        clang = find_tool(a.llvm_bin, ["clang++", "clang-19", "clang++-19"])
+        lld = find_tool(a.llvm_bin, ["ld.lld", "lld", "ld.lld-19"])
+        cxxflags, ext = CXXFLAGS_ANDROID, ".o"
+    elif MACOS:
         clang = find_tool(a.llvm_bin, ["clang++", "clang"])
         lld = find_tool(a.llvm_bin, ["ld64.lld", "ld"])
         cxxflags, ext = CXXFLAGS_MACOS, ".o"
@@ -89,10 +111,10 @@ def main():
     sources = sorted(os.path.join(a.generated, f) for f in os.listdir(a.generated)
                      if f.startswith("gtav_recomp.") and f.endswith(".cpp"))
     sources += [os.path.join(a.generated, "gtav_init.cpp"), os.path.join(FS, "game_dll.cpp")]
-    if not MACOS:
-        sources.append(os.path.join(FS, "fs_crt.cpp"))
+    if not MACOS and not android:
+        sources.append(os.path.join(FS, "fs_crt.cpp"))  # x86 memcpy & co.; arm64 takes the system's
     inc = ["-isystem", os.path.join(FS, "include"), "-I", a.generated]
-    if MACOS:
+    if MACOS or android:
         inc[2:2] = ["-isystem", a.simde or os.path.join(ROOT, "rexglue-sdk", "thirdparty", "simde")]
 
     def compile_one(src):
@@ -100,8 +122,10 @@ def main():
         if os.path.exists(obj) and os.path.getmtime(obj) > os.path.getmtime(src):
             return obj, 0.0, ""
         t = time.time()
-        r = subprocess.run([clang] + cxxflags + inc + ["-c", src, "-o", obj], capture_output=True,
-                           text=True)
+        # clang-19 is the one binary in the bundled LLVM; it acts as clang++ with --driver-mode.
+        drv = ["--driver-mode=g++"] if os.path.basename(clang).startswith("clang-") else []
+        r = subprocess.run([clang] + drv + cxxflags + inc + ["-c", src, "-o", obj],
+                           capture_output=True, text=True)
         return (obj if r.returncode == 0 else None), time.time() - t, r.stderr[-2000:]
 
     t0 = time.time()
@@ -114,6 +138,21 @@ def main():
             objs.append(obj)
             if done % 25 == 0 or done == len(sources):
                 print(f"compiled {done}/{len(sources)} ({time.time() - t0:.0f} s)", flush=True)
+
+    if android:
+        rsp = os.path.join(a.out, "link.rsp")
+        with open(rsp, "w") as f:
+            f.write("\n".join(f'"{o}"' for o in objs))
+        # "lld" (the multi-call binary) acts as ld.lld under -flavor gnu.
+        flavor = ["-flavor", "gnu"] if os.path.basename(lld) == "lld" else []
+        t = time.time()
+        subprocess.run([lld] + flavor + LDFLAGS_ANDROID +
+                       [f"--version-script={os.path.join(a.interface, 'gtav_game.exports')}",
+                        "-o", os.path.join(a.out, "libgtav_game.so"), f"@{rsp}",
+                        os.path.join(a.android, "libgtav_fast.so"),
+                        os.path.join(a.android, "librexruntime.so")], check=True)
+        print(f"linked libgtav_game.so in {time.time() - t:.0f} s, total {time.time() - t0:.0f} s")
+        return
 
     if MACOS:
         rsp = os.path.join(a.out, "link.rsp")

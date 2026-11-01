@@ -1,0 +1,15 @@
+# Host (or Android) build of shader_fix: the Adreno shader passes with SPIRV-Tools from the SDK.
+#   cmake -S tools/android/shader_fix -B build/shader_fix -G Ninja && cmake --build build/shader_fix
+cmake_minimum_required(VERSION 3.25)
+project(shader_fix LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 20)
+set(ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../../..)
+set(SPIRV-Headers_SOURCE_DIR ${ROOT}/rexglue-sdk/thirdparty/spirv-headers)
+set(SPIRV_SKIP_TESTS ON CACHE BOOL "" FORCE)
+set(SPIRV_SKIP_EXECUTABLES ON CACHE BOOL "" FORCE)
+set(SPIRV_WERROR OFF CACHE BOOL "" FORCE)
+set(SKIP_SPIRV_TOOLS_INSTALL ON CACHE BOOL "" FORCE)
+add_subdirectory(${ROOT}/rexglue-sdk/thirdparty/spirv-tools spirv-tools EXCLUDE_FROM_ALL)
+add_executable(shader_fix shader_fix_cli.cpp ${ROOT}/gtav/src/native/adreno_shader_fix.cpp)
+target_compile_definitions(shader_fix PRIVATE GTAV_HAVE_SPIRV_TOOLS=1)
+target_link_libraries(shader_fix PRIVATE SPIRV-Tools-static)
