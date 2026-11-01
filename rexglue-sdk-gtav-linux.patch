@@ -91,7 +91,7 @@ index d9a64eb..cdf0918 100644
          DESTINATION ${CMAKE_INSTALL_LIBDIR}
          CONFIGURATIONS Release
 diff --git a/include/rex/audio/sdl/sdl_audio_driver.h b/include/rex/audio/sdl/sdl_audio_driver.h
-index f8949ca..32ce942 100644
+index f8949ca..dfab846 100644
 --- a/include/rex/audio/sdl/sdl_audio_driver.h
 +++ b/include/rex/audio/sdl/sdl_audio_driver.h
 @@ -11,9 +11,11 @@
@@ -106,7 +106,7 @@ index f8949ca..32ce942 100644
  
  #include <rex/audio/audio_driver.h>
  #include <rex/thread.h>
-@@ -49,6 +51,15 @@ class SDLAudioDriver : public AudioDriver {
+@@ -49,6 +51,21 @@ class SDLAudioDriver : public AudioDriver {
    std::queue<float*> frames_queued_ = {};
    std::stack<float*> frames_unused_ = {};
    std::mutex frames_mutex_ = {};
@@ -115,6 +115,12 @@ index f8949ca..32ce942 100644
 +  // releases the guest semaphore once per frame period, so a device that takes several frames
 +  // per callback (WASAPI shared mode: 10 ms) still sees one audio pass every 5.3 ms.
 +  void PacerThread();
++  // Without a device (iOS audio session refused): frames consumed silently, device retried.
++  bool OpenDevice();
++  void CloseDevice();
++  void SilentThread();
++  std::thread silent_;
++  std::atomic<bool> silent_stop_{false};
 +  std::thread pacer_;
 +  std::atomic<bool> pacer_stop_{false};
 +  std::atomic<int32_t> pending_releases_{0};
@@ -337,7 +343,7 @@ index 50638d6..feec200 100644
  namespace rex {
  namespace ui {
 diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
-index 20a2cd8..0897aac 100644
+index 20a2cd8..043a747 100644
 --- a/src/audio/sdl/sdl_audio_driver.cpp
 +++ b/src/audio/sdl/sdl_audio_driver.cpp
 @@ -11,7 +11,14 @@
@@ -405,7 +411,48 @@ index 20a2cd8..0897aac 100644
  
    // Set app name for audio device identification
    SDL_SetAppMetadataProperty(SDL_PROP_APP_METADATA_NAME_STRING, "rexglue");
-@@ -75,7 +117,7 @@ bool SDLAudioDriver::Initialize() {
+@@ -49,6 +91,25 @@ bool SDLAudioDriver::Initialize() {
+   }
+   sdl_initialized_ = true;
+ 
++  // iOS refuses the audio session now and then (app launched while not in front, another app
++  // holding the audio): without a device the game's audio objects stayed null and it crashed at
++  // start (guest read of 0x6C). Without a device the frames are consumed silently at the device
++  // rate (the guest's audio engine keeps its pace) and the device is retried every 2 s.
++  pacing_ = REXCVAR_GET(audio_release_pacing);
++  if (!OpenDevice()) {
++    REXAPU_WARN("no audio device yet: running silent, retrying every 2 s");
++    silent_stop_ = false;
++    silent_ = std::thread([this] { SilentThread(); });
++  }
++
++  if (pacing_) {
++    pacer_stop_ = false;
++    pacer_ = std::thread([this] { PacerThread(); });
++  }
++  return true;
++}
++
++bool SDLAudioDriver::OpenDevice() {
+   SDL_AudioSpec desired_spec = {};
+   SDL_AudioSpec obtained_spec = {};
+   desired_spec.freq = frame_frequency_;
+@@ -59,12 +120,14 @@ bool SDLAudioDriver::Initialize() {
+                                           SDLCallback, this);
+   if (!sdl_stream_) {
+     REXAPU_ERROR("SDL_OpenAudioDeviceStream() failed: {}", SDL_GetError());
++    CloseDevice();
+     return false;
+   }
+ 
+   SDL_AudioDeviceID sdl_device = SDL_GetAudioStreamDevice(sdl_stream_);
+   if (!sdl_device) {
+     REXAPU_ERROR("SDL_GetAudioStreamDevice() failed: {}", SDL_GetError());
++    CloseDevice();
+     return false;
+   }
+ 
+@@ -75,7 +138,7 @@ bool SDLAudioDriver::Initialize() {
  
    // A 1-channel device gets the stereo fold too, then SDL collapses to mono.
    // Handing it a 6ch stream instead would use SDL's own downmix.
@@ -414,18 +461,78 @@ index 20a2cd8..0897aac 100644
      SDL_DestroyAudioStream(sdl_stream_);
      sdl_stream_ = nullptr;
      desired_spec.channels = 2;
-@@ -106,9 +148,50 @@ bool SDLAudioDriver::Initialize() {
+@@ -84,12 +147,14 @@ bool SDLAudioDriver::Initialize() {
+                                             SDLCallback, this);
+     if (!sdl_stream_) {
+       REXAPU_ERROR("SDL_OpenAudioDeviceStream() stereo fallback failed: {}", SDL_GetError());
+-      return false;
++      CloseDevice();
++    return false;
+     }
+     sdl_device = SDL_GetAudioStreamDevice(sdl_stream_);
+     if (!sdl_device) {
+       REXAPU_ERROR("SDL_GetAudioStreamDevice() failed after stereo fallback: {}", SDL_GetError());
+-      return false;
++      CloseDevice();
++    return false;
+     }
+   }
+ 
+@@ -103,12 +168,93 @@ bool SDLAudioDriver::Initialize() {
+ 
+   if (!SDL_ResumeAudioDevice(sdl_device)) {
+     REXAPU_ERROR("SDL_ResumeAudioDevice() failed: {}", SDL_GetError());
++    CloseDevice();
      return false;
    }
  
-+  pacing_ = REXCVAR_GET(audio_release_pacing);
-+  if (pacing_) {
-+    pacer_stop_ = false;
-+    pacer_ = std::thread([this] { PacerThread(); });
-+  }
    return true;
  }
  
++void SDLAudioDriver::CloseDevice() {
++  if (sdl_stream_) {
++    SDL_DestroyAudioStream(sdl_stream_);
++    sdl_stream_ = nullptr;
++  }
++}
++
++// No device (see Initialize): one frame per device period is taken from the queue and released to
++// the guest as the callback would, and the device is retried every 2 s; once it opens, the
++// callback takes over.
++void SDLAudioDriver::SilentThread() {
++  using Clock = std::chrono::steady_clock;
++  const auto period = std::chrono::nanoseconds(1000000000ll * channel_samples_ / frame_frequency_);
++  auto next = Clock::now(), retry = next + std::chrono::seconds(2);
++  while (!silent_stop_.load(std::memory_order_relaxed)) {
++    next += period;
++    auto now = Clock::now();
++    if (next < now - 4 * period) next = now;
++    if (next > now) std::this_thread::sleep_until(next);
++    if (now >= retry) {
++      retry = now + std::chrono::seconds(2);
++      if (OpenDevice()) {
++        REXAPU_INFO("audio device opened: sound on");
++        return;
++      }
++    }
++    bool released = false;
++    {
++      std::unique_lock<std::mutex> guard(frames_mutex_);
++      if (!frames_queued_.empty()) {
++        frames_unused_.push(frames_queued_.front());
++        frames_queued_.pop();
++        released = true;
++      }
++    }
++    if (!released) continue;
++    if (pacing_) {
++      pending_releases_.fetch_add(1, std::memory_order_acq_rel);
++    } else {
++      semaphore_->Release(1, nullptr);
++    }
++  }
++}
++
 +void SDLAudioDriver::PacerThread() {
 +  using Clock = std::chrono::steady_clock;
 +  const auto period = std::chrono::nanoseconds(1000000000ll * channel_samples_ / frame_frequency_);
@@ -465,10 +572,14 @@ index 20a2cd8..0897aac 100644
  void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
    const auto input_frame = memory_->TranslateVirtual<float*>(frame_ptr);
    float* output_frame;
-@@ -139,6 +222,10 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
+@@ -139,6 +285,14 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
  }
  
  void SDLAudioDriver::Shutdown() {
++  if (silent_.joinable()) {
++    silent_stop_ = true;
++    silent_.join();
++  }
 +  if (pacer_.joinable()) {
 +    pacer_stop_ = true;
 +    pacer_.join();
@@ -476,7 +587,7 @@ index 20a2cd8..0897aac 100644
    if (sdl_stream_) {
      SDL_DestroyAudioStream(sdl_stream_);
      sdl_stream_ = nullptr;
-@@ -158,6 +245,58 @@ void SDLAudioDriver::Shutdown() {
+@@ -158,6 +312,58 @@ void SDLAudioDriver::Shutdown() {
    }
  }
  
@@ -535,7 +646,7 @@ index 20a2cd8..0897aac 100644
  void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int additional_amount,
                                   [[maybe_unused]] int total_amount) {
    SCOPE_profile_cpu_f("apu");
-@@ -178,15 +317,26 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+@@ -178,15 +384,26 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
    const StereoFold fold = GetStereoFold();
    const SurroundMix mix = GetSurroundMix();
    const float gain = GetOutputGain();
@@ -562,7 +673,7 @@ index 20a2cd8..0897aac 100644
        if (!SDL_PutAudioStreamData(stream, data, len)) {
          REXAPU_ERROR("SDL_PutAudioStreamData() failed while filling silence: {}", SDL_GetError());
          break;
-@@ -195,9 +345,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+@@ -195,9 +412,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
      } else {
        auto buffer = driver->frames_queued_.front();
        driver->frames_queued_.pop();
@@ -573,7 +684,7 @@ index 20a2cd8..0897aac 100644
          switch (driver->sdl_device_channels_) {
            case 2:
              conversion::sequential_6_BE_to_interleaved_2_LE(data, buffer, channel_samples_, fold,
-@@ -211,6 +359,8 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+@@ -211,6 +426,8 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
              assert_unhandled_case(driver->sdl_device_channels_);
              break;
          }
@@ -582,7 +693,7 @@ index 20a2cd8..0897aac 100644
        }
        if (!SDL_PutAudioStreamData(stream, data, len)) {
          REXAPU_ERROR("SDL_PutAudioStreamData() failed: {}", SDL_GetError());
-@@ -219,8 +369,12 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+@@ -219,8 +436,12 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
        }
        driver->frames_unused_.push(buffer);
  
