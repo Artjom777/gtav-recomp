@@ -3445,13 +3445,19 @@ struct Backend::Impl {
                            RenderTarget* const color[4], uint32_t count, RenderTarget* depth, const uint8_t* r,
                            RenderPrimitiveTopology topology, uint32_t spec, bool rect_list, uint32_t diag,
                            bool colorless, uint64_t vs_hash, uint64_t ps_hash) {
+    pipeline_failed = false;
     auto it = pipelines.find(key);
     if (it != pipelines.end()) return it->second.get();
+    if (auto f = failed_pipelines.find(key);
+        f != failed_pipelines.end() && (f->second.tries >= 3 || frame < f->second.retry_frame)) {
+      pipeline_failed = true;
+      return nullptr;
+    }
     if (auto p = pending_pipelines.find(key); p != pending_pipelines.end()) {
       if (!WaitForJob(*p->second)) return nullptr;
-      auto& done = pipelines[key] = std::move(p->second->result);
+      auto result = std::move(p->second->result);
       pending_pipelines.erase(p);
-      return done.get();
+      return FinishPipeline(key, std::move(result));
     }
     ScopedMs timer{t_pipeline};
     RenderGraphicsPipelineDesc desc;
@@ -3596,12 +3602,37 @@ struct Backend::Impl {
       pending_pipelines[key] = job;
       pipeline_compiler.Enqueue(device, job);
       if (!WaitForJob(*job)) return nullptr;
-      auto& done = pipelines[key] = std::move(job->result);
+      auto result = std::move(job->result);
       pending_pipelines.erase(key);
-      return done.get();
+      return FinishPipeline(key, std::move(result));
     }
-    auto pipeline = device->createGraphicsPipeline(desc);
-    return (pipelines[key] = std::move(pipeline)).get();
+    return FinishPipeline(key, device->createGraphicsPipeline(desc));
+  }
+
+  // A compile that failed (iPhone: the Metal compiler service dropped its connection under memory
+  // pressure, "XPC_ERROR_CONNECTION_INTERRUPTED") used to be cached as a null pipeline that every
+  // later frame counted as still compiling, so --gtav_native_hold_lost_frames held those frames:
+  // one failed pipeline froze 60% of the prologue's frames. It is now compiled again up to three
+  // times, 60 frames apart; meanwhile and after the last try its draws are skipped without
+  // counting as lost (pipeline_failed), so the frame is shown.
+  struct FailedPipeline {
+    uint32_t tries = 0;
+    uint64_t retry_frame = 0;
+  };
+  std::unordered_map<uint64_t, FailedPipeline> failed_pipelines;
+  bool pipeline_failed = false;  // the last Pipeline() returned null for a failed compile
+  RenderPipeline* FinishPipeline(uint64_t key, std::unique_ptr<RenderPipeline> result) {
+    if (!result) {
+      auto& f = failed_pipelines[key];
+      f.tries++;
+      f.retry_frame = frame + 60;
+      REXLOG_WARN("[native] pipeline {:016X} failed to compile (try {} of 3){}", key, f.tries,
+                  f.tries >= 3 ? ": its draws are skipped" : "");
+      pipeline_failed = true;
+      return nullptr;
+    }
+    failed_pipelines.erase(key);
+    return (pipelines[key] = std::move(result)).get();
   }
 
   void NoteLost(uint32_t& counter, const char* what, const DrawCommand& d, const uint8_t* r) {
@@ -4391,7 +4422,7 @@ struct Backend::Impl {
                  d.vs_hash, d.ps_hash);
     if (!pipeline) {
       stat_skipped++;
-      NoteLost(lost_pipeline, "pipeline", d, r);
+      if (!pipeline_failed) NoteLost(lost_pipeline, "pipeline", d, r);  // (a failed one is not held for)
       return;
     }
     prof.Mark(prof.pipe);
