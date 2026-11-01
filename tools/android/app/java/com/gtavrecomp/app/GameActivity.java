@@ -61,16 +61,44 @@ public class GameActivity extends SDLActivity {
         return new String[] { "main" };
     }
 
+    /**
+     * The public APK: no game code (libmain.so is a shim; libgtav_fast.so holds ours and the
+     * player's libgtav_game.so comes from their PC's Build for Android, see SetupActivity).
+     */
+    static boolean isReleaseLayout(android.content.Context c) {
+        return new File(c.getApplicationInfo().nativeLibraryDir, "libgtav_fast.so").exists();
+    }
+
+    /** The release defaults (tools/android/args.txt): files/args.txt lines come after and win. */
+    private static final String[] RELEASE_ARGS = {
+        "--headless=true", "--log_level=info", "--gtav_native=on", "--gtav_fps_limit=0",
+        "--gpu_skip_rendering=true", "--gpu_skip_rendering_lag_ms=6", "--vsync=false",
+        "--gtav_native_vsync=true", "--vulkan_log_debug_messages=false", "--window_presenter=false",
+        "--gtav_native_texture_budget_mb=384",
+    };
+
     @Override
     protected String[] getArguments() {
         File files = getExternalFilesDir(null);
         String root = files.getAbsolutePath();
         new File(files, "logs").mkdirs();
-        new File(files, "userdata").mkdirs();
         ArrayList<String> args = new ArrayList<>();
-        args.add("--game_data_root=" + root + "/game/disc2_files");
-        args.add("--update_data_root=" + root + "/game/update");
-        args.add("--user_data_root=" + root + "/userdata");
+        if (new File(files, "data/data_installed.txt").exists()) {
+            // Installed by the setup screen (install.cpp RunDataInstall layout).
+            new File(files, "data/user").mkdirs();
+            args.add("--game_data_root=" + root + "/data/game");
+            args.add("--update_data_root=" + root + "/data/update");
+            args.add("--user_data_root=" + root + "/data/user");
+        } else {
+            // Developer layout (pushed with adb).
+            new File(files, "userdata").mkdirs();
+            args.add("--game_data_root=" + root + "/game/disc2_files");
+            args.add("--update_data_root=" + root + "/game/update");
+            args.add("--user_data_root=" + root + "/userdata");
+        }
+        if (isReleaseLayout(this)) {
+            for (String a : RELEASE_ARGS) args.add(a);
+        }
         args.add("--gpu_plugin=xenos");
         args.add("--log_file=" + root + "/logs/gtav.log");
         args.add("--log_max_file_size_mb=256");

@@ -42,7 +42,9 @@ extern char** environ;
 #endif
 // The iPhone app's setup screen uses the copy stages only (RunDataInstall): iOS cannot start
 // processes, so nothing here that spawns one (codegen, clang, the game) runs there.
-#if defined(__APPLE__) && TARGET_OS_IPHONE
+#if (defined(__APPLE__) && TARGET_OS_IPHONE) || defined(__ANDROID__)
+// Android (the APK's setup screen, libgtav_setup.so): RunDataInstall only, like the iPhone; bionic
+// also lacks posix_spawn_file_actions_addchdir_np before API 34.
 #define LOADER_NO_SPAWN 1
 #endif
 
@@ -1754,7 +1756,7 @@ bool SyncRuntime(const fs::path& root, const fs::path& home, std::wstring* error
   }
   return true;
 }
-#elif !defined(_WIN32)
+#elif !defined(_WIN32) && !defined(__ANDROID__)
 bool Preflight(const fs::path& root, std::wstring* error) {
   // gtav_fast and the game code are built for x86-64-v3 (AVX2, BMI2, FMA, MOVBE).
   __builtin_cpu_init();
@@ -1786,6 +1788,9 @@ bool Preflight(const fs::path& root, std::wstring* error) {
   }
   return true;
 }
+#elif defined(__ANDROID__)
+// Android: the setup screen (libgtav_setup.so) uses RunDataInstall only; nothing to check.
+bool Preflight(const fs::path&, std::wstring*) { return true; }
 #else
 bool Preflight(const fs::path& root, std::wstring* error) {
   // gtav_fast.exe and the game code are built for x86-64-v3 (AVX2, BMI2, FMA, MOVBE).

@@ -87,6 +87,10 @@ elseif(ANDROID)
         add_library(gtav_main_shim SHARED src/android_main_shim.cpp)
         set_target_properties(gtav_main_shim PROPERTIES OUTPUT_NAME main)
         target_link_libraries(gtav_main_shim PRIVATE rex::runtime log)
+        # libgtav_setup.so: the setup screen's game data install (no game code, no SDK).
+        add_library(gtav_setup SHARED src/android_setup_jni.cpp ../loader/src/install.cpp
+                    ../loader/src/sources.cpp src/native/adreno_shader_fix.cpp)
+        target_link_libraries(gtav_setup PRIVATE log)
     else()
         set_target_properties(gtav PROPERTIES OUTPUT_NAME main)
     endif()
