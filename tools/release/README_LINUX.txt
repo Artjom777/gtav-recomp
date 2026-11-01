@@ -56,7 +56,8 @@ Play GTA V on an iPhone 12 or newer (iOS 17+). The phone cannot build the game i
 PC does it once (about 15 minutes); the phone then installs the game files from your discs.
 1. Set up and play the game here for a while first (the phone gets the shaders the PC has seen:
    drive around, go indoors).
-2. Run ./gtav_launcher --iphone. When it is done, iphone/GTAV.ipa is next to it.
+2. Press "Build for iPhone" in the setup window (or run ./gtav_launcher --iphone). When it is
+   done, iphone/GTAV.ipa is next to it.
 3. Install GTAV.ipa with a sideloading tool that runs on Linux (for example AltServer-Linux with
    AltStore), or copy it to a Windows PC or Mac with Sideloadly. A free Apple ID re-signs every
    7 days.
@@ -66,8 +67,29 @@ PC does it once (about 15 minutes); the phone then installs the game files from 
 Objects missing on the phone? Copy the phone's GTA V > shader_cache folder to iphone/shader_cache
 here, run --iphone again (a few minutes) and reinstall GTAV.ipa; the game files stay.
 
-Everything made from your files stays in this folder (data/ and gtav_game.so). Do not share it:
-it contains Rockstar Games' copyrighted work.
+Android (experimental)
+----------------------
+Play GTA V on an Android phone with a recent Snapdragon (tested: Galaxy S23 FE, Snapdragon 8 Gen 1)
+and about 40 GB free during setup. The app has no game in it: this PC builds your game code for
+the phone once (about 15-30 minutes), and the phone installs the game files from your discs.
+1. Set up and play the game here for a while first (the phone gets the shaders the PC has seen:
+   drive around, go indoors).
+2. Press "Build for Android" in the setup window (or run ./gtav_launcher --android). When it is
+   done, android/gtav-android-pack.zip is next to it.
+3. Install android/GTAV.apk on the phone (copy it over and open it; allow installing apps from
+   that source).
+4. Copy gtav-android-pack.zip, your Disc 1 ISO, Disc 2 ISO and the TU file to the phone (for
+   example its Download folder).
+5. Open GTA V on the phone, choose the four files and press Install. It copies and checks about
+   16 GB, then starts the game. Keep the app open while it installs. The disc images and the pack
+   can be deleted afterwards.
+Objects missing on the phone? Copy the phone's Android/data/com.gtavrecomp.app/files/shader_cache
+folder to android/shader_cache here, press "Build for Android" again (a few minutes) and choose the
+new pack on the phone; the game files stay. A newer GTAV.apk needs a new pack (the app says so).
+
+Everything made from your files stays in this folder (data/, gtav_game.so, iphone/GTAV.ipa and
+android/gtav-android-pack.zip). Do not share any of it: it contains Rockstar Games' copyrighted
+work. (android/GTAV.apk as downloaded holds no game and is fine to share.)
 
 This project is free software under the GNU GPL, version 3 or later (LICENSES/gtav-recomp-GPL-3.0.txt).
 Source code: https://github.com/andrewnakas/gtav-recomp. The complete source of every program in

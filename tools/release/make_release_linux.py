@@ -144,6 +144,7 @@ def main():
     ap.add_argument("out")
     ap.add_argument("--llvm", required=True)
     ap.add_argument("--ios", help="tools/ios/make_shell.sh output (built on a Mac): the iPhone step's ios/ folder")
+    ap.add_argument("--android", help="tools/android/make_shell.sh output (built on Linux): the Android step's android/ folder")
     ap.add_argument("--expected", required=True)
     ap.add_argument("--licenses", required=True)
     ap.add_argument("--compat", action="store_true")
@@ -177,6 +178,17 @@ def main():
             if not (ios / f).is_file():
                 sys.exit(f"--ios: missing {f}")
         shutil.copytree(ios, out / "ios")
+
+    if a.android:
+        # The Android step (install.cpp RunAndroid): the public APK without game code, the APK's
+        # own libgtav_fast.so / librexruntime.so to link against, interface lists and simde; built
+        # on Linux by tools/android/make_shell.sh, copied as it is.
+        android = Path(a.android)
+        for f in ("GTAV.apk", "link/libgtav_fast.so", "link/librexruntime.so", "interface/gtav_game.exports",
+                  "interface/gtav_hooks.h", "include/simde/x86/sse4.1.h", "LICENSES/simde.txt"):
+            if not (android / f).is_file():
+                sys.exit(f"--android: missing {f}")
+        shutil.copytree(android, out / "android")
 
     llvm = Path(a.llvm)
     copy(llvm / "bin" / "clang-19", out / "tools/llvm/bin/clang++", True)

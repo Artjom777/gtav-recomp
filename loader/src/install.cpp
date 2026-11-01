@@ -999,6 +999,15 @@ class Installer {
   //--- compile and link ------------------------------------------------------
 
   static int JobCount() {
+    // GTAV_JOBS=N: at most N compilers at a time (a machine busy with something else).
+    if (const char* env = getenv("GTAV_JOBS")) {
+      int n = atoi(env);
+      if (n >= 1) return std::min(n, Uncapped());
+    }
+    return Uncapped();
+  }
+
+  static int Uncapped() {
 #ifdef __APPLE__
     // clang needs up to ~1 GB for the largest generated file; keep 3 GB for macOS and the app.
     uint64_t mem = 0;
