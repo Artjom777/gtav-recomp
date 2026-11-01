@@ -152,6 +152,10 @@ need XenosRecomp + dxc built for linux-arm64. Not for the first version.
 
 ## Getting this branch
 
-The iPhone work is on `ios-android` (local on the Mac until pushed; it is `origin/android` + the
-iOS commits). Merge it into `android` here before starting; conflicts should be limited to
-backend.cpp (GTAV_MOBILE defaults) and tools/android files the Mac did not touch.
+The iPhone work is on branch `ios-android` (= `origin/android` at d6a2d41 + 20 iOS commits). Since
+then `android` gained 10 commits here (render scale, tile fixes, **the GTK setup window for the
+Linux launcher**). Merge `ios-android` into `android` before starting. Expected conflicts:
+`loader/src/main_linux.cpp` (the Mac added a terminal `--iphone` path; put "Build for iPhone" and
+"Build for Android" buttons into the new GTK window as on Windows/Mac, keep `--iphone`/`--android`
+for scripts), `gtav/src/native/backend.cpp` (GTAV_MOBILE defaults, buffer budget, texture sample
+knob next to the render-scale work), `docs/IOS_PORT.md`/READMEs (text only).
