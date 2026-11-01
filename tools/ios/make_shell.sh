@@ -20,6 +20,12 @@ MOLTENVK_FW="${MOLTENVK_FW:-/Volumes/Untitled/MacOffload/skate3/moltenvk-ios/Mol
 APP="$OUT/GTAV.app"
 IFACE="${GTAV_IOS_INTERFACE:-$(dirname "$(dirname "$SHELL_EXE")")/game_interface}"
 
+# The renderer's own shaders must be compiled by this build (dxc): prebuilt headers from an older
+# tree lack the vertex-buffer overlay shader, and the touch controls and menu drew nothing.
+CACHE="$(dirname "$(dirname "$SHELL_EXE")")/CMakeCache.txt"
+if [ -f "$CACHE" ] && grep -qE '^GTAV_PREBUILT_NATIVE_SHADERS:PATH=.+' "$CACHE"; then
+  echo "the shell was built with GTAV_PREBUILT_NATIVE_SHADERS: reconfigure with -DGTAV_PREBUILT_NATIVE_SHADERS="; exit 1
+fi
 rm -rf "$APP" "$OUT/interface" "$OUT/include" "$OUT/LICENSES"; mkdir -p "$APP" "$OUT/interface" "$OUT/include" "$OUT/LICENSES"
 cp "$SHELL_EXE" "$APP/gtav"
 cp "$SDK/lib/librexruntime.dylib" "$SDK/lib/librexgpu-xenos.dylib" "$APP/"
