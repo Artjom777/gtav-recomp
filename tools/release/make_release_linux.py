@@ -143,6 +143,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out")
     ap.add_argument("--llvm", required=True)
+    ap.add_argument("--ios", help="tools/ios/make_shell.sh output (built on a Mac): the iPhone step's ios/ folder")
     ap.add_argument("--expected", required=True)
     ap.add_argument("--licenses", required=True)
     ap.add_argument("--compat", action="store_true")
@@ -166,6 +167,16 @@ def main():
     ours = ["gtav_launcher", "gtav_fast", "librexruntime.so", "librexgpu-xenos.so", "libTracyClient.so",
             "rexglue", "tools/XenosRecomp"]
     subprocess.run(["strip", "--strip-debug"] + [str(out / f) for f in ours], check=True)
+
+    if a.ios:
+        # The iPhone step (install.cpp RunIphone): an iOS shell without game code, interface lists,
+        # libSystem_ios.tbd and simde; built on a Mac by tools/ios/make_shell.sh, copied as it is.
+        ios = Path(a.ios)
+        for f in ("GTAV.app/gtav", "GTAV.app/libMoltenVK.dylib", "interface/gtav_game.undefs",
+                  "libSystem_ios.tbd", "include/simde/x86/sse4.1.h", "LICENSES/MoltenVK.txt"):
+            if not (ios / f).is_file():
+                sys.exit(f"--ios: missing {f}")
+        shutil.copytree(ios, out / "ios")
 
     llvm = Path(a.llvm)
     copy(llvm / "bin" / "clang-19", out / "tools/llvm/bin/clang++", True)

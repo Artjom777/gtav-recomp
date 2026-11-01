@@ -41,16 +41,18 @@ Logs: <game folder>/data/logs (gtav.log for the game, install.log for setup).
 
 iPhone (experimental)
 ---------------------
-The Mac builds the iPhone app from your installed game (iOS cannot compile code or shaders); the
-phone then installs the game's files itself from your discs, like the Mac's first-run setup.
+The Mac builds the iPhone app once from your installed game (iOS cannot compile code or shaders;
+Windows and Linux PCs can do this too); the phone then installs the game's files itself from your
+discs, like the Mac's first-run setup.
 Needs an iPhone 12 or newer (A14+, 4 GB RAM; tested on an iPhone 13 mini) on iOS 17 or newer, and
 a sideloading tool that signs apps with your own Apple ID (Sideloadly or AltStore; with a free
 Apple ID the app has to be re-signed every 7 days).
 1. Install and play the game on the Mac for a while first: the game saves every shader it meets,
    and only those can be translated for the phone (drive around the map, enter interiors).
 2. Hold Option while opening GTAV.app and press "Build for iPhone" (about 15-25 minutes). The game
-   folder then has iphone/GTAV.ipa (the game code and shaders for the phone; not the game files).
-3. Install iphone/GTAV.ipa on the phone with Sideloadly or AltStore.
+   folder then has iphone/GTAV.ipa (the game code and shaders for the phone; not the game files),
+   and Finder shows it.
+3. Drag GTAV.ipa into Sideloadly (sideloadly.io) with the iPhone plugged in, or use AltStore.
 4. Put your Disc 1 and Disc 2 ISO images and the TU27 file (tu00000009_00000000) where the phone
    can read them: in GTA V's folder (Finder > your iPhone > Files > GTA V, or the Files app), or
    on a USB drive plugged into the phone.

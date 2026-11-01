@@ -30,6 +30,22 @@ First run
 Later runs start the game directly. Hold Shift while starting the launcher (or pass --setup) to
 open setup again, for example after moving your discs.
 
+iPhone (experimental)
+---------------------
+Play GTA V on an iPhone 12 or newer (iOS 17+). The phone cannot build the game itself, so this
+PC does it once (about 15 minutes); the phone then installs the game files from your discs.
+1. Set up and play the game here for a while first (the phone gets the shaders the PC has seen:
+   drive around, go indoors).
+2. Hold Shift while starting gtav_launcher.exe and press "Build for iPhone". When it is done,
+   Explorer shows iphone\GTAV.ipa.
+3. Drag GTAV.ipa into Sideloadly (sideloadly.io) with the iPhone plugged in, and sign in with
+   your Apple ID. (A free Apple ID has to re-sign every 7 days.)
+4. Copy your Disc 1 ISO, Disc 2 ISO and the TU file onto the phone: Apple Devices (or iTunes) >
+   your iPhone > Files > GTA V, or put them on a USB stick and plug that into the phone.
+5. Open GTA V on the phone and press Install. It copies and checks about 16 GB, then starts.
+Objects missing on the phone? Copy the phone's GTA V > shader_cache folder to iphone\shader_cache
+here, build for iPhone again (a few minutes) and reinstall GTAV.ipa; the game files stay.
+
 Everything made from your files stays in this folder (data\ and gtav_game.dll). Do not share it:
 it contains Rockstar Games' copyrighted work.
 

@@ -47,6 +47,7 @@ extern char** environ;
 #endif
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -510,6 +511,100 @@ std::string Tail(const fs::path& p, size_t bytes) {
 }
 
 //-----------------------------------------------------------------------------
+// GTAV.ipa: a zip of Payload/ (stored, no compression), written here so every desktop system
+// makes the same one with nothing installed. Unix modes are recorded: iOS needs the executable
+// bits on gtav and the dylibs.
+//-----------------------------------------------------------------------------
+
+uint32_t Crc32(uint32_t crc, const uint8_t* p, size_t n) {
+  static const auto table = [] {
+    std::array<uint32_t, 256> t{};
+    for (uint32_t i = 0; i < 256; i++) {
+      uint32_t c = i;
+      for (int k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+      t[i] = c;
+    }
+    return t;
+  }();
+  crc = ~crc;
+  while (n--) crc = table[(crc ^ *p++) & 0xFF] ^ (crc >> 8);
+  return ~crc;
+}
+
+bool WriteIpa(const fs::path& payload, const fs::path& ipa) {
+  struct Item {
+    std::string name;  // zip path ('/' separators, directories end in '/')
+    fs::path path;
+    bool dir, exec;
+  };
+  std::vector<Item> items = {{"Payload/", payload, true, false}};
+  std::error_code ec;
+  for (auto it = fs::recursive_directory_iterator(payload, ec); !ec && it != fs::recursive_directory_iterator();
+       it.increment(ec)) {
+    std::string rel = "Payload/" + fs::relative(it->path(), payload).generic_string();
+    const std::string leaf = it->path().filename().string();
+    if (leaf.rfind("._", 0) == 0 || leaf == ".DS_Store") continue;  // AppleDouble files break signing
+    if (it->is_directory()) {
+      items.push_back({rel + "/", it->path(), true, false});
+    } else if (it->is_regular_file()) {
+      bool exec = leaf == "gtav" || it->path().extension() == ".dylib";
+      items.push_back({rel, it->path(), false, exec});
+    }
+  }
+  if (ec) return false;
+  std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) { return a.name < b.name; });
+  fs::path tmp = ipa;
+  tmp += ".part";
+  std::ofstream z(tmp, std::ios::binary | std::ios::trunc);
+  if (!z) return false;
+  auto u16 = [&](std::string& b, uint16_t v) { b += char(v & 0xFF), b += char(v >> 8); };
+  auto u32 = [&](std::string& b, uint32_t v) { u16(b, uint16_t(v)), u16(b, uint16_t(v >> 16)); };
+  constexpr uint16_t kTime = 0, kDate = (46 << 9) | (1 << 5) | 1;  // 2026-01-01: same bytes every run
+  std::string central;
+  std::vector<uint8_t> buf(1 << 20);
+  for (const Item& it : items) {
+    const uint64_t offset = uint64_t(z.tellp());
+    uint32_t crc = 0;
+    uint64_t size = 0;
+    if (!it.dir) {
+      size = fs::file_size(it.path, ec);
+      std::ifstream f(it.path, std::ios::binary);
+      while (f) {
+        f.read(reinterpret_cast<char*>(buf.data()), buf.size());
+        crc = Crc32(crc, buf.data(), size_t(f.gcount()));
+      }
+    }
+    if (ec || size >= 0xFFFFFFFFull || offset >= 0xFFFFFFFFull) return false;  // (no zip64 needed: ~200 MB)
+    std::string h;
+    u32(h, 0x04034b50), u16(h, 20), u16(h, 0), u16(h, 0), u16(h, kTime), u16(h, kDate);
+    u32(h, crc), u32(h, uint32_t(size)), u32(h, uint32_t(size)), u16(h, uint16_t(it.name.size())), u16(h, 0);
+    z << h << it.name;
+    if (!it.dir) {
+      std::ifstream f(it.path, std::ios::binary);
+      while (f) {
+        f.read(reinterpret_cast<char*>(buf.data()), buf.size());
+        z.write(reinterpret_cast<const char*>(buf.data()), f.gcount());
+      }
+    }
+    const uint32_t mode = it.dir ? 040755 : it.exec ? 0100755 : 0100644;
+    std::string c;
+    u32(c, 0x02014b50), u16(c, (3 << 8) | 20), u16(c, 20), u16(c, 0), u16(c, 0), u16(c, kTime), u16(c, kDate);
+    u32(c, crc), u32(c, uint32_t(size)), u32(c, uint32_t(size)), u16(c, uint16_t(it.name.size()));
+    u16(c, 0), u16(c, 0), u16(c, 0), u16(c, 0), u32(c, (mode << 16) | (it.dir ? 0x10 : 0)), u32(c, uint32_t(offset));
+    central += c + it.name;
+  }
+  const uint64_t cd = uint64_t(z.tellp());
+  std::string e;
+  u32(e, 0x06054b50), u16(e, 0), u16(e, 0), u16(e, uint16_t(items.size())), u16(e, uint16_t(items.size()));
+  u32(e, uint32_t(central.size())), u32(e, uint32_t(cd)), u16(e, 0);
+  z << central << e;
+  z.close();
+  if (!z || items.size() > 0xFFFF) return false;
+  fs::rename(tmp, ipa, ec);
+  return !ec;
+}
+
+//-----------------------------------------------------------------------------
 // The install
 //-----------------------------------------------------------------------------
 
@@ -932,7 +1027,8 @@ class Installer {
     fs::path gen = data_ / L"build" / L"generated" / L"default";
     fs::path obj = data_ / L"build" / (ios_ ? L"obj_ios" : L"obj");
     fs::path fsdir = root_ / L"tools" / L"game_dll" / L"fs";
-    fs::path iface = root_ / L"tools" / L"game_dll" / L"interface";
+    // iPhone: the iOS shell's own hook header (package ios/interface).
+    fs::path iface = ios_ ? root_ / L"ios" / L"interface" : root_ / L"tools" / L"game_dll" / L"interface";
     std::error_code ec;
     fs::create_directories(obj, ec);
     for (auto [src, name] : {std::pair{fsdir, L"gtav_pch.h"}, {fsdir, L"layout_check.h"},
@@ -948,29 +1044,37 @@ class Installer {
     }
     sources.push_back(fsdir / L"game_dll.cpp");
 #ifndef __APPLE__
-    sources.push_back(fsdir / L"fs_crt.cpp");  // x86 memcpy & co.; macOS takes libSystem's
+    if (!ios_) sources.push_back(fsdir / L"fs_crt.cpp");  // x86 memcpy & co.; Apple takes libSystem's
 #endif
 
     fs::path clang = root_ / L"tools" / L"llvm" / L"bin" / kClang;
     // Keep in sync with tools/game_dll/build_game_dll.py.
+    Args flags;
+    if (ios_) {
+      // iPhone, from any host: arm64 iOS 17, A14 or newer. The SSE intrinsics map to NEON through
+      // simde (MIT, package ios/include), as on the Mac.
+      flags = {L"--target=arm64-apple-ios17.0", L"-nostdinc++", L"-nostdlibinc", L"-fno-stack-protector",
+               L"-O2", L"-std=gnu++23", L"-mcpu=apple-a14", L"-fno-exceptions", L"-fno-rtti",
+               L"-fno-threadsafe-statics", L"-fno-math-errno", L"-w", L"-isystem",
+               (root_ / L"ios" / L"include").wstring()};
+    } else {
 #ifdef _WIN32
-    Args flags = {L"--target=x86_64-pc-windows-msvc", L"-nostdinc++", L"-nostdlibinc", L"-O2",
+    flags = {L"--target=x86_64-pc-windows-msvc", L"-nostdinc++", L"-nostdlibinc", L"-O2",
                   L"-std=gnu++23", L"-march=x86-64-v3", L"-msse4.1", L"-fno-exceptions",
                   L"-fno-rtti", L"-fno-threadsafe-statics", L"-fno-math-errno", L"-w"};
 #elif defined(__APPLE__)
-    // fs/include also holds simde (SSE on NEON, the SDK's own headers). iPhone: the same code for
-    // arm64 iOS 17, A14 or newer (build_game_dll.py --ios).
-    Args flags = {ios_ ? L"--target=arm64-apple-ios17.0" : L"--target=arm64-apple-macos15",
-                  L"-nostdinc++", L"-nostdlibinc", L"-fno-stack-protector", L"-O2",
-                  L"-std=gnu++23", ios_ ? L"-mcpu=apple-a14" : L"-mcpu=apple-m1", L"-fno-exceptions",
-                  L"-fno-rtti", L"-fno-threadsafe-statics", L"-fno-math-errno", L"-w"};
+    // fs/include also holds simde (SSE on NEON, the SDK's own headers).
+    flags = {L"--target=arm64-apple-macos15", L"-nostdinc++", L"-nostdlibinc", L"-fno-stack-protector",
+             L"-O2", L"-std=gnu++23", L"-mcpu=apple-m1", L"-fno-exceptions", L"-fno-rtti",
+             L"-fno-threadsafe-statics", L"-fno-math-errno", L"-w"};
 #else
-    Args flags = {L"--target=x86_64-linux-gnu", L"-nostdinc++", L"-nostdlibinc", L"-fPIC",
+    flags = {L"--target=x86_64-linux-gnu", L"-nostdinc++", L"-nostdlibinc", L"-fPIC",
                   L"-fno-semantic-interposition", L"-fno-stack-protector",
                   L"-fcf-protection=none", L"-O2", L"-std=gnu++23", L"-march=x86-64-v3",
                   L"-msse4.1", L"-fno-exceptions", L"-fno-rtti", L"-fno-threadsafe-statics",
                   L"-fno-math-errno", L"-w"};
 #endif
+    }
     flags.insert(flags.end(), {L"-isystem", (fsdir / L"include").wstring(), L"-I", gen.wstring()});
 
     int jobs = JobCount();
@@ -1023,14 +1127,16 @@ class Installer {
     return true;
   }
 
-#ifdef __APPLE__
   //--- iPhone ----------------------------------------------------------------
-  // The iPhone build (docs/IOS_PORT.md, "Release"): iOS can neither compile code nor translate
-  // shaders, so this Mac does both from the player's installed game. Same codegen and reference
-  // check as the install, compiled for arm64 iOS into gtav_game.dylib next to the shipped iOS
-  // shell (package ios/GTAV.app, no game code); every shader the game has made on this Mac (and
-  // those the phone saved, iphone/shader_cache) translated for the phone; packed as GTAV.ipa,
-  // unsigned (Sideloadly or AltStore sign it with the player's Apple ID). Out: <home>/iphone/.
+  // The iPhone build (docs/IOS_PORT.md, "Release"), on any of the three desktop systems: iOS can
+  // neither compile code nor translate shaders, so this computer does both from the player's
+  // installed game. Same codegen and reference check as the install, compiled with the bundled
+  // clang for arm64 iOS and linked with the bundled lld (Mach-O flavour, against our
+  // libSystem_ios.tbd: no Apple SDK) into gtav_game.dylib next to the shipped iOS shell (package
+  // ios/, no game code); every shader the game has made here (and those the phone saved,
+  // iphone/shader_cache) translated for the phone into the app; packed as iphone/GTAV.ipa,
+  // unsigned (Sideloadly or AltStore sign it with the player's Apple ID). The phone installs the
+  // game files itself from the player's discs (gtav/src/ios_setup.mm).
  public:
   bool RunIphone(std::wstring* error) {
     error_ = error;
@@ -1039,16 +1145,19 @@ class Installer {
     fs::create_directories(data_ / L"logs", ec);
     log_.open(data_ / L"logs" / L"iphone.log", std::ios::app);
     Log(L"---- iPhone build");
-    if (!IsInstalled(home_)) return SetError(L"Set up the game on this Mac first (Install), then build for iPhone.");
-    const fs::path shell = root_ / L"ios" / L"GTAV.app";
-    for (const wchar_t* f : {L"gtav", L"librexruntime.dylib", L"librexgpu-xenos.dylib", L"libMoltenVK.dylib",
-                             L"Info.plist"}) {
-      if (!fs::exists(shell / f, ec)) return SetError(std::wstring(L"The app has no iPhone files (ios/GTAV.app/") + f + L").");
+    if (!IsInstalled(home_))
+      return SetError(L"Set up the game on this computer first (Install), then build for iPhone.");
+    const fs::path ios = root_ / L"ios", shell = ios / L"GTAV.app";
+    for (const fs::path f : {shell / L"gtav", shell / L"librexruntime.dylib", shell / L"librexgpu-xenos.dylib",
+                             shell / L"libMoltenVK.dylib", shell / L"Info.plist", ios / L"libSystem_ios.tbd",
+                             ios / L"interface" / L"gtav_game.undefs", ios / L"include" / L"simde" / L"x86" / L"sse4.1.h"}) {
+      if (!fs::exists(f, ec))
+        return SetError(L"This download has no iPhone files (" + fs::relative(f, root_).wstring() + L" is missing).");
     }
-    if (!fs::exists(root_ / L"tools" / L"game_dll" / L"libSystem_ios.tbd", ec))
-      return SetError(L"The app has no iPhone files (tools/game_dll/libSystem_ios.tbd).");
+#ifdef __APPLE__
     std::wstring err;
     if (!SyncRuntime(root_, home_, &err)) return SetError(err);  // the shader tools in <home>/tools
+#endif
     const fs::path out = home_ / L"iphone", app = out / L"Payload" / L"GTAV.app";
     // Built before from this same package: only the shaders (new ones the phone saved) are redone
     // and the ipa repacked; reinstalling it keeps the game data in the app's Documents.
@@ -1077,15 +1186,7 @@ class Installer {
     fs::remove_all(out / L"Documents", ec);  // (earlier builds' layout)
 
     ui_.Stage(L"Packing GTAV.ipa...");
-    fs::remove(out / L"GTAV.ipa", ec);
-    Child zip;
-    // No resource forks or ._ AppleDouble files (non-APFS game folders): they break app signatures.
-    if (!zip.Start({L"/usr/bin/ditto", L"-c", L"-k", L"--norsrc", L"--noextattr", L"--noacl", L"--keepParent",
-                    (out / L"Payload").wstring(),
-                    (out / L"GTAV.ipa").wstring()},
-                   out, data_ / L"logs" / L"ipa.log") ||
-        zip.Poll(INFINITE) != 0)
-      return SetError(L"Could not pack GTAV.ipa");
+    if (!WriteIpa(out / L"Payload", out / L"GTAV.ipa")) return SetError(L"Could not write " + (out / L"GTAV.ipa").wstring());
     fs::remove_all(data_ / L"build", ec);
     Log(L"---- iPhone build finished: " + (out / L"GTAV.ipa").wstring());
     ui_.Progress(1.0);
@@ -1109,23 +1210,37 @@ class Installer {
   bool LinkIphone(const fs::path& out) {
     ui_.Stage(L"Linking gtav_game.dylib for iPhone...");
     fs::path build = data_ / L"build";
-    fs::path gd = root_ / L"tools" / L"game_dll";
+    fs::path ios = root_ / L"ios";
     fs::path rsp = build / L"link_ios.rsp";
     {
+      // Forward slashes: lld reads response files GNU-style (a backslash escapes).
       std::ofstream f(rsp);
-      for (auto& o : objects_) f << "\"" << o.string() << "\"\n";
-      std::ifstream u(gd / L"interface" / L"gtav_game.undefs");
-      for (std::string line; std::getline(u, line);)
+      for (auto& o : objects_) {
+        std::u8string g = o.generic_u8string();  // lld reads UTF-8
+        f << "\"" << std::string(g.begin(), g.end()) << "\"\n";
+      }
+      std::ifstream u(ios / L"interface" / L"gtav_game.undefs");
+      for (std::string line; std::getline(u, line);) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         if (!line.empty()) f << "-U " << line << "\n";
+      }
     }
     fs::path log = data_ / L"logs" / L"link_ios.log";
-    // As Link() for macOS, for iOS 17: libSystem_ios.tbd, the iOS shell's librexruntime.dylib.
-    Args cmd = {(root_ / L"tools" / L"llvm" / L"bin" / L"ld64.lld").wstring(), L"-arch", L"arm64",
-                L"-platform_version", L"ios", L"17.0", L"17.0", L"-dylib", L"-install_name",
-                L"@rpath/gtav_game.dylib", L"-dead_strip_dylibs", L"-O1", L"-exported_symbols_list",
-                (gd / L"interface" / L"gtav_game.exports").wstring(), (gd / L"libSystem_ios.tbd").wstring(),
-                (root_ / L"ios" / L"GTAV.app" / L"librexruntime.dylib").wstring(), L"-o", out.wstring(),
-                L"@" + rsp.wstring()};
+    // As Link() for macOS, for iOS 17: libSystem_ios.tbd, the iOS shell's librexruntime.dylib. Every
+    // package's lld is the same multi-format binary; -flavor darwin picks Mach-O whatever its name.
+#ifdef _WIN32
+    const fs::path lld = root_ / L"tools" / L"llvm" / L"bin" / L"lld-link.exe";
+#elif defined(__APPLE__)
+    const fs::path lld = root_ / L"tools" / L"llvm" / L"bin" / L"ld64.lld";
+#else
+    const fs::path lld = root_ / L"tools" / L"llvm" / L"bin" / L"ld.lld";
+#endif
+    auto gen = [](const fs::path& p) { return p.generic_wstring(); };
+    Args cmd = {lld.wstring(), L"-flavor", L"darwin", L"-arch", L"arm64", L"-platform_version", L"ios",
+                L"17.0", L"17.0", L"-dylib", L"-install_name", L"@rpath/gtav_game.dylib", L"-dead_strip_dylibs",
+                L"-O1", L"-exported_symbols_list", gen(ios / L"interface" / L"gtav_game.exports"),
+                gen(ios / L"libSystem_ios.tbd"), gen(ios / L"GTAV.app" / L"librexruntime.dylib"), L"-o",
+                gen(out), L"@" + gen(rsp)};
     Child c;
     if (!c.Start(cmd, build, log)) return SetError(L"Could not start ld64.lld");
     if (c.Poll(INFINITE) != 0) return SetError(L"Linking failed:\n" + Widen(Tail(log, 1500)));
@@ -1195,7 +1310,17 @@ class Installer {
   // tools/ios/make_spirv.sh does with the same XenosRecomp and dxc the Mac game uses.
   bool IphoneShaders(const fs::path& spirv) {
     ui_.Stage(L"Translating the shaders for iPhone...");
-    const fs::path tools = home_ / L"tools", work = data_ / L"build" / L"spirv_ios";
+#ifdef __APPLE__
+    const fs::path tools = home_ / L"tools";  // SyncRuntime's copy
+#else
+    const fs::path tools = root_ / L"tools";
+#endif
+#ifdef _WIN32
+    const wchar_t *kXr = L"XenosRecomp.exe", *kDxc = L"dxc.exe";
+#else
+    const wchar_t *kXr = L"XenosRecomp", *kDxc = L"dxc";
+#endif
+    const fs::path work = data_ / L"build" / L"spirv_ios";
     std::error_code ec;
     fs::create_directories(spirv, ec);
     fs::create_directories(work, ec);
@@ -1224,7 +1349,7 @@ class Installer {
     std::atomic<size_t> next{0}, done{0}, failed{0}, made{0};
     std::atomic<bool> stop{false};
     auto dxc = [&](const fs::path& hlsl, const fs::path& out, bool pixel, const fs::path& log) {
-      Args cmd = {(tools / L"dxc").wstring(), L"-T", pixel ? L"ps_6_0" : L"vs_6_0", L"-HV", L"2021",
+      Args cmd = {(tools / kDxc).wstring(), L"-T", pixel ? L"ps_6_0" : L"vs_6_0", L"-HV", L"2021",
                   L"-all-resources-bound", L"-spirv", L"-fvk-use-dx-layout", L"-Wno-ignored-attributes",
                   L"-Qstrip_debug"};
       if (!pixel) cmd.push_back(L"-fvk-invert-y");
@@ -1245,7 +1370,7 @@ class Installer {
         return true;
       made++;
       Child xr;
-      if (!xr.Start({(tools / L"XenosRecomp").wstring(), bin.wstring(), hlsl.wstring(),
+      if (!xr.Start({(tools / kXr).wstring(), bin.wstring(), hlsl.wstring(),
                      (work / L"shader_common.h").wstring()},
                     work, log) ||
           xr.Poll(INFINITE) != 0)
@@ -1291,7 +1416,6 @@ class Installer {
     if (failed > items.size() / 50) return SetError(Num(failed) + L" shaders could not be translated (see " + work.wstring() + L").");
     return true;
   }
-#endif
 
 #ifdef __APPLE__
   bool Link() {
@@ -1591,12 +1715,10 @@ bool RunInstall(const fs::path& root, const fs::path& home, const InstallInputs&
   return inst.Run(error);
 }
 
-#ifdef __APPLE__
 bool RunIphoneBuild(const fs::path& root, const fs::path& home, InstallUi& ui, std::wstring* error) {
   Installer inst(root, home, InstallInputs{}, ui);
   return inst.RunIphone(error);
 }
-#endif
 
 bool LaunchGame(const fs::path& root, std::wstring* error, const std::vector<std::wstring>& extra) {
   fs::path data = root / L"data";

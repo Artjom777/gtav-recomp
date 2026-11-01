@@ -3,9 +3,12 @@
 // First run (or "gtav_launcher.exe --setup"): the player picks their own Disc 1, Disc 2 and Title
 // Update 27; the launcher copies and checks the files, recompiles the game executable on this PC
 // and starts the game. Later runs start the game directly.
+// "Build for iPhone" (or "gtav_launcher.exe --iphone"): from the installed game, iphone\GTAV.ipa for
+// Sideloadly / AltStore (install.h RunIphoneBuild); the phone installs the game files itself.
 #include <windows.h>
 #include <commctrl.h>
 #include <shobjidl.h>
+#include <shellapi.h>
 
 #include <atomic>
 #include <filesystem>
@@ -32,6 +35,7 @@ enum : int {
   kIdProgress = 203,
   kIdStage = 204,
   kIdLog = 205,
+  kIdIphone = 206,
 };
 constexpr UINT kMsgLog = WM_APP + 1, kMsgStage = WM_APP + 2, kMsgProgress = WM_APP + 3,
                kMsgDone = WM_APP + 4, kMsgAsk = WM_APP + 5;
@@ -42,7 +46,8 @@ const wchar_t* kRowHints[3] = {
     L"the TU file (e.g. tu00000009_00000000) or a folder with default.xexp + update.rpf"};
 
 fs::path g_root;
-HWND g_wnd, g_edit[3], g_install, g_play, g_cancel, g_progress, g_stage, g_log;
+HWND g_wnd, g_edit[3], g_install, g_play, g_cancel, g_progress, g_stage, g_log, g_iphone;
+bool g_iphone_job = false;  // the running job is the iPhone build
 HFONT g_font;
 std::atomic<bool> g_busy{false}, g_cancelled{false};
 std::thread g_worker;
@@ -152,6 +157,7 @@ void SetBusy(bool busy) {
     EnableWindow(GetDlgItem(g_wnd, kIdFolder + i), !busy);
   }
   EnableWindow(g_install, !busy);
+  EnableWindow(g_iphone, !busy && IsInstalled(g_root));
   EnableWindow(g_cancel, busy);
   EnableWindow(g_play, !busy && IsInstalled(g_root));
 }
@@ -172,12 +178,27 @@ void StartInstall() {
   SaveInputs();
   SetWindowTextW(g_log, L"");
   g_cancelled = false;
+  g_iphone_job = false;
   SetBusy(true);
   if (g_worker.joinable()) g_worker.join();
   g_worker = std::thread([in] {
     WindowUi ui;
     std::wstring error;
     bool ok = RunInstall(g_root, in, ui, &error);
+    PostMessageW(g_wnd, kMsgDone, ok, reinterpret_cast<LPARAM>(new std::wstring(error)));
+  });
+}
+
+void StartIphone() {
+  SetWindowTextW(g_log, L"");
+  g_cancelled = false;
+  g_iphone_job = true;
+  SetBusy(true);
+  if (g_worker.joinable()) g_worker.join();
+  g_worker = std::thread([] {
+    WindowUi ui;
+    std::wstring error;
+    bool ok = RunIphoneBuild(g_root, g_root, ui, &error);
     PostMessageW(g_wnd, kMsgDone, ok, reinterpret_cast<LPARAM>(new std::wstring(error)));
   });
 }
@@ -212,6 +233,7 @@ void CreateControls() {
   }
   g_install = Make(L"BUTTON", L"Install", BS_DEFPUSHBUTTON | WS_TABSTOP, 16, 250, 120, 30, kIdInstall);
   g_cancel = Make(L"BUTTON", L"Cancel", WS_TABSTOP, 144, 250, 100, 30, kIdCancel);
+  g_iphone = Make(L"BUTTON", L"Build for iPhone", WS_TABSTOP, 252, 250, 150, 30, kIdIphone);
   g_play = Make(L"BUTTON", L"Play", WS_TABSTOP, 604, 250, 120, 30, kIdPlay);
   g_stage = Make(L"STATIC", L"", SS_ENDELLIPSIS, 16, 292, 708, 18, kIdStage);
   g_progress = Make(PROGRESS_CLASSW, L"", 0, 16, 314, 708, 18, kIdProgress);
@@ -241,6 +263,8 @@ LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
         if (!p.empty()) SetWindowTextW(g_edit[id - kIdFolder], p.c_str());
       } else if (id == kIdInstall) {
         StartInstall();
+      } else if (id == kIdIphone) {
+        StartIphone();
       } else if (id == kIdCancel) {
         g_cancelled = true;
         SetWindowTextW(g_stage, L"Cancelling...");
@@ -275,7 +299,12 @@ LRESULT CALLBACK WndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
     case kMsgDone: {
       std::unique_ptr<std::wstring> err(reinterpret_cast<std::wstring*>(lp));
       SetBusy(false);
-      if (wp) {
+      if (wp && g_iphone_job) {
+        // Show GTAV.ipa in Explorer: the next step is dragging it into Sideloadly.
+        SetWindowTextW(g_stage, L"iPhone build finished: install iphone\\GTAV.ipa with Sideloadly.");
+        std::wstring arg = L"/select,\"" + (g_root / L"iphone" / L"GTAV.ipa").wstring() + L"\"";
+        ShellExecuteW(hw, nullptr, L"explorer.exe", arg.c_str(), nullptr, SW_SHOWNORMAL);
+      } else if (wp) {
         SetWindowTextW(g_stage, L"Setup finished. Press Play.");
         SetFocus(g_play);
       } else {
@@ -353,6 +382,17 @@ int Unattended() {
   return ok ? 0 : 1;
 }
 
+// "--iphone": the iPhone build without a window (data\logs\iphone_unattended.txt).
+int IphoneUnattended() {
+  std::error_code ec;
+  fs::create_directories(g_root / L"data" / L"logs", ec);
+  FileUi ui(g_root / L"data" / L"logs" / L"iphone_unattended.txt");
+  std::wstring error;
+  bool ok = Preflight(g_root, &error) && RunIphoneBuild(g_root, g_root, ui, &error);
+  ui.Log(ok ? L"done" : L"error: " + error);
+  return ok ? 0 : 1;
+}
+
 fs::path ExeDir() {
   wchar_t buf[MAX_PATH * 4];
   GetModuleFileNameW(nullptr, buf, DWORD(std::size(buf)));
@@ -364,6 +404,7 @@ fs::path ExeDir() {
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int show) {
   g_root = ExeDir();
   if (cmdline && wcsstr(cmdline, L"--unattended")) return Unattended();
+  if (cmdline && wcsstr(cmdline, L"--iphone")) return IphoneUnattended();
   bool setup = cmdline && wcsstr(cmdline, L"--setup");
   // The common case: installed, start the game and get out of the way.
   if (!setup && IsInstalled(g_root) && !(GetKeyState(VK_SHIFT) & 0x8000)) {

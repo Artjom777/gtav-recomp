@@ -3,6 +3,7 @@
 //   ./gtav_launcher                         installed: start the game; otherwise run setup
 //   ./gtav_launcher --setup [DISC1 DISC2 TU] run setup again (paths asked for when not given)
 //   ./gtav_launcher --unattended            setup from data/launcher.ini, no questions (testing)
+//   ./gtav_launcher --iphone                after setup: iphone/GTAV.ipa for Sideloadly / AltStore
 //   ./gtav_launcher -- ARGS...              pass ARGS to the game (for example --vulkan_device=1)
 //
 // Setup is the same as on Windows (install.cpp): the player's own Disc 1, Disc 2 and Title Update
@@ -228,7 +229,7 @@ int main(int argc, char** argv) {
   if (ec) g_root = fs::absolute(argv[0]).parent_path();
   std::signal(SIGINT, [](int) { g_cancelled = 1; });
 
-  bool setup = false, unattended = false;
+  bool setup = false, unattended = false, iphone = false;
   std::vector<std::string> paths;
   std::vector<std::wstring> game_args;
   for (int i = 1; i < argc; ++i) {
@@ -241,8 +242,10 @@ int main(int argc, char** argv) {
       setup = true;
     } else if (a == "--unattended") {
       unattended = true;
+    } else if (a == "--iphone") {
+      iphone = true;
     } else if (a == "--help" || a == "-h") {
-      printf("usage: %s [--setup [DISC1 DISC2 TU]] [--unattended] [-- GAME_ARGS...]\n", argv[0]);
+      printf("usage: %s [--setup [DISC1 DISC2 TU]] [--unattended] [--iphone] [-- GAME_ARGS...]\n", argv[0]);
       return 0;
     } else if (a.rfind("--", 0) == 0) {
       fprintf(stderr, "unknown option %s (game options go after --)\n", a.c_str());
@@ -252,6 +255,19 @@ int main(int argc, char** argv) {
     }
   }
   if (unattended) return Unattended();
+  if (iphone) {
+    // The iPhone build (install.h RunIphoneBuild) from the installed game.
+    std::wstring error;
+    TermUi ui;
+    if (!Preflight(g_root, &error) || !RunIphoneBuild(g_root, g_root, ui, &error)) {
+      fprintf(stderr, "\niPhone build stopped: %s\n", Narrow(error).c_str());
+      return 1;
+    }
+    printf("\nDone: %s\nInstall it on the phone with Sideloadly or AltStore, then open GTA V there: it\n"
+           "installs the game files from your discs itself.\n",
+           (g_root / "iphone" / "GTAV.ipa").c_str());
+    return 0;
+  }
   if (!paths.empty()) setup = true;
 
   std::wstring error;

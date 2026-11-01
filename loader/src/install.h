@@ -31,6 +31,12 @@ class InstallUi {
 bool RunDataInstall(const std::filesystem::path& home, const std::filesystem::path& expected,
                     const InstallInputs& in, InstallUi& ui, std::wstring* error);
 bool IsDataInstalled(const std::filesystem::path& home);
+// iPhone, on any desktop system: from the installed game, <home>/iphone/GTAV.ipa (the package's iOS
+// shell with gtav_game.dylib built for iOS and the shaders translated for it; no game files: the
+// phone installs those from the player's discs). macOS: root is the package, home the game folder;
+// Windows / Linux: both the launcher's folder.
+bool RunIphoneBuild(const std::filesystem::path& root, const std::filesystem::path& home, InstallUi& ui,
+                    std::wstring* error);
 
 // root = the folder holding the launcher, gtav_fast.exe and tools\ (Linux: gtav_fast, tools/).
 bool IsInstalled(const std::filesystem::path& root);
@@ -54,10 +60,6 @@ bool CheckGameFolder(const std::filesystem::path& home, std::wstring* error);
 // package into the game folder when they changed. Run before every launch.
 bool SyncRuntime(const std::filesystem::path& root, const std::filesystem::path& home,
                  std::wstring* error);
-// iPhone: from the installed game folder, <home>/iphone/GTAV.ipa (the package's iOS shell with
-// gtav_game.dylib built for iOS) and <home>/iphone/Documents (args.txt, spirv/) for the phone.
-bool RunIphoneBuild(const std::filesystem::path& root, const std::filesystem::path& home, InstallUi& ui,
-                    std::wstring* error);
 #endif
 
 }  // namespace loader

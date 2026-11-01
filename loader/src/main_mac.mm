@@ -381,8 +381,10 @@ class WindowUi : public InstallUi {
     dispatch_async(dispatch_get_main_queue(), ^{
       [self setBusy:false];
       if (ok) {
-        [self stage:@"iPhone build finished: the iphone folder in the game folder has GTAV.ipa and Documents."];
-        [NSWorkspace.sharedWorkspace openURL:[NSURL fileURLWithPath:NS(g_home / "iphone")]];
+        [self stage:@"iPhone build finished: install GTAV.ipa with Sideloadly or AltStore."];
+        // Show GTAV.ipa in Finder: the next step is dragging it into Sideloadly.
+        [NSWorkspace.sharedWorkspace
+            activateFileViewerSelectingURLs:@[ [NSURL fileURLWithPath:NS(g_home / "iphone" / "GTAV.ipa")] ]];
       } else if (g_cancelled) {
         [self stage:@"Cancelled."];
       } else {

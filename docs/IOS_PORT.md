@@ -123,7 +123,19 @@ Measured with the game's own log lines (`memory at frame`, `record ms per frame`
   hitch log only past 50 ms on phones, logs rotate at 16 MB (`devicectl copy from` stalls on files
   past ~20 MB; when the phone's file service wedges, replug the cable).
 
-## Release (built and tested on the Mac 2026-10-31; the ipa not yet sideloaded)
+## Release (built and tested on the Mac 2026-10-31/11-01; the ipa not yet sideloaded)
+
+**Any PC builds the ipa** (2026-11-01): the iPhone step is one code path in install.cpp for
+Windows, Linux and macOS ("Build for iPhone" in the Windows / Mac setup windows, `--iphone` on all
+three). Each package's `ios/` folder (tools/ios/make_shell.sh, built on a Mac, copied as-is by
+make_release.py / make_release_linux.py `--ios DIR` and make_release_macos.py `--ios-shell DIR`)
+holds the shell app, `interface/` (Mac-format exports/undefs/hooks), `libSystem_ios.tbd`,
+`include/simde` and the MoltenVK + simde licenses. The compile uses the package's clang with
+`--target=arm64-apple-ios17.0`; the link uses the package's lld under whatever name it ships
+(`lld-link.exe`, `ld.lld`, `ld64.lld`) with `-flavor darwin` (checked: all three names link an
+iOS dylib); the response file uses forward slashes (lld tokenizes it GNU-style); GTAV.ipa is a
+stored zip written by install.cpp WriteIpa with Unix modes (no ditto). Windows / Linux are not
+compiled or run yet (only syntax-checked on the Mac).
 
 Constraint as for every release: nothing Rockstar-derived is published, and iOS can neither
 compile code nor translate shaders, so the player's **Mac** builds the phone's game library and

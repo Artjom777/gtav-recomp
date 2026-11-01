@@ -3,7 +3,9 @@
 # no build paths in the binaries (-ffile-prefix-map), then packaged by make_release_macos.py.
 # usage: build_release_macos.sh OUT_DIR LLVM_DIR LICENSES_DIR [--zip]
 #   IOS_SHELL=1   also the iPhone shell (GTAV.app/Contents/Resources/gtav/ios: the SDK runtime and
-#                 gtav for iOS 17 / A14+ without game code, MoltenVK; MOLTENVK_FW as in make_shell.sh)
+#                 gtav for iOS 17 / A14+ without game code, MoltenVK; MOLTENVK_FW as in make_shell.sh).
+#                 build/release-mac/ios-shell-app is then also the --ios folder for the Windows and
+#                 Linux release scripts.
 #   LLVM_DIR      unpacked LLVM-19.1.7-macOS-ARM64 (official release)
 #   LICENSES_DIR  LLVM.txt and DirectXShaderCompiler.txt
 # Needs Xcode (clang, the macOS SDK), CMake, Ninja, Python 3. The SDK tree must be v0.10.0 +

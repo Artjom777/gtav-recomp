@@ -152,7 +152,7 @@ def main():
     ap.add_argument("--licenses", required=True)
     ap.add_argument("--sdk", default=str(SDK / "out" / "install" / "mac-arm64"))
     ap.add_argument("--zip", action="store_true")
-    ap.add_argument("--ios-shell", help="folder holding GTAV.app from tools/ios/make_shell.sh (the iPhone step)")
+    ap.add_argument("--ios-shell", help="tools/ios/make_shell.sh output folder (the iPhone step's ios/)")
     ap.add_argument("--allow-newer-os", action="store_true", help="skip the macOS 15 floor check (testing)")
     a = ap.parse_args()
     sdk_install = Path(a.sdk)
@@ -214,12 +214,9 @@ def main():
                      "rexglue", "tools/shaders/XenosRecomp")], check=True, capture_output=True)
 
     ios_dir = None
-    if a.ios_shell:
+    if a.ios_shell:  # tools/ios/make_shell.sh output: the iPhone step's inputs (install.cpp RunIphone)
+        shutil.copytree(Path(a.ios_shell), pkg / "ios")
         ios_dir = pkg / "ios" / "GTAV.app"
-        shutil.copytree(Path(a.ios_shell) / "GTAV.app", ios_dir)
-        copy(REPO / "tools" / "game_dll" / "libSystem_ios.tbd", pkg / "tools/game_dll/libSystem_ios.tbd")
-        subprocess.run(["strip", "-S", "-x", str(ios_dir / "gtav"), str(ios_dir / "librexruntime.dylib"),
-                        str(ios_dir / "librexgpu-xenos.dylib")], check=True, capture_output=True)
         check_ios_shell(ios_dir)
 
     llvm = Path(a.llvm)
