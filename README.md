@@ -1,3 +1,5 @@
+Just want to play the game on Windows, Android, IOS, Mac or Linux? go here https://github.com/andrewnakas/gtav-recomp/releases
+
 # GTA V (Xbox 360) recompiled: Windows, Linux, macOS, iPhone and Android
 
 Grand Theft Auto V for Xbox 360 (Title Update 27), **statically recompiled** from the console's
