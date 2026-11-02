@@ -58,7 +58,9 @@ endif()
 # tools/android/ubo_constants.py and lower_int64.py; the int64 lowering needs SPIRV-Tools (static,
 # from the SDK's thirdparty tree).
 target_sources(gtav_launcher PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../gtav/src/native/adreno_shader_fix.cpp)
-set(_gtav_tp ${CMAKE_CURRENT_SOURCE_DIR}/../rexglue-sdk/thirdparty)
+set(GTAV_SDK_THIRDPARTY ${CMAKE_CURRENT_SOURCE_DIR}/../rexglue-sdk/thirdparty CACHE PATH
+    "rexglue-sdk/thirdparty (SPIRV-Tools for the Android shaders)")
+set(_gtav_tp ${GTAV_SDK_THIRDPARTY})
 if(EXISTS ${_gtav_tp}/spirv-tools/CMakeLists.txt)
     set(SPIRV-Headers_SOURCE_DIR ${_gtav_tp}/spirv-headers)
     set(SPIRV_SKIP_TESTS ON CACHE BOOL "" FORCE)

@@ -406,16 +406,33 @@ struct Child {
     SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, TRUE};
     HANDLE out = CreateFileW(log.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_ALWAYS,
                              FILE_ATTRIBUTE_NORMAL, nullptr);
-    STARTUPINFOW si = {sizeof(si)};
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = out;
-    si.hStdError = out;
-    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    // The child inherits the log handle only. Children start from several worker threads, and the
+    // CRT opens files (std::ofstream) with inheritable handles: with plain inheritance a child
+    // started on one thread kept another thread's .hlsl open for writing, and that thread's dxc
+    // then failed with "being used by another process" (365 of 3,617 iPhone shaders).
+    const bool have_out = out != INVALID_HANDLE_VALUE;
+    SIZE_T attr_size = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &attr_size);
+    std::vector<char> attr_buf(attr_size);
+    auto* attrs = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attr_buf.data());
+    bool have_attrs = have_out && InitializeProcThreadAttributeList(attrs, 1, 0, &attr_size) &&
+                      UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &out,
+                                                sizeof(out), nullptr, nullptr);
+    STARTUPINFOEXW si = {};
+    si.StartupInfo.cb = sizeof(si);
+    if (have_attrs) {
+      si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+      si.StartupInfo.hStdOutput = out;
+      si.StartupInfo.hStdError = out;
+      si.lpAttributeList = attrs;
+    }
     std::wstring cmd = cmdline;
-    BOOL ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE,
-                             CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS, nullptr,
-                             cwd.c_str(), &si, &pi);
-    if (out != INVALID_HANDLE_VALUE) CloseHandle(out);
+    BOOL ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, have_attrs ? TRUE : FALSE,
+                             CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS |
+                                 (have_attrs ? EXTENDED_STARTUPINFO_PRESENT : 0),
+                             nullptr, cwd.c_str(), &si.StartupInfo, &pi);
+    if (have_attrs) DeleteProcThreadAttributeList(attrs);
+    if (have_out) CloseHandle(out);
     return ok != 0;
   }
   // -1 while running.
