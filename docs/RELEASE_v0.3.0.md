@@ -1,8 +1,9 @@
 # v0.3.0 build sheet: one release, three desktop packages, each able to build iPhone and Android
 
 Written 2026-11-01 on the Mac. **Read all of it before building.** One GitHub release, tag `v0.3.0`,
-with every package built from the **same commit** (the commit that adds this file, on `main` and
-`android-pc-build`; later commits only if every package is rebuilt from them).
+with every package built from the **same commit**: `main` as of the Windows build (f36486f or later,
+which adds the app-local Visual C++ runtime). Record the commit you built from in the draft's notes;
+the Mac rebuilds its package from that commit during final assembly.
 
 Order (the owner's plan): the Windows PC builds the Windows package, then reboots into Linux and
 builds the Linux package and the Android folder; the Mac builds the Mac package and the iPhone shell.
