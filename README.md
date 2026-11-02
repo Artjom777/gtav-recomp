@@ -65,7 +65,7 @@ from them.
   | OS | Windows 10/11 x64 | x86-64 with glibc 2.35 + GCC 13 libstdc++ (Ubuntu 24.04, Debian 13, Fedora 39, Arch...) | macOS 15 or newer |
   | CPU | AVX2 (Intel Haswell / AMD Zen or newer) | AVX2 | Apple silicon (M1 or newer) |
   | GPU | Vulkan driver | Vulkan driver + loader | built in (Metal) |
-  | Extra | [VC++ 2015-2022 x64 redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe) | a desktop session (X11 or Wayland) | none |
+  | Extra | none (the Visual C++ runtime is included) | a desktop session (X11 or Wayland) | none |
 
   8 GB RAM or more. About 25 GB free during setup, about 17 GB afterwards. A controller is
   recommended (Xbox or PlayStation through SDL; Windows: XInput). The keyboard works on Mac and Linux.

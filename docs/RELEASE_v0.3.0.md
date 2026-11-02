@@ -50,7 +50,11 @@ with `gh release download v0.3.0 -p <pattern>` (drafts are visible to the repo o
 3. `gh release download v0.3.0 -p ios-shell-v0.3.0.tar` and unpack it. For `android/`, the first
    Windows package may use the v0.2.1-linux `android/` **only as a stand-in**: the final zip must
    carry the Linux-built v0.3.0 `android/` (step 3.4), see step 4.
-4. `make_release.py OUT --llvm ... --expected ... --ios <ios> --android <android> --zip`.
+4. `make_release.py OUT --llvm ... --expected ... --ios <ios> --android <android> --zip`, from a VS x64
+   developer prompt (or `--vcruntime <...\\Microsoft.VC143.CRT>`): **new in 0.3.0** the Visual C++
+   runtime DLLs are copied next to the exes and into tools\\, so players need no redistributable.
+   Check on a Windows without the VC++ redistributable installed (or a fresh VM) that
+   gtav_launcher.exe, gtav_fast.exe, XenosRecomp.exe and dxc.exe start.
 5. From the unpacked package on an installed test game: `gtav_launcher.exe --iphone` and `--android`
    (0 failed; the 4784105 handle fix matters here), the Windows-made ipa on the iPhone.
 6. `tools\release\scan_release.cmd` (PASS), upload `gtav-recomp-windows-x64.zip` to the draft.
@@ -60,6 +64,10 @@ with `gh release download v0.3.0 -p <pattern>` (drafts are visible to the repo o
 
 1. Same commit and patches; build the runtime, launcher, `gtav_fast` (GTAV_GAME_DLL=ON), as for
    v0.2.0-linux (`tools/release/compat/build.sh` for the glibc 2.35 floor).
+   **New in 0.3.0, if it can be done safely**: carry libstdc++.so.6 and libgcc_s.so.1 (GCC 13+) in the
+   package with an `$ORIGIN` runpath, so Ubuntu 22.04 / Debian 12 work without the toolchain PPA
+   (check_needed then only allows glibc and the desktop libraries). Update README_LINUX.txt and
+   the repo README's requirements row if you do.
 2. **Android from this commit**: libgtav_fast.so / libmain.so shim / APK (`tools/android/build_apk.sh`,
    versionCode 3), then `tools/android/make_shell.sh dist/android`. This carries the phone renderer
    fixes from 11-01 (failed-pipeline retry, no holds for shaders that can't arrive, hold limit, render

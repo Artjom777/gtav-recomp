@@ -1835,9 +1835,10 @@ bool Preflight(const fs::path& root, std::wstring* error) {
              L"(Intel Haswell, AMD Excavator / Zen or newer).";
     return false;
   }
-  // The runtime DLLs use the Visual C++ runtime, which Windows does not always include.
+  // The runtime DLLs use the Visual C++ runtime. Packages since 0.3.0 carry it next to the exes
+  // (make_release.py); an installed redistributable works too.
   for (const wchar_t* dll : {L"msvcp140.dll", L"msvcp140_atomic_wait.dll", L"vcruntime140.dll", L"vcruntime140_1.dll"}) {
-    HMODULE m = LoadLibraryExW(dll, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    HMODULE m = LoadLibraryExW(dll, nullptr, LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!m) {
       *error = std::wstring(L"The Microsoft Visual C++ 2015-2022 Redistributable (x64) is not "
                             L"installed (") + dll + L" is missing). Install it from Microsoft: "

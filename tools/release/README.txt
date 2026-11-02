@@ -12,8 +12,6 @@ What you need
 - Title Update 27 for GTA V from your own console: the TU file (tu00000009_00000000) or a folder
   with disc002\default.xexp and disc002\update.rpf.
 - Windows 10/11 x64, a CPU with AVX2 (Intel Haswell / AMD Zen or newer), a GPU with current Vulkan drivers.
-- The Microsoft Visual C++ 2015-2022 Redistributable (x64):
-  https://aka.ms/vs/17/release/vc_redist.x64.exe
 - An Xbox-compatible (XInput) controller.
 - About 25 GB free on this drive during setup (about 17 GB once installed), 8 GB RAM or more.
 

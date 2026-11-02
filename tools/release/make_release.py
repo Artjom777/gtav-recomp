@@ -114,6 +114,12 @@ def copy(src, dst):
     shutil.copy2(src, dst)
 
 
+# App-local Visual C++ runtime (see main): what gtav_fast.exe, the SDK DLLs, the launcher and the
+# shader tools import from it.
+VC_RUNTIME = ("msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll", "msvcp140_atomic_wait.dll",
+              "vcruntime140.dll", "vcruntime140_1.dll")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out")
@@ -123,6 +129,8 @@ def main():
     ap.add_argument("--expected", required=True)
     ap.add_argument("--licenses", required=True)
     ap.add_argument("--zip", action="store_true")
+    ap.add_argument("--vcruntime", help="folder with the x64 Visual C++ runtime DLLs (default: "
+                    "%%VCToolsRedistDir%%\\x64\\Microsoft.VC14x.CRT from a VS developer prompt)")
     a = ap.parse_args()
 
     out = Path(a.out).resolve()
@@ -135,6 +143,18 @@ def main():
 
     for src, rel in FILES:
         copy(src, out / rel)
+    # The Visual C++ runtime, app-local (Microsoft's redistributable files, deployed next to the
+    # executables that use them): players no longer install the VC++ redistributable. tools\ gets a
+    # copy too (XenosRecomp.exe, dxc.exe use it); clang/lld are statically linked.
+    crt = Path(a.vcruntime) if a.vcruntime else None
+    if crt is None and os.environ.get("VCToolsRedistDir"):
+        found = sorted(Path(os.environ["VCToolsRedistDir"], "x64").glob("Microsoft.VC14*.CRT"))
+        crt = found[-1] if found else None
+    if crt is None or not crt.is_dir():
+        sys.exit("--vcruntime: the x64 Visual C++ runtime folder (Microsoft.VC14x.CRT) was not found")
+    for dll in VC_RUNTIME:
+        copy(crt / dll, out / dll)
+        copy(crt / dll, out / "tools" / dll)
     copy(Path(a.expected), out / "tools/game_dll/expected.txt")
 
     if a.ios:
