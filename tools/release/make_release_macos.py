@@ -282,7 +282,10 @@ def main():
     if a.zip:
         z = out.parent / (out.name + ".zip")
         z.unlink(missing_ok=True)
-        subprocess.run(["ditto", "-c", "-k", "--keepParent", str(out), str(z)], check=True)
+        # No ._ AppleDouble entries (xattrs such as com.apple.provenance): unzipped off a Mac they
+        # become real files (v0.2.0-macos had 1,873 of them; harmless on a Mac).
+        subprocess.run(["ditto", "-c", "-k", "--norsrc", "--noextattr", "--noacl", "--keepParent", str(out), str(z)],
+                       check=True)
         print(f"zip {z.stat().st_size / 2**20:.0f} MB -> {z}")
 
 
