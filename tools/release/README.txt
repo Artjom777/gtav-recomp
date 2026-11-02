@@ -46,6 +46,23 @@ PC does it once (about 15 minutes); the phone then installs the game files from 
 Objects missing on the phone? Copy the phone's GTA V > shader_cache folder to iphone\shader_cache
 here, build for iPhone again (a few minutes) and reinstall GTAV.ipa; the game files stay.
 
+Android (experimental)
+----------------------
+Play GTA V on an Android phone with a recent Snapdragon (tested: Galaxy S23 FE, Snapdragon 8 Gen 1)
+and about 40 GB free during setup. The app has no game in it: this PC builds your game code for
+the phone once (about 15-30 minutes), and the phone installs the game files from your discs.
+1. Set up and play the game here for a while first (the phone gets the shaders the PC has seen).
+2. Hold Shift while starting gtav_launcher.exe and press "Build for Android". When it is done,
+   Explorer shows android\gtav-android-pack.zip (android\GTAV.apk is next to it).
+3. Copy GTAV.apk, gtav-android-pack.zip, your Disc 1 ISO, Disc 2 ISO and the TU file to the
+   phone (for example its Download folder).
+4. On the phone, open GTAV.apk to install it (allow installing apps from that source).
+5. Open GTA V, choose the four files and press Install. It copies and checks about 16 GB, then
+   starts the game. The disc images and the pack can be deleted afterwards.
+Objects missing on the phone? Copy the phone's Android\data\com.gtavrecomp.app\files\shader_cache
+folder to android\shader_cache here, press "Build for Android" again (a few minutes) and choose
+the new pack on the phone; the game files stay.
+
 Everything made from your files stays in this folder (data\ and gtav_game.dll). Do not share it:
 it contains Rockstar Games' copyrighted work.
 
