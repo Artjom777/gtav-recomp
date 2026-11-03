@@ -10,6 +10,14 @@ PowerPC executable into native code, with a new renderer, for PCs, Macs and phon
 Xbox 360 discs and title update; everything made from them (the recompiled code, the game files,
 the translated shaders) is made on your own computer and stays there.
 
+> [!WARNING]
+> **Forking, mirroring or publishing your own builds?** Read
+> [Keeping it clean](#keeping-it-clean-rules-for-forks-and-downstream-releases) first. The
+> recompiled game code, the game's shaders and anything else made from the discs are **Rockstar
+> Games' copyrighted work**. They must never be in a repository, release, ipa, apk, mirror or
+> download link. This project's GPL license covers only our own code and cannot give anyone the
+> right to share Rockstar's.
+
 **Downloads: [Releases](https://github.com/andrewnakas/gtav-recomp/releases).** Pick the package
 for your computer (Windows, Linux or macOS). Every package can also build the **iPhone** and
 **Android** versions, so you never need a separate phone download.
@@ -25,6 +33,7 @@ for your computer (Windows, Linux or macOS). Every package can also build the **
 - [Troubleshooting](#troubleshooting)
 - [Building from source](#building-from-source)
 - [Repository layout](#repository-layout)
+- [Keeping it clean: rules for forks and downstream releases](#keeping-it-clean-rules-for-forks-and-downstream-releases)
 - [License and legal](#license-and-legal)
 
 ---
@@ -205,6 +214,65 @@ Release scripts: `tools/release/build_release_macos.sh` (+ `IOS_SHELL=1` for the
 - `scripts/`: manifest derivation, XEX / STFS / ISO extraction
 - `docs/`: status, handoffs and process documents
 
+## Keeping it clean: rules for forks and downstream releases
+
+This project only works because it **never distributes Rockstar Games' or Microsoft's work**. The
+downloads contain our launcher, runtime, renderer and tools, and nothing from the game. Every player
+recompiles their own copy from their own discs. If you fork this repository, mirror the releases,
+package it for a store or distro, or share builds with friends, the same rules apply to you.
+
+### Never distribute any of these
+
+| What | Why it is Rockstar's / Microsoft's |
+|---|---|
+| Disc images (ISO), extracted disc folders, `default.xex` / `default.xexp`, `.rpf` archives, install packages | the game itself |
+| Title updates (`tu00000009_00000000`, `update.rpf`), or links to sites that host them | the game's executable and data |
+| Extracted assets: models, textures, audio, maps, scripts, text | the game's data |
+| **The generated C++** (the 811 files the codegen writes) | a mechanical translation of the game's code is still the game's code |
+| **Compiled game libraries**: `gtav_game.dll`, `gtav_game.so`, `gtav_game.dylib`, `libgtav_game.so`, or any exe or app with the game linked in | compiled game code |
+| **Game shaders in any form**: the originals, HLSL, SPIR-V (`data/spirv`), Metal, pipeline caches, a phone's `shader_cache` | translated game code |
+| **A `GTAV.ipa` or Android pack made by Build for iPhone / Android** | they contain your compiled game library and shaders |
+| Your game folder (`data/`), saves, memory dumps, GPU captures, traces, and logs that contain game memory | game data |
+
+Only the "empty" shells may be shared: the release packages, the iPhone shell (`ios/`) and the
+Android APK as they ship. They contain no game code, and they are useless without a game the player
+builds from their own discs.
+
+### Rules for working on the code
+
+- **Never use the leaked Rockstar source code**, not even for names, comments or structure. Work only
+  from your own analysis of your own copy of the game.
+- Don't commit anything game-derived, even temporarily. Git history is permanent, and a deleted
+  file stays downloadable from old commits.
+- Function addresses, sizes and hook names (our manifest, the codegen partition, `expected.txt`
+  hashes) are our own analysis and are fine. Code copied from the game is not, including code
+  pasted from a disassembly or from the generated C++.
+
+### Before you publish anything
+
+1. Build the release from a clean checkout with the release scripts in `tools/release/`.
+2. Run the taint scan on the finished package: `tools/release/scan_release.sh` (Linux),
+   `tools/release/scan_release_macos.sh` (macOS) or `tools\release\scan_release.cmd` (Windows).
+   It checks the package byte for byte against the generated code, a compiled game library and
+   the game's shaders, and it must pass. Explain any match it reports, as our release notes do.
+3. Unpack your own download and look at what is in it before you share the link.
+
+The process is described in [`docs/RELEASE_CLEANROOM.md`](docs/RELEASE_CLEANROOM.md).
+
+### Why this matters
+
+- **The GPL can't help you here.** The GNU GPL covers *our* code, and you may share and modify that
+  freely under its terms. It gives no rights to Rockstar's or Microsoft's work, because nobody here
+  owns them. Sharing a build with the game inside is copyright infringement by whoever shares it,
+  whatever license file sits next to it.
+- **Recompiling isn't a clean room.** The output of the recompiler is the game's code in another
+  form. It is legal for you to make it from a copy you own. It isn't legal to hand it to someone else.
+- **One bad mirror can end the project for everyone.** A takedown aimed at a build with game content
+  can take this repository with it.
+
+If you find game content in this repository, in a release, or in a fork that links here, please open
+an issue (without attaching the content) so it can be removed.
+
 ## License and legal
 
 This project is free software under the **GNU GPL, version 3 or later** (`LICENSE`). Bundled
@@ -213,7 +281,9 @@ release attaches the complete corresponding source.
 
 No Rockstar Games or Microsoft code, data, shaders or title-update files are in this repository or
 in any release, and the project never used leaked source code. What you make from your own discs is
-for you alone: don't share your game folder, your `GTAV.ipa` or your Android pack.
+for you alone: don't share your game folder, your `GTAV.ipa` or your Android pack (see
+[Keeping it clean](#keeping-it-clean-rules-for-forks-and-downstream-releases)). The GPL applies
+to this project's own code only; it grants no rights to Rockstar Games' or Microsoft's work.
 
 Grand Theft Auto V is a trademark of Take-Two Interactive Software. This project is not affiliated
 with or endorsed by Rockstar Games, Take-Two Interactive, Microsoft, Apple or Google.

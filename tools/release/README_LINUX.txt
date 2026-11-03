@@ -5,6 +5,16 @@ This package contains no game. It holds a launcher, an Xbox 360 runtime and the 
 your own copy of Grand Theft Auto V for Xbox 360 into a native Linux build on your computer.
 No Rockstar Games or Microsoft game code, data, shaders or title-update files are included.
 
+Do not share what you build
+---------------------------
+Everything this package makes from your discs is Rockstar Games' copyrighted work: the game
+folder (data/), the recompiled game library (gtav_game.*), the generated C++, the translated
+shaders (data/spirv, shader_cache), and the GTAV.ipa and Android pack made by "Build for iPhone"
+and "Build for Android". They are for your own devices only. Never upload, share or link them,
+and never add them to a fork or a release. The GPL license of this project covers its own code
+only; it gives no one the right to share Rockstar's. Rules for forks and downstream releases:
+https://github.com/andrewnakas/gtav-recomp#keeping-it-clean-rules-for-forks-and-downstream-releases
+
 What you need
 -------------
 - Your own Xbox 360 discs of GTA V: Disc 1 (Install) and Disc 2 (Play), as ISO images or as
