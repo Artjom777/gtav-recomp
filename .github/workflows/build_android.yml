@@ -221,21 +221,34 @@ jobs:
           fi
 
           if [ -f "assets/default.xex" ] && [ -f "assets/default.xexp" ]; then
-            echo "Found default.xex and default.xexp! Building gtav-android-pack.zip..."
-            cmake -S rexglue-sdk -B rexglue-sdk/out/build/host -G Ninja -DCMAKE_BUILD_TYPE=Release
+            echo "Found default.xex and default.xexp! Building host rexglue codegen tool..."
+            cmake -S rexglue-sdk -B rexglue-sdk/out/build/host -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_INSTALL_PREFIX="$PWD/rexglue-sdk/out/install/host" \
+              -DREXGLUE_BUILD_TESTS=OFF
             cmake --build rexglue-sdk/out/build/host --target rexglue -j$(nproc)
+            cmake --install rexglue-sdk/out/build/host || true
+
+            REXGLUE_BIN=$(find rexglue-sdk/out/build/host rexglue-sdk/out/install/host -name rexglue -type f -perm /111 2>/dev/null | head -n 1)
+            echo "Using rexglue binary at: $REXGLUE_BIN"
 
             mkdir -p generated/default
             cp tools/game_dll/codegen.partition.json generated/default/
-            ./rexglue-sdk/out/build/host/bin/rexglue codegen gtav/gtav_manifest.toml
+            "$REXGLUE_BIN" codegen gtav/gtav_manifest.toml
 
             mkdir -p artifacts/pack
-            LLVM_BIN=$(dirname $(find "$ANDROID_NDK_HOME" -name "aarch64-linux-android*-clang" | head -n 1))
-            python3 tools/game_dll/build_game_dll.py "$LLVM_BIN" generated/default build/android-poco-dll/game_interface artifacts/pack --android build/android-poco-dll
+            # Ensure required libraries (libgtav_fast.so and librexruntime.so) are in one directory for linking
+            mkdir -p build/link-android
+            cp artifacts/poco-x7-pro-libs/libgtav_fast.so build/link-android/
+            cp artifacts/poco-x7-pro-libs/librexruntime.so build/link-android/
 
-            SHELL_HASH=$(sha256sum build/android-poco-dll/libgtav_fast.so | cut -d' ' -f1)
-            echo "gtav-recomp android pack 1" > artifacts/pack/pack.txt
-            echo "shell $SHELL_HASH" >> artifacts/pack/pack.txt
+            LLVM_BIN=$(dirname $(find "$ANDROID_NDK_HOME" -name "aarch64-linux-android*-clang" | head -n 1))
+            python3 tools/game_dll/build_game_dll.py "$LLVM_BIN" generated/default build/android-poco-dll/game_interface artifacts/pack --android build/link-android
+
+            # Compute shell hash directly from the packaged APK to match SetupActivity verification
+            SHELL_HASH=$(unzip -p artifacts/gtav-recomp-poco-x7-pro.apk lib/arm64-v8a/libgtav_fast.so | sha256sum | cut -d' ' -f1)
+            echo "Pack shell hash: $SHELL_HASH"
+            printf "gtav-recomp android pack 1\nshell %s\n" "$SHELL_HASH" > artifacts/pack/pack.txt
             cp tools/release/expected.txt artifacts/pack/expected.txt
 
             (cd artifacts/pack && zip -r ../gtav-android-pack.zip libgtav_game.so pack.txt expected.txt)
