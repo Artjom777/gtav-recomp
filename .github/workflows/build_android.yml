@@ -230,7 +230,7 @@ jobs:
               -DCMAKE_C_COMPILER=clang \
               -DCMAKE_CXX_COMPILER=clang++ \
               -DCMAKE_C_FLAGS="-march=x86-64-v2" \
-              -DCMAKE_CXX_FLAGS="-march=x86-64-v2" \
+              -DCMAKE_CXX_FLAGS="-march=x86-64-v2 -D__cpp_concepts=202002L" \
               -DCMAKE_CXX_STANDARD=23 \
               -DREXGLUE_BUILD_TESTS=OFF \
               -DREXGLUE_ENABLE_TRACY=OFF \
@@ -243,6 +243,7 @@ jobs:
             fi
             echo "Using rexglue binary at: $REXGLUE_BIN"
             chmod +x "$REXGLUE_BIN"
+            export LD_LIBRARY_PATH="$(dirname "$REXGLUE_BIN"):$PWD/rexglue-sdk/out/linux-amd64:$LD_LIBRARY_PATH"
             "$REXGLUE_BIN" --version || true
 
             cp assets/default.xex gtav/assets/
