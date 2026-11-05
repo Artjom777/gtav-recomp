@@ -1,8 +1,9 @@
 # Runtime flags for the Android build (pushed to files/args.txt; GameActivity adds the data paths).
+env:GTAV_NATIVE_FETCH_RESOLVE=0
 --headless=true
 --log_level=info
 --gtav_native=on
---gtav_fps_limit=60
+--gtav_fps_limit=30
 --gpu_skip_rendering=true
 --gpu_skip_rendering_lag_ms=4
 --vsync=false
@@ -21,3 +22,5 @@
 --vulkan_require_vertex_pipeline_stores_and_atomics=false
 --vulkan_require_geometry_shader=false
 --vulkan_require_fill_mode_non_solid=false
+--gtav_native_save_missing_shaders=true
+--gtav_native_compile=false

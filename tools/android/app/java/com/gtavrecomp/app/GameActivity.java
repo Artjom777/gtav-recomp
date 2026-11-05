@@ -58,24 +58,32 @@ public class GameActivity extends SDLActivity {
             // whole big core spent in joystick detection); pads come through Android's input events.
             android.system.Os.setenv("SDL_ACCELEROMETER_AS_JOYSTICK", "0", true);
             android.system.Os.setenv("SDL_JOYSTICK_HIDAPI", "0", true);
+            // On Mali and mobile GPUs, fetch resolves in-pass can corrupt/hang rendering: force off by default
+            android.system.Os.setenv("GTAV_NATIVE_FETCH_RESOLVE", "0", true);
         } catch (Exception e) {
             Log.w(TAG, "setenv: " + e);
         }
         // args.txt env: lines before super.onCreate loads libmain.so: its static initializers read
         // some variables (GTAV_NATIVE_FETCH_RESOLVE), and getArguments runs only after the load.
-        File extra = new File(getExternalFilesDir(null), "args.txt");
-        if (extra.exists()) {
-            try (BufferedReader reader = new BufferedReader(new FileReader(extra))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    line = line.trim();
-                    if (line.startsWith("env:") && line.indexOf('=') > 4) {
-                        int eq = line.indexOf('=');
-                        android.system.Os.setenv(line.substring(4, eq), line.substring(eq + 1), true);
+        File[] candidateArgs = {
+            new File(getExternalFilesDir(null), "args.txt"),
+            new File("/storage/emulated/0/gtav/args.txt"),
+            new File("/sdcard/gtav/args.txt")
+        };
+        for (File extra : candidateArgs) {
+            if (extra.exists()) {
+                try (BufferedReader reader = new BufferedReader(new FileReader(extra))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        line = line.trim();
+                        if (line.startsWith("env:") && line.indexOf('=') > 4) {
+                            int eq = line.indexOf('=');
+                            android.system.Os.setenv(line.substring(4, eq), line.substring(eq + 1), true);
+                        }
                     }
+                } catch (Exception e) {
+                    Log.w(TAG, "args.txt env (" + extra + "): " + e);
                 }
-            } catch (Exception e) {
-                Log.w(TAG, "args.txt env: " + e);
             }
         }
         super.onCreate(savedInstanceState);
@@ -98,7 +106,7 @@ public class GameActivity extends SDLActivity {
 
     /** The release defaults (tools/android/args.txt): files/args.txt lines come after and win. */
     private static final String[] RELEASE_ARGS = {
-        "--headless=true", "--log_level=info", "--gtav_native=on", "--gtav_fps_limit=60",
+        "--headless=true", "--log_level=info", "--gtav_native=on", "--gtav_fps_limit=30",
         "--gpu_skip_rendering=true", "--gpu_skip_rendering_lag_ms=4", "--vsync=false",
         "--gtav_native_vsync=true", "--gtav_native_fps=true", "--vulkan_log_debug_messages=false",
         "--window_presenter=false", "--gtav_native_texture_budget_mb=768",
@@ -108,6 +116,8 @@ public class GameActivity extends SDLActivity {
         "--vulkan_require_vertex_pipeline_stores_and_atomics=false",
         "--vulkan_require_geometry_shader=false",
         "--vulkan_require_fill_mode_non_solid=false",
+        "--gtav_native_save_missing_shaders=true",
+        "--gtav_native_compile=false",
     };
 
     @Override
@@ -142,6 +152,14 @@ public class GameActivity extends SDLActivity {
             logDir.mkdirs();
             if (logDir.canWrite()) {
                 logFile = new File(logDir, "gtav.log").getAbsolutePath();
+            }
+            File spirvDir = new File(gtavDir, "spirv");
+            if (spirvDir.exists()) {
+                args.add("--gtav_native_spirv_dir=" + spirvDir.getAbsolutePath());
+            }
+            File dumpDir = new File(gtavDir, "shader_dump");
+            if (dumpDir.exists()) {
+                args.add("--gtav_native_shader_dump=" + dumpDir.getAbsolutePath());
             }
         }
         args.add("--log_file=" + logFile);
