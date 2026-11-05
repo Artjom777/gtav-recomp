@@ -2,19 +2,22 @@
 # Cross-compile the ReXGlue SDK (runtime libraries) for Android arm64-v8a with the NDK.
 # Usage: tools/android/build_sdk.sh [configure|build|install|all]   (default: all)
 set -e
-source ~/android-tools/env.sh
+if [ -f "$HOME/android-tools/env.sh" ]; then
+  source "$HOME/android-tools/env.sh"
+fi
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 SDK=$ROOT/rexglue-sdk
-BUILD=$SDK/out/build/android-arm64
-PREFIX=$SDK/out/install/android-arm64
-JOBS=${JOBS:-4}
+BUILD=${BUILD:-"$SDK/out/build/android-arm64"}
+PREFIX=${PREFIX:-"$SDK/out/install/android-arm64"}
+JOBS=${JOBS:-$(nproc 2>/dev/null || echo 4)}
+MARCH=${MARCH:-"armv8.2-a+lse+rcpc+dotprod"}
 step=${1:-all}
 if [ "$step" = configure ] || [ "$step" = all ]; then
   cmake -S "$SDK" -B "$BUILD" -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
     -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-30 -DANDROID_STL=c++_shared \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=23 \
-    -DCMAKE_C_FLAGS="-march=armv8.2-a+lse+rcpc+dotprod" -DCMAKE_CXX_FLAGS="-march=armv8.2-a+lse+rcpc+dotprod -fno-semantic-interposition" \
+    -DCMAKE_C_FLAGS="-march=${MARCH}" -DCMAKE_CXX_FLAGS="-march=${MARCH} -fno-semantic-interposition" \
     -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-Bsymbolic-functions" \
     -DCMAKE_INSTALL_PREFIX="$PREFIX" \
     -DREXGLUE_ENABLE_TRACY=OFF -DREXGLUE_BUILD_TESTS=OFF \

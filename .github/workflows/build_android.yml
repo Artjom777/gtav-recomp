@@ -1,0 +1,205 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main, master]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      build_poco:
+        description: 'Build optimized APK for POCO X7 Pro'
+        required: false
+        type: boolean
+        default: true
+      build_standard:
+        description: 'Build standard arm64-v8a APK'
+        required: false
+        type: boolean
+        default: true
+      create_release:
+        description: 'Create GitHub Release with artifacts'
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Android APKs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK & NDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "platform-tools platforms;android-34 build-tools;34.0.0 ndk;27.1.12297006"
+
+      - name: Install Host Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cmake python3 python3-pip clang lld libvulkan-dev spirv-tools rsync zip unzip
+
+      - name: Configure Environment
+        run: |
+          SDK_DIR=${ANDROID_HOME:-${ANDROID_SDK_ROOT}}
+          echo "ANDROID_HOME=${SDK_DIR}" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=${SDK_DIR}" >> $GITHUB_ENV
+
+          SDKMANAGER_PATH=$(find "$SDK_DIR/cmdline-tools" -name sdkmanager 2>/dev/null | head -n 1)
+          if [ -n "$SDKMANAGER_PATH" ]; then
+            SDKMANAGER_DIR=$(dirname "$SDKMANAGER_PATH")
+            echo "$SDKMANAGER_DIR" >> $GITHUB_PATH
+          fi
+
+          ANDROID_NDK_HOME=$(find ${SDK_DIR}/ndk -maxdepth 1 -mindepth 1 2>/dev/null | sort -V | tail -n 1)
+          echo "ANDROID_NDK_HOME=${ANDROID_NDK_HOME}" >> $GITHUB_ENV
+          echo "NDK_HOME=${ANDROID_NDK_HOME}" >> $GITHUB_ENV
+
+          mkdir -p ~/android-tools
+          cat << EOF > ~/android-tools/env.sh
+          export ANDROID_HOME=${SDK_DIR}
+          export ANDROID_NDK_HOME=${ANDROID_NDK_HOME}
+          export NDK_HOME=${ANDROID_NDK_HOME}
+          export PATH=${SDK_DIR}/platform-tools:\$PATH
+          EOF
+
+      - name: Clone and Patch Submodules & Dependencies
+        run: |
+          echo "=== Cloning and patching dependencies ==="
+          # 1. rexglue-sdk
+          git clone https://github.com/rexglue/rexglue-sdk rexglue-sdk
+          cd rexglue-sdk
+          git checkout f5337cd
+          git submodule update --init --recursive
+          git -C thirdparty/sdl3 apply ../../sdl3-gtav.patch
+          git -C thirdparty/FFmpeg apply ../../ffmpeg-gtav.patch
+          git apply ../rexglue-sdk-gtav-linux.patch
+          cd ..
+
+          # 2. plume
+          mkdir -p thirdparty
+          git clone --recursive https://github.com/renderbag/plume thirdparty/plume
+          git -C thirdparty/plume checkout 0ce184b
+          git -C thirdparty/plume apply ../../plume-gtav.patch
+
+          # 3. XenosRecomp
+          git clone --recursive https://github.com/hedge-dev/XenosRecomp thirdparty/XenosRecomp
+          git -C thirdparty/XenosRecomp checkout 990d03b
+          git -C thirdparty/XenosRecomp apply ../../xenosrecomp-gtav.patch
+          chmod +x thirdparty/XenosRecomp/thirdparty/dxc-bin/bin/x64/dxc-linux
+
+      - name: Build POCO X7 Pro Optimized APK (ARMv9.2-A / Cortex-A725)
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_poco }}
+        run: |
+          echo "=== Building POCO X7 Pro Optimized APK ==="
+          CLANG=$(find "$ANDROID_NDK_HOME" -name "aarch64-linux-android*-clang" | head -n 1)
+          POCO_MARCH="armv8.2-a+lse+rcpc+dotprod"
+          if "$CLANG" -march=armv9.2-a -E -x c /dev/null -o /dev/null 2>/dev/null; then
+            POCO_MARCH="armv9.2-a+lse+rcpc+dotprod"
+          elif "$CLANG" -march=armv9-a -E -x c /dev/null -o /dev/null 2>/dev/null; then
+            POCO_MARCH="armv9-a+lse+rcpc+dotprod"
+          fi
+          echo "POCO_MARCH: $POCO_MARCH"
+
+          # 1. Build SDK
+          BUILD=rexglue-sdk/out/build/android-poco PREFIX=rexglue-sdk/out/install/android-poco MARCH="$POCO_MARCH" ./tools/android/build_sdk.sh all
+
+          # 2. Build gtav libraries
+          mkdir -p build/android-poco-dll
+          cmake -S gtav -B build/android-poco-dll -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-30 -DANDROID_STL=c++_shared \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS="-march=$POCO_MARCH -O3 -fno-semantic-interposition" \
+            -DCMAKE_CXX_FLAGS="-march=$POCO_MARCH -O3 -fno-semantic-interposition" \
+            -DCMAKE_FIND_ROOT_PATH="$PWD/rexglue-sdk/out/install/android-poco" \
+            -Drexglue_DIR="$PWD/rexglue-sdk/out/install/android-poco/lib/cmake/rexglue" \
+            -DSDL3_DIR="$PWD/rexglue-sdk/out/install/android-poco/lib/cmake/SDL3" \
+            -DCMAKE_FIND_PACKAGE_NO_PACKAGE_REGISTRY=ON \
+            -DGTAV_GAME_DLL=ON
+          cmake --build build/android-poco-dll -j$(nproc)
+
+          # 3. Package APK
+          mkdir -p artifacts
+          RELEASE=1 APK_NAME=gtav-recomp-poco-x7-pro \
+            SDK_LIB="$PWD/rexglue-sdk/out/install/android-poco/lib" \
+            LIBS_OVERRIDE="$PWD/build/android-poco-dll/libmain.so $PWD/build/android-poco-dll/libgtav_fast.so $PWD/build/android-poco-dll/libgtav_setup.so" \
+            ./tools/android/build_apk.sh
+
+          cp build/android/apk/gtav-recomp-poco-x7-pro.apk artifacts/
+
+      - name: Build Standard ARM64 APK (arm64-v8a)
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_standard }}
+        run: |
+          echo "=== Building Standard ARM64 APK ==="
+          # 1. Build SDK
+          ./tools/android/build_sdk.sh all
+
+          # 2. Build gtav libraries
+          mkdir -p build/android-dll
+          cmake -S gtav -B build/android-dll -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-30 -DANDROID_STL=c++_shared \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_FIND_ROOT_PATH="$PWD/rexglue-sdk/out/install/android-arm64" \
+            -Drexglue_DIR="$PWD/rexglue-sdk/out/install/android-arm64/lib/cmake/rexglue" \
+            -DSDL3_DIR="$PWD/rexglue-sdk/out/install/android-arm64/lib/cmake/SDL3" \
+            -DCMAKE_FIND_PACKAGE_NO_PACKAGE_REGISTRY=ON \
+            -DGTAV_GAME_DLL=ON
+          cmake --build build/android-dll -j$(nproc)
+
+          # 3. Package standard APK
+          mkdir -p artifacts
+          RELEASE=1 APK_NAME=gtav-recomp-arm64-v8a ./tools/android/build_apk.sh
+          cp build/android/apk/gtav-recomp-arm64-v8a.apk artifacts/
+
+          # 4. Generate Android shell package
+          mkdir -p dist/android
+          ./tools/android/make_shell.sh dist/android
+          tar -czf artifacts/gtav-android-shell.tar.gz -C dist android
+
+      - name: Upload Android Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gtav-recomp-android-apks
+          path: artifacts/*
+
+      - name: Generate Release Tag
+        if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.create_release)
+        id: vars
+        run: |
+          echo "tag=android-$(date +'%Y%m%d%H%M')-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "date=$(date +'%Y-%m-%d %H:%M')" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.create_release)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.vars.outputs.tag }}
+          name: "GTA V Recomp Android Build (${{ steps.vars.outputs.date }})"
+          prerelease: false
+          make_latest: true
+          files: artifacts/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

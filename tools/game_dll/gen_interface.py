@@ -62,9 +62,14 @@ def write_if_changed(path, text):
 
 
 def find_tool(llvm_bin, names):
+    import shutil
     for n in names:
         p = os.path.join(llvm_bin, n)
         if os.path.isfile(p):
+            return p
+    for n in names:
+        p = shutil.which(n)
+        if p:
             return p
     sys.exit(f"gen_interface: none of {names} in {llvm_bin}")
 

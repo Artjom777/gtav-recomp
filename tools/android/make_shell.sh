@@ -15,10 +15,12 @@
 set -euo pipefail
 R="$(cd "$(dirname "$0")/../.." && pwd)"
 OUT=$1
-DLL=$R/build/android-dll
-source ~/android-tools/env.sh
-NM=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm
-READELF=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf
+DLL=${DLL:-"$R/build/android-dll"}
+if [ -f "$HOME/android-tools/env.sh" ]; then
+  source "$HOME/android-tools/env.sh"
+fi
+NM=$(find "$ANDROID_NDK_HOME" -name "llvm-nm" 2>/dev/null | head -n 1 || echo llvm-nm)
+READELF=$(find "$ANDROID_NDK_HOME" -name "llvm-readelf" 2>/dev/null | head -n 1 || echo llvm-readelf)
 
 # The shell must be the release layout: no recompiled game function defined anywhere in it.
 "$READELF" -d "$DLL/libgtav_fast.so" | grep -q "librexruntime.so" || { echo "no $DLL/libgtav_fast.so"; exit 1; }
