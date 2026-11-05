@@ -68,7 +68,9 @@ jobs:
       - name: Install Host Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build cmake python3 python3-pip clang lld libvulkan-dev spirv-tools rsync zip unzip
+          sudo apt-get install -y ninja-build cmake python3 python3-pip clang lld libvulkan-dev spirv-tools rsync zip unzip pkg-config \
+            libx11-xcb-dev libwayland-dev libgtk-3-dev libxss-dev libxkbcommon-dev libdecor-0-dev \
+            libasound2-dev libpulse-dev libpipewire-0.3-dev
 
       - name: Configure Environment
         run: |
@@ -229,6 +231,7 @@ jobs:
               -DCMAKE_CXX_COMPILER=clang++ \
               -DCMAKE_CXX_STANDARD=23 \
               -DREXGLUE_BUILD_TESTS=OFF \
+              -DREXGLUE_ENABLE_TRACY=OFF \
               -DSDL_X11_XSCRNSAVER=OFF
             cmake --build rexglue-sdk/out/build/host --target rexglue -j$(nproc)
 
