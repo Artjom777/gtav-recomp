@@ -36,8 +36,8 @@
 #include <TargetConditionals.h>
 #endif
 
-// iOS cannot start processes: every shader comes precompiled from the Mac (spirv dir).
-#if defined(__APPLE__) && TARGET_OS_IPHONE
+// iOS and Android cannot start processes: every shader comes precompiled (spirv dir).
+#if (defined(__APPLE__) && TARGET_OS_IPHONE) || defined(__ANDROID__)
 #define GTAV_NATIVE_COMPILE_DEFAULT false
 #else
 #define GTAV_NATIVE_COMPILE_DEFAULT true
@@ -105,7 +105,7 @@ bool Run(const std::vector<std::string>& args) {
   CloseHandle(pi.hThread);
   CloseHandle(pi.hProcess);
   return code == 0;
-#elif defined(__APPLE__) && TARGET_OS_IPHONE
+#elif (defined(__APPLE__) && TARGET_OS_IPHONE) || defined(__ANDROID__)
   (void)args;
   return false;
 #else
