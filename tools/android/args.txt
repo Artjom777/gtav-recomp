@@ -12,3 +12,6 @@
 --window_presenter=false
 # Phones have ~7 GB shared with the GPU: keep the texture cache smaller than desktop's 1 GB.
 --gtav_native_texture_budget_mb=384
+--vulkan_require_vertex_pipeline_stores_and_atomics=false
+--vulkan_require_geometry_shader=false
+--vulkan_require_fill_mode_non_solid=false

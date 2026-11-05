@@ -258,6 +258,21 @@ index e90418d..9f5d0f8 100644
  #ifndef REX_PLATFORM_WIN32
  #define REX_PLATFORM_WIN32 0
  #endif
+diff --git a/include/rex/system/map_parser.h b/include/rex/system/map_parser.h
+index 732b2f1..e1c3a0d 100644
+--- a/include/rex/system/map_parser.h
++++ b/include/rex/system/map_parser.h
+@@ -11,6 +11,10 @@
+ 
+ #pragma once
+ 
++#if defined(__clang__) && (!defined(__cpp_concepts) || __cpp_concepts < 202002L)
++#define __cpp_concepts 202002L
++#endif
++
+ #include <cstdint>
+ #include <expected>
+ #include <filesystem>
 diff --git a/include/rex/system/xobject.h b/include/rex/system/xobject.h
 index 0a43f07..a9bf21f 100644
 --- a/include/rex/system/xobject.h
@@ -2457,7 +2472,7 @@ index a53a222..087fada 100644
 +  return true;
 +}
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 001f36b..0a6a909 100644
+index 001f36b..b9f4fb3 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -10,6 +10,7 @@
@@ -2510,7 +2525,40 @@ index 001f36b..0a6a909 100644
  REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
                      "Read render-to-texture results on the CPU")
      .lifecycle(rex::cvar::Lifecycle::kHotReload);
-@@ -1066,6 +1095,10 @@ bool VulkanCommandProcessor::SetupContext() {
+@@ -924,16 +953,24 @@ bool VulkanCommandProcessor::SetupContext() {
+         "titles correctly");
+   }
+   if (!device_properties.fragmentStoresAndAtomics) {
+-    REXGPU_ERROR(
+-        "Vulkan fragmentStoresAndAtomics is required for GPU emulation and "
+-        "D3D12 parity, but unsupported by the selected device");
+-    return false;
++    if (REXCVAR_GET(vulkan_require_fragment_stores_and_atomics)) {
++      REXGPU_ERROR(
++          "Vulkan fragmentStoresAndAtomics is required for GPU emulation and "
++          "D3D12 parity, but unsupported by the selected device");
++      return false;
++    }
++    REXGPU_WARN("Vulkan fragmentStoresAndAtomics is not supported by the device");
+   }
+   if (!device_properties.vertexPipelineStoresAndAtomics) {
+-    REXGPU_ERROR(
+-        "Vulkan vertexPipelineStoresAndAtomics is required for GPU emulation and "
+-        "D3D12 parity, but unsupported by the selected device");
+-    return false;
++    if (REXCVAR_GET(vulkan_require_vertex_pipeline_stores_and_atomics)) {
++      REXGPU_ERROR(
++          "Vulkan vertexPipelineStoresAndAtomics is required for GPU emulation and "
++          "D3D12 parity, but unsupported by the selected device");
++      return false;
++    }
++    REXGPU_WARN(
++        "Vulkan vertexPipelineStoresAndAtomics is not supported by the device; "
++        "vertex pipeline stores will fall back to compute");
+   }
+   if (!device_properties.geometryShader) {
+     if (REXCVAR_GET(vulkan_require_geometry_shader)) {
+@@ -1066,6 +1103,10 @@ bool VulkanCommandProcessor::SetupContext() {
      shared_memory_descriptor_buffer_info.buffer = shared_memory_->buffer();
      shared_memory_descriptor_buffer_info.offset = shared_memory_binding_range * i;
      shared_memory_descriptor_buffer_info.range = shared_memory_binding_range;
@@ -2521,7 +2569,7 @@ index 001f36b..0a6a909 100644
    }
    VkWriteDescriptorSet write_descriptor_sets[2];
    VkWriteDescriptorSet& write_descriptor_set_shared_memory = write_descriptor_sets[0];
-@@ -2275,7 +2308,13 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+@@ -2275,7 +2316,13 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
    vertex_buffers_in_sync_[0] = 0;
    vertex_buffers_in_sync_[1] = 0;
  
@@ -2536,7 +2584,7 @@ index 001f36b..0a6a909 100644
      return;
    ui::Presenter* presenter = graphics_system_->presenter();
    if (!presenter) {
-@@ -3594,8 +3633,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3594,8 +3641,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    SCOPE_profile_cpu_f("gpu");
  #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
  
@@ -2549,7 +2597,7 @@ index 001f36b..0a6a909 100644
    auto draw_fail = [&](const char* stage) {
      auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
      REXGPU_ERROR(
-@@ -4385,6 +4428,9 @@ bool VulkanCommandProcessor::IssueCopy() {
+@@ -4385,6 +4436,9 @@ bool VulkanCommandProcessor::IssueCopy() {
  #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
    SCOPE_profile_cpu_f("gpu");
  #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -2559,7 +2607,7 @@ index 001f36b..0a6a909 100644
  
    if (!BeginSubmission(true)) {
      return false;
-@@ -4400,6 +4446,64 @@ bool VulkanCommandProcessor::IssueCopy() {
+@@ -4400,6 +4454,64 @@ bool VulkanCommandProcessor::IssueCopy() {
    return IssueCopy_ReadbackResolvePath();
  }
  
@@ -2624,7 +2672,7 @@ index 001f36b..0a6a909 100644
  bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
    const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
-@@ -4682,6 +4786,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
+@@ -4682,6 +4794,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
      uint8_t* destination = memory_->TranslatePhysical(written_address);
      if (destination) {
        std::memcpy(destination, readback.mapped_data[read_index], written_length);
@@ -3215,6 +3263,58 @@ index 0000000..913511e
 +
 +}  // namespace ui
 +}  // namespace rex
+diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
+index 8197bb4..c1a9a3a 100644
+--- a/src/ui/vulkan/vulkan_device.cpp
++++ b/src/ui/vulkan/vulkan_device.cpp
+@@ -23,20 +23,19 @@
+ #include <rex/ui/vulkan/device.h>
+ 
+ REXCVAR_DEFINE_BOOL(vulkan_require_fragment_stores_and_atomics, true, "UI/Vulkan",
+-                    "Deprecated and ignored for parity; fragmentStoresAndAtomics is always "
+-                    "required for Vulkan GPU emulation")
++                    "Require fragmentStoresAndAtomics support for Vulkan GPU emulation")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+-REXCVAR_DEFINE_BOOL(vulkan_require_vertex_pipeline_stores_and_atomics, true, "UI/Vulkan",
+-                    "Deprecated and ignored for parity; vertexPipelineStoresAndAtomics is always "
+-                    "required for Vulkan GPU emulation")
++REXCVAR_DEFINE_BOOL(vulkan_require_vertex_pipeline_stores_and_atomics,
++                    !REX_PLATFORM_MAC && !REX_PLATFORM_ANDROID, "UI/Vulkan",
++                    "Require vertexPipelineStoresAndAtomics support for Vulkan GPU emulation")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+-// Apple Silicon / MoltenVK does not expose geometryShader or fillModeNonSolid;
+-// default both to false on macOS so the device can still be selected.
+-REXCVAR_DEFINE_BOOL(vulkan_require_geometry_shader, !REX_PLATFORM_MAC, "UI/Vulkan",
++// Apple Silicon / MoltenVK and Android / Mali GPUs do not expose geometryShader or fillModeNonSolid;
++// default both to false on macOS and Android so the device can still be selected.
++REXCVAR_DEFINE_BOOL(vulkan_require_geometry_shader, !REX_PLATFORM_MAC && !REX_PLATFORM_ANDROID, "UI/Vulkan",
+                     "Require geometryShader support for Vulkan GPU emulation (disable to allow "
+                     "fallback primitive emulation paths)")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+-REXCVAR_DEFINE_BOOL(vulkan_require_fill_mode_non_solid, !REX_PLATFORM_MAC, "UI/Vulkan",
++REXCVAR_DEFINE_BOOL(vulkan_require_fill_mode_non_solid, !REX_PLATFORM_MAC && !REX_PLATFORM_ANDROID, "UI/Vulkan",
+                     "Require fillModeNonSolid support for Vulkan GPU emulation (disable to "
+                     "allow fallback to solid fill for line/point polygon modes)")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+@@ -109,14 +108,16 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+           properties.deviceName);
+       return nullptr;
+     }
+-    if (!supported_features.fragmentStoresAndAtomics) {
++    if (REXCVAR_GET(vulkan_require_fragment_stores_and_atomics) &&
++        !supported_features.fragmentStoresAndAtomics) {
+       REXLOG_WARN(
+           "Vulkan device '{}' doesn't support fragmentStoresAndAtomics, which "
+           "is required for Vulkan GPU emulation parity",
+           properties.deviceName);
+       return nullptr;
+     }
+-    if (!supported_features.vertexPipelineStoresAndAtomics) {
++    if (REXCVAR_GET(vulkan_require_vertex_pipeline_stores_and_atomics) &&
++        !supported_features.vertexPipelineStoresAndAtomics) {
+       REXLOG_WARN(
+           "Vulkan device '{}' doesn't support vertexPipelineStoresAndAtomics, which "
+           "is required for Vulkan GPU emulation parity",
 diff --git a/src/ui/vulkan/vulkan_instance.cpp b/src/ui/vulkan/vulkan_instance.cpp
 index 914b311..0c76c51 100644
 --- a/src/ui/vulkan/vulkan_instance.cpp
@@ -3506,18 +3606,3 @@ index 0000000..b961317
 +#include "imgui_rex_config.h"
 +
 +thread_local ImGuiContext* RexImGuiContextTLS = nullptr;
-diff --git a/include/rex/system/map_parser.h b/include/rex/system/map_parser.h
---- a/include/rex/system/map_parser.h
-+++ b/include/rex/system/map_parser.h
-@@ -12,6 +12,10 @@
-  */
- 
- #pragma once
-+
-+#if defined(__clang__) && (!defined(__cpp_concepts) || __cpp_concepts < 202002L)
-+#define __cpp_concepts 202002L
-+#endif
- 
- #include <cstdint>
- #include <expected>
-

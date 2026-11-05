@@ -102,6 +102,9 @@ public class GameActivity extends SDLActivity {
         "--gpu_skip_rendering=true", "--gpu_skip_rendering_lag_ms=6", "--vsync=false",
         "--gtav_native_vsync=true", "--vulkan_log_debug_messages=false", "--window_presenter=false",
         "--gtav_native_texture_budget_mb=384",
+        "--vulkan_require_vertex_pipeline_stores_and_atomics=false",
+        "--vulkan_require_geometry_shader=false",
+        "--vulkan_require_fill_mode_non_solid=false",
     };
 
     @Override
@@ -143,6 +146,12 @@ public class GameActivity extends SDLActivity {
         args.add("--log_max_files=2");
 
         File extra = new File(files, "args.txt");
+        if (!extra.exists() && gtavDir.exists()) {
+            File externalArgs = new File(gtavDir, "args.txt");
+            if (externalArgs.exists()) {
+                extra = externalArgs;
+            }
+        }
         if (extra.exists()) {
             try (BufferedReader reader = new BufferedReader(new FileReader(extra))) {
                 String line;
