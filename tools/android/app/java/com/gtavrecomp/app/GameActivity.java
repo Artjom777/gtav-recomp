@@ -98,10 +98,13 @@ public class GameActivity extends SDLActivity {
 
     /** The release defaults (tools/android/args.txt): files/args.txt lines come after and win. */
     private static final String[] RELEASE_ARGS = {
-        "--headless=true", "--log_level=info", "--gtav_native=on", "--gtav_fps_limit=0",
-        "--gpu_skip_rendering=true", "--gpu_skip_rendering_lag_ms=6", "--vsync=false",
-        "--gtav_native_vsync=true", "--vulkan_log_debug_messages=false", "--window_presenter=false",
-        "--gtav_native_texture_budget_mb=384",
+        "--headless=true", "--log_level=info", "--gtav_native=on", "--gtav_fps_limit=60",
+        "--gpu_skip_rendering=true", "--gpu_skip_rendering_lag_ms=4", "--vsync=false",
+        "--gtav_native_vsync=true", "--gtav_native_fps=true", "--vulkan_log_debug_messages=false",
+        "--window_presenter=false", "--gtav_native_texture_budget_mb=768",
+        "--gtav_native_fetch_resolves=false", "--gtav_native_rect_gs=false",
+        "--gtav_native_render_scale=1.0", "--gtav_android_main_prime=true",
+        "--audio_maxqframes=32", "--audio_device_frames=512", "--audio_force_stereo=true",
         "--vulkan_require_vertex_pipeline_stores_and_atomics=false",
         "--vulkan_require_geometry_shader=false",
         "--vulkan_require_fill_mode_non_solid=false",
@@ -146,11 +149,9 @@ public class GameActivity extends SDLActivity {
         args.add("--log_max_files=2");
 
         File extra = new File(files, "args.txt");
-        if (!extra.exists() && gtavDir.exists()) {
-            File externalArgs = new File(gtavDir, "args.txt");
-            if (externalArgs.exists()) {
-                extra = externalArgs;
-            }
+        File externalArgs = new File(gtavDir, "args.txt");
+        if (externalArgs.exists()) {
+            extra = externalArgs;
         }
         if (extra.exists()) {
             try (BufferedReader reader = new BufferedReader(new FileReader(extra))) {

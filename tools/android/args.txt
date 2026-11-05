@@ -1,17 +1,23 @@
 # Runtime flags for the Android build (pushed to files/args.txt; GameActivity adds the data paths).
-# Same as play.sh's native "on" mode.
 --headless=true
 --log_level=info
 --gtav_native=on
---gtav_fps_limit=0
+--gtav_fps_limit=60
 --gpu_skip_rendering=true
---gpu_skip_rendering_lag_ms=6
+--gpu_skip_rendering_lag_ms=4
 --vsync=false
 --gtav_native_vsync=true
+--gtav_native_fps=true
 --vulkan_log_debug_messages=false
 --window_presenter=false
-# Phones have ~7 GB shared with the GPU: keep the texture cache smaller than desktop's 1 GB.
---gtav_native_texture_budget_mb=384
+--gtav_native_texture_budget_mb=768
+--gtav_native_fetch_resolves=false
+--gtav_native_rect_gs=false
+--gtav_native_render_scale=1.0
+--gtav_android_main_prime=true
+--audio_maxqframes=32
+--audio_device_frames=512
+--audio_force_stereo=true
 --vulkan_require_vertex_pipeline_stores_and_atomics=false
 --vulkan_require_geometry_shader=false
 --vulkan_require_fill_mode_non_solid=false
