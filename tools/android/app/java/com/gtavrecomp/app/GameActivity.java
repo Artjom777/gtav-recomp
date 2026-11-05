@@ -6,7 +6,9 @@ import android.view.WindowManager;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.FileReader;
+import java.io.PrintStream;
 import java.util.ArrayList;
 
 import org.libsdl.app.SDLActivity;
@@ -21,8 +23,33 @@ import org.libsdl.app.SDLActivity;
 public class GameActivity extends SDLActivity {
     private static final String TAG = "GtavRecomp";
 
+    private static void writeCrashLog(String msg, Throwable t) {
+        String[] paths = {
+            "/storage/emulated/0/gtav/crash.log",
+            "/sdcard/gtav_crash.log"
+        };
+        for (String p : paths) {
+            try {
+                File f = new File(p);
+                f.getParentFile().mkdirs();
+                try (PrintStream ps = new PrintStream(new FileOutputStream(f, true))) {
+                    ps.println("=== CRASH LOG ===");
+                    if (msg != null) ps.println(msg);
+                    if (t != null) t.printStackTrace(ps);
+                    ps.println();
+                }
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        Thread.setDefaultUncaughtExceptionHandler((thread, throwable) -> {
+            Log.e(TAG, "Uncaught exception in " + thread.getName(), throwable);
+            writeCrashLog("Uncaught exception in thread " + thread.getName(), throwable);
+        });
+
         // SDL picks the orientation from the window it creates (the runtime's is resizable, so
         // portrait was allowed): the game is landscape only.
         try {
@@ -100,9 +127,21 @@ public class GameActivity extends SDLActivity {
             for (String a : RELEASE_ARGS) args.add(a);
         }
         args.add("--gpu_plugin=xenos");
-        args.add("--log_file=" + root + "/logs/gtav.log");
+
+        // Prefer writing log directly to /storage/emulated/0/gtav/logs/gtav.log if available
+        File gtavDir = new File("/storage/emulated/0/gtav");
+        String logFile = root + "/logs/gtav.log";
+        if (gtavDir.exists()) {
+            File logDir = new File(gtavDir, "logs");
+            logDir.mkdirs();
+            if (logDir.canWrite()) {
+                logFile = new File(logDir, "gtav.log").getAbsolutePath();
+            }
+        }
+        args.add("--log_file=" + logFile);
         args.add("--log_max_file_size_mb=256");
         args.add("--log_max_files=2");
+
         File extra = new File(files, "args.txt");
         if (extra.exists()) {
             try (BufferedReader reader = new BufferedReader(new FileReader(extra))) {
@@ -128,7 +167,20 @@ public class GameActivity extends SDLActivity {
             byName.put(name, a);
         }
         args = new ArrayList<>(byName.values());
-        Log.i(TAG, "arguments: " + String.join(" ", args));
+        String fullCmd = String.join(" ", args);
+        Log.i(TAG, "arguments: " + fullCmd);
+
+        // Record launch arguments
+        try {
+            File launchLog = new File("/storage/emulated/0/gtav/launch.log");
+            launchLog.getParentFile().mkdirs();
+            try (PrintStream ps = new PrintStream(new FileOutputStream(launchLog, false))) {
+                ps.println("=== Launch Arguments ===");
+                ps.println(fullCmd);
+            }
+        } catch (Exception ignored) {
+        }
+
         return args.toArray(new String[0]);
     }
 }

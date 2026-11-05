@@ -37,7 +37,7 @@ rm -rf classes stage && mkdir -p classes stage/lib/arm64-v8a
 
 javac --release 17 -nowarn -classpath "$JAR" -d classes \
   $(find "$SDL_JAVA" "$APP/java" -name '*.java') 2>&1 | grep -v "^Note:" || true
-"$BT/d8" --release --min-api 30 --lib "$JAR" --output stage $(find classes -name '*.class')
+"$BT/d8" --release --min-api 28 --lib "$JAR" --output stage $(find classes -name '*.class')
 
 MANIFEST=$APP/AndroidManifest.xml
 NAME=${APK_NAME:-gtav-recomp}
@@ -54,7 +54,7 @@ if [ -n "${LIBS_OVERRIDE:-}" ]; then
   read -r -a LIBS <<< "$LIBS_OVERRIDE"
 fi
 "$BT/aapt2" link -o base.apk --manifest "$MANIFEST" -I "$JAR" \
-  --min-sdk-version 30 --target-sdk-version 34
+  --min-sdk-version 28 --target-sdk-version 28
 
 cp "${LIBS[@]}" "$SDK_LIB/librexruntime.so" "$SDK_LIB/librexgpu-xenos.so" \
    "$NDK_LIBCXX" stage/lib/arm64-v8a/

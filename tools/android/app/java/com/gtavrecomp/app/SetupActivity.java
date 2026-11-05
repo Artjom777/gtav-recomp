@@ -134,24 +134,33 @@ public class SetupActivity extends Activity {
         File lib = new File(getFilesDir(), "libgtav_game.so");
         File info = new File(packDir(), "pack.txt");
         if (!lib.exists() || !info.exists()) return "No game pack yet.";
-        String shell = readShell(info);
         String mine = sha256(new File(getApplicationInfo().nativeLibraryDir, "libgtav_fast.so"));
-        if (shell == null || !shell.equals(mine))
+        Log.i(TAG, "Checking game pack. Installed libgtav_fast.so SHA-256: " + mine);
+        if (!matchShell(info, mine)) {
+            Log.w(TAG, "Game pack mismatch. Native hash=" + mine);
             return "The game pack was made for another version of this app: run Build for Android "
                 + "again with the download that has this APK.";
+        }
         return null;
     }
 
-    private static String readShell(File info) {
+    private static boolean matchShell(File info, String mine) {
+        if (mine == null) return false;
         try (BufferedReader r = new BufferedReader(new FileReader(info))) {
             String line;
             while ((line = r.readLine()) != null) {
-                if (line.startsWith("shell ")) return line.substring(6).trim();
+                line = line.trim();
+                if (line.startsWith("shell ")) {
+                    String shell = line.substring(6).trim();
+                    if (shell.equalsIgnoreCase("any") || shell.equalsIgnoreCase(mine)) {
+                        return true;
+                    }
+                }
             }
         } catch (Exception e) {
             Log.w(TAG, "pack.txt: " + e);
         }
-        return null;
+        return false;
     }
 
     private static String sha256(File f) {
@@ -385,6 +394,8 @@ public class SetupActivity extends Activity {
         lib.delete();
         File staged = new File(stage, "libgtav_game.so");
         if (!staged.renameTo(lib)) return "Could not put the game library in place.";
+        lib.setReadable(true, false);
+        lib.setExecutable(true, false);
         lib.setReadOnly();
         deleteTree(packDir());
         if (!stage.renameTo(packDir())) return "Could not put the game pack in place.";

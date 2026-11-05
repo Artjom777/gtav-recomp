@@ -261,24 +261,48 @@ jobs:
             echo "Codegen output directory: $GEN_DIR"
             ls -la "$GEN_DIR" | head -n 20
 
-            mkdir -p artifacts/pack
-            mkdir -p build/link-android
-            cp artifacts/poco-x7-pro-libs/libgtav_fast.so build/link-android/
-            cp artifacts/poco-x7-pro-libs/librexruntime.so build/link-android/
-
             LLVM_BIN=$(dirname $(find "$ANDROID_NDK_HOME" -name "aarch64-linux-android*-clang" | head -n 1))
             echo "Using LLVM_BIN: $LLVM_BIN"
-            python3 tools/game_dll/build_game_dll.py "$LLVM_BIN" "$GEN_DIR" build/android-poco-dll/game_interface artifacts/pack --android build/link-android
 
-            # Compute shell hash directly from the packaged APK to match SetupActivity verification
-            SHELL_HASH=$(unzip -p artifacts/gtav-recomp-poco-x7-pro.apk lib/arm64-v8a/libgtav_fast.so | sha256sum | cut -d' ' -f1)
-            echo "Pack shell hash: $SHELL_HASH"
-            printf "gtav-recomp android pack 1\nshell %s\n" "$SHELL_HASH" > artifacts/pack/pack.txt
-            cp tools/release/expected.txt artifacts/pack/expected.txt
+            # 1. Build POCO game pack
+            mkdir -p artifacts/pack-poco
+            mkdir -p build/link-android-poco
+            cp artifacts/poco-x7-pro-libs/libgtav_fast.so build/link-android-poco/
+            cp artifacts/poco-x7-pro-libs/librexruntime.so build/link-android-poco/
 
-            (cd artifacts/pack && zip -r ../gtav-android-pack.zip libgtav_game.so pack.txt expected.txt)
-            echo "Created artifacts/gtav-android-pack.zip successfully!"
-            ls -lh artifacts/gtav-android-pack.zip
+            echo "=== Building POCO X7 Pro game DLL ==="
+            python3 tools/game_dll/build_game_dll.py "$LLVM_BIN" "$GEN_DIR" build/android-poco-dll/game_interface artifacts/pack-poco --android build/link-android-poco
+
+            # 2. Build Standard ARM64 game pack (reusing compiled object files)
+            mkdir -p artifacts/pack-arm64
+            mkdir -p build/link-android-arm64
+            cp artifacts/arm64-v8a-libs/libgtav_fast.so build/link-android-arm64/
+            cp artifacts/arm64-v8a-libs/librexruntime.so build/link-android-arm64/
+            cp -r artifacts/pack-poco/obj artifacts/pack-arm64/obj
+
+            echo "=== Linking Standard ARM64 game DLL ==="
+            python3 tools/game_dll/build_game_dll.py "$LLVM_BIN" "$GEN_DIR" build/android-dll/game_interface artifacts/pack-arm64 --android build/link-android-arm64
+
+            # 3. Compute shell hashes from both packaged APKs
+            POCO_HASH=$(unzip -p artifacts/gtav-recomp-poco-x7-pro.apk lib/arm64-v8a/libgtav_fast.so | sha256sum | cut -d' ' -f1)
+            ARM64_HASH=$(unzip -p artifacts/gtav-recomp-arm64-v8a.apk lib/arm64-v8a/libgtav_fast.so | sha256sum | cut -d' ' -f1)
+            echo "POCO shell hash: $POCO_HASH"
+            echo "ARM64 shell hash: $ARM64_HASH"
+
+            # 4. Write pack.txt with BOTH hashes so any pack is recognized by both APKs
+            printf "gtav-recomp android pack 1\nshell %s\nshell %s\n" "$POCO_HASH" "$ARM64_HASH" > artifacts/pack-poco/pack.txt
+            cp tools/release/expected.txt artifacts/pack-poco/expected.txt
+
+            printf "gtav-recomp android pack 1\nshell %s\nshell %s\n" "$POCO_HASH" "$ARM64_HASH" > artifacts/pack-arm64/pack.txt
+            cp tools/release/expected.txt artifacts/pack-arm64/expected.txt
+
+            # 5. Package zip files
+            (cd artifacts/pack-poco && zip -r ../gtav-android-pack-poco-x7-pro.zip libgtav_game.so pack.txt expected.txt)
+            (cd artifacts/pack-arm64 && zip -r ../gtav-android-pack-arm64-v8a.zip libgtav_game.so pack.txt expected.txt)
+            cp artifacts/gtav-android-pack-poco-x7-pro.zip artifacts/gtav-android-pack.zip
+
+            echo "=== Created game packs successfully! ==="
+            ls -lh artifacts/gtav-android-pack*.zip
           else
             echo "No default.xex / default.xexp provided. Skipping gtav-android-pack.zip build."
           fi
