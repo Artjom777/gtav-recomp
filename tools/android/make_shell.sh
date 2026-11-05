@@ -27,8 +27,10 @@ READELF=$(find "$ANDROID_NDK_HOME" -name "llvm-readelf" 2>/dev/null | head -n 1 
 defined=$("$NM" -D --defined-only "$DLL/libgtav_fast.so" | grep -c -E " __imp__sub_[0-9A-F]{8}$" || true)
 [ "$defined" = 0 ] || { echo "libgtav_fast.so defines $defined game functions: not the shell build"; exit 1; }
 
-RELEASE=1 "$R/tools/android/build_apk.sh" >/dev/null
-APK=$R/build/android/apk/gtav-recomp-release.apk
+APK=${APK:-"$R/build/android/apk/gtav-recomp-release.apk"}
+if [ ! -f "$APK" ]; then
+  RELEASE=1 "$R/tools/android/build_apk.sh" >/dev/null
+fi
 rm -rf "$OUT/link" "$OUT/interface" "$OUT/include" "$OUT/LICENSES" "$OUT/GTAV.apk"
 mkdir -p "$OUT/link" "$OUT/interface" "$OUT/include" "$OUT/LICENSES"
 cp "$APK" "$OUT/GTAV.apk"

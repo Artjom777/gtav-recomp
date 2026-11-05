@@ -29,5 +29,6 @@ fi
 if [ "$step" = install ] || [ "$step" = all ]; then
   cmake --install "$BUILD"
   # The install registers its prefix in ~/.cmake/packages; a host configure must never find it.
-  grep -l "android-arm64" ~/.cmake/packages/rexglue/* 2>/dev/null | xargs -r -I{} mv {} "$BUILD/registry-entry"
+  mkdir -p "$BUILD"
+  grep -l -E "android" ~/.cmake/packages/rexglue/* 2>/dev/null | xargs -r -I{} mv {} "$BUILD/registry-entry" || true
 fi

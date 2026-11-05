@@ -34,7 +34,7 @@ permissions:
 
 jobs:
   build:
-    name: Build Android APKs
+    name: Build Android APKs & Libraries
     runs-on: ubuntu-latest
 
     steps:
@@ -87,52 +87,53 @@ jobs:
       - name: Clone and Patch Submodules & Dependencies
         run: |
           echo "=== Cloning and patching dependencies ==="
+          ROOT="$GITHUB_WORKSPACE"
+
           # 1. rexglue-sdk
           git clone https://github.com/rexglue/rexglue-sdk rexglue-sdk
-          cd rexglue-sdk
-          git checkout f5337cd
-          git submodule update --init --recursive
-          git -C thirdparty/sdl3 apply ../../sdl3-gtav.patch
-          git -C thirdparty/FFmpeg apply ../../ffmpeg-gtav.patch
-          git apply ../rexglue-sdk-gtav-linux.patch
-          cd ..
+          git -C rexglue-sdk checkout f5337cd
+          git -C rexglue-sdk submodule update --init --recursive
+          git -C rexglue-sdk/thirdparty/sdl3 apply "$ROOT/sdl3-gtav.patch"
+          git -C rexglue-sdk/thirdparty/FFmpeg apply "$ROOT/ffmpeg-gtav.patch"
+          git -C rexglue-sdk apply "$ROOT/rexglue-sdk-gtav-linux.patch"
 
           # 2. plume
           mkdir -p thirdparty
           git clone --recursive https://github.com/renderbag/plume thirdparty/plume
           git -C thirdparty/plume checkout 0ce184b
-          git -C thirdparty/plume apply ../../plume-gtav.patch
+          git -C thirdparty/plume apply "$ROOT/plume-gtav.patch"
 
           # 3. XenosRecomp
           git clone --recursive https://github.com/hedge-dev/XenosRecomp thirdparty/XenosRecomp
           git -C thirdparty/XenosRecomp checkout 990d03b
-          git -C thirdparty/XenosRecomp apply ../../xenosrecomp-gtav.patch
+          git -C thirdparty/XenosRecomp apply "$ROOT/xenosrecomp-gtav.patch"
           chmod +x thirdparty/XenosRecomp/thirdparty/dxc-bin/bin/x64/dxc-linux
 
-      - name: Build POCO X7 Pro Optimized APK (ARMv9.2-A / Cortex-A725)
+      - name: Build POCO X7 Pro Optimized APK & Libraries (ARMv9.2-A / Cortex-A725)
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_poco }}
         run: |
-          echo "=== Building POCO X7 Pro Optimized APK ==="
+          echo "=== Building POCO X7 Pro Optimized APK and Libraries ==="
           CLANG=$(find "$ANDROID_NDK_HOME" -name "aarch64-linux-android*-clang" | head -n 1)
           POCO_MARCH="armv8.2-a+lse+rcpc+dotprod"
           if "$CLANG" -march=armv9.2-a -E -x c /dev/null -o /dev/null 2>/dev/null; then
-            POCO_MARCH="armv9.2-a+lse+rcpc+dotprod"
+            POCO_MARCH="armv9.2-a"
           elif "$CLANG" -march=armv9-a -E -x c /dev/null -o /dev/null 2>/dev/null; then
-            POCO_MARCH="armv9-a+lse+rcpc+dotprod"
+            POCO_MARCH="armv9-a"
           fi
           echo "POCO_MARCH: $POCO_MARCH"
 
-          # 1. Build SDK
+          # 1. Build SDK for POCO
           BUILD=rexglue-sdk/out/build/android-poco PREFIX=rexglue-sdk/out/install/android-poco MARCH="$POCO_MARCH" ./tools/android/build_sdk.sh all
 
-          # 2. Build gtav libraries
+          # 2. Build gtav libraries for POCO
           mkdir -p build/android-poco-dll
           cmake -S gtav -B build/android-poco-dll -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
             -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-30 -DANDROID_STL=c++_shared \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_FLAGS="-march=$POCO_MARCH -O3 -fno-semantic-interposition" \
-            -DCMAKE_CXX_FLAGS="-march=$POCO_MARCH -O3 -fno-semantic-interposition" \
+            -DGTAV_ARM64_MARCH="$POCO_MARCH" \
+            -DCMAKE_C_FLAGS="-O3 -fno-semantic-interposition" \
+            -DCMAKE_CXX_FLAGS="-O3 -fno-semantic-interposition" \
             -DCMAKE_FIND_ROOT_PATH="$PWD/rexglue-sdk/out/install/android-poco" \
             -Drexglue_DIR="$PWD/rexglue-sdk/out/install/android-poco/lib/cmake/rexglue" \
             -DSDL3_DIR="$PWD/rexglue-sdk/out/install/android-poco/lib/cmake/SDL3" \
@@ -140,7 +141,7 @@ jobs:
             -DGTAV_GAME_DLL=ON
           cmake --build build/android-poco-dll -j$(nproc)
 
-          # 3. Package APK
+          # 3. Package POCO APK
           mkdir -p artifacts
           RELEASE=1 APK_NAME=gtav-recomp-poco-x7-pro \
             SDK_LIB="$PWD/rexglue-sdk/out/install/android-poco/lib" \
@@ -149,10 +150,16 @@ jobs:
 
           cp build/android/apk/gtav-recomp-poco-x7-pro.apk artifacts/
 
-      - name: Build Standard ARM64 APK (arm64-v8a)
+          # 4. Export compiled native shared libraries (.so)
+          mkdir -p artifacts/poco-x7-pro-libs
+          cp build/android/apk/libs/gtav-recomp-poco-x7-pro/*.so artifacts/poco-x7-pro-libs/
+          (cd artifacts/poco-x7-pro-libs && zip -r ../gtav-libs-poco-x7-pro.zip ./*.so)
+          tar -czf artifacts/gtav-libs-poco-x7-pro.tar.gz -C artifacts/poco-x7-pro-libs .
+
+      - name: Build Standard ARM64 APK & Libraries (arm64-v8a)
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_standard }}
         run: |
-          echo "=== Building Standard ARM64 APK ==="
+          echo "=== Building Standard ARM64 APK and Libraries ==="
           # 1. Build SDK
           ./tools/android/build_sdk.sh all
 
@@ -174,16 +181,30 @@ jobs:
           RELEASE=1 APK_NAME=gtav-recomp-arm64-v8a ./tools/android/build_apk.sh
           cp build/android/apk/gtav-recomp-arm64-v8a.apk artifacts/
 
-          # 4. Generate Android shell package
+          # 4. Export compiled native shared libraries (.so)
+          mkdir -p artifacts/arm64-v8a-libs
+          cp build/android/apk/libs/gtav-recomp-arm64-v8a/*.so artifacts/arm64-v8a-libs/
+          (cd artifacts/arm64-v8a-libs && zip -r ../gtav-libs-arm64-v8a.zip ./*.so)
+          tar -czf artifacts/gtav-libs-arm64-v8a.tar.gz -C artifacts/arm64-v8a-libs .
+
+          # 5. Generate Android shell package
           mkdir -p dist/android
           ./tools/android/make_shell.sh dist/android
           tar -czf artifacts/gtav-android-shell.tar.gz -C dist android
 
+      - name: List Artifacts
+        run: |
+          echo "=== Artifacts to be published ==="
+          ls -lh artifacts/
+
       - name: Upload Android Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: gtav-recomp-android-apks
-          path: artifacts/*
+          name: gtav-recomp-android-release
+          path: |
+            artifacts/*.apk
+            artifacts/*.zip
+            artifacts/*.tar.gz
 
       - name: Generate Release Tag
         if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.create_release)
@@ -200,6 +221,9 @@ jobs:
           name: "GTA V Recomp Android Build (${{ steps.vars.outputs.date }})"
           prerelease: false
           make_latest: true
-          files: artifacts/*
+          files: |
+            artifacts/*.apk
+            artifacts/*.zip
+            artifacts/*.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

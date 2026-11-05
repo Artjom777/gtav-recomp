@@ -68,9 +68,16 @@ if [ ! -f "$KEY" ]; then
     -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US" >/dev/null
 fi
 "$BT/apksigner" sign --ks "$KEY" --ks-pass pass:android --key-pass pass:android \
-  --out $NAME.apk aligned.apk
+  --out "$NAME.apk" aligned.apk
 rm -f unaligned.apk aligned.apk base.apk
-ls -la $NAME.apk
+ls -la "$NAME.apk"
+
+echo "=== Packaged native libraries in $NAME.apk: ==="
+unzip -l "$NAME.apk" | grep 'lib/arm64-v8a/' || true
+
+mkdir -p "$OUT/libs/$NAME"
+cp stage/lib/arm64-v8a/*.so "$OUT/libs/$NAME/"
+
 if [ "$1" = install ]; then
   adb install -r $NAME.apk
 fi
