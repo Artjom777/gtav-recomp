@@ -247,6 +247,28 @@ index 1cb3faa..a68b9cc 100644
  };
  
  /// Create a default InputSystem with SDL + NOP drivers.
+diff --git a/include/rex/memory/ring_buffer.h b/include/rex/memory/ring_buffer.h
+index 0a5b96e..440fc95 100644
+--- a/include/rex/memory/ring_buffer.h
++++ b/include/rex/memory/ring_buffer.h
+@@ -36,7 +36,7 @@ class RingBuffer {
+   ring_size_t read_offset() const { return read_offset_; }
+   uintptr_t read_ptr() const { return uintptr_t(buffer_) + static_cast<uintptr_t>(read_offset_); }
+   void set_read_offset(size_t offset) {
+-    read_offset_ = static_cast<ring_size_t>(offset) % capacity_;
++    read_offset_ = capacity_ ? static_cast<ring_size_t>(offset) % capacity_ : 0;
+   }
+   ring_size_t read_count() const {
+     ring_size_t read_offs = read_offset_;
+@@ -52,7 +52,7 @@ class RingBuffer {
+   ring_size_t write_offset() const { return write_offset_; }
+   uintptr_t write_ptr() const { return uintptr_t(buffer_) + static_cast<uintptr_t>(write_offset_); }
+   void set_write_offset(size_t offset) {
+-    write_offset_ = static_cast<ring_size_t>(offset) % capacity_;
++    write_offset_ = capacity_ ? static_cast<ring_size_t>(offset) % capacity_ : 0;
+   }
+   ring_size_t write_count() const {
+     ring_size_t read_offs = read_offset_;
 diff --git a/include/rex/platform.h b/include/rex/platform.h
 index e90418d..9f5d0f8 100644
 --- a/include/rex/platform.h
@@ -789,7 +811,7 @@ index 20a2cd8..6aef51f 100644
      }
    }
 diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
-index 11b83be..993dd67 100644
+index 11b83be..f723e9e 100644
 --- a/src/audio/xma_context.cpp
 +++ b/src/audio/xma_context.cpp
 @@ -9,12 +9,20 @@
@@ -954,6 +976,15 @@ index 11b83be..993dd67 100644
    if (av_frame_) {
      av_frame_free(&av_frame_);
    }
+@@ -104,7 +235,7 @@ bool XmaContext::Work() {
+   XMA_CONTEXT_DATA data(context_ptr);
+   const XMA_CONTEXT_DATA initial_data = data;
+ 
+-  if (!data.output_buffer_valid) {
++  if (!data.output_buffer_valid || !data.output_buffer_ptr || !data.output_buffer_block_count) {
+     return true;
+   }
+ 
 @@ -117,6 +248,9 @@ bool XmaContext::Work() {
      }
      Consume(&output_rb, &data);
@@ -1034,7 +1065,33 @@ index 11b83be..993dd67 100644
    }
    raw_frame_.fill(0);
    decoded_frame_.fill(0);
-@@ -476,7 +638,30 @@ int XmaContext::PrepareDecoder(int sample_rate, bool is_two_channel) {
+@@ -289,8 +451,8 @@ uint32_t XmaContext::GetAmountOfBitsToRead(uint32_t remaining_stream_bits, uint3
+ const uint8_t* XmaContext::GetNextPacket(XMA_CONTEXT_DATA* data, uint32_t next_packet_index,
+                                          uint32_t current_input_packet_count) {
+   if (next_packet_index < current_input_packet_count) {
+-    return memory()->TranslatePhysical(data->GetCurrentInputBufferAddress()) +
+-           next_packet_index * kBytesPerPacket;
++    uint8_t* in_buf = memory()->TranslatePhysical(data->GetCurrentInputBufferAddress());
++    return in_buf ? in_buf + next_packet_index * kBytesPerPacket : nullptr;
+   }
+ 
+   const uint8_t next_buffer_index = data->current_buffer ^ 1;
+@@ -334,7 +496,13 @@ memory::RingBuffer XmaContext::PrepareOutputRingBuffer(XMA_CONTEXT_DATA* data) {
+         id(), output_capacity, kOutputMaxSizeBytes);
+   }
+ 
+-  uint8_t* output_buffer = memory()->TranslatePhysical(data->output_buffer_ptr);
++  uint8_t* output_buffer = (data->output_buffer_ptr && output_capacity)
++                               ? memory()->TranslatePhysical(data->output_buffer_ptr)
++                               : nullptr;
++  if (!output_buffer || output_capacity == 0) {
++    remaining_subframe_blocks_in_output_buffer_ = 0;
++    return memory::RingBuffer(nullptr, 0);
++  }
+ 
+   memory::RingBuffer output_rb(output_buffer, output_capacity);
+   output_rb.set_read_offset(output_read_offset);
+@@ -476,7 +644,30 @@ int XmaContext::PrepareDecoder(int sample_rate, bool is_two_channel) {
        av_context_->channels != static_cast<int>(channels)) {
      REXAPU_NOISY_DEBUG("XmaContext {}: Codec reinit: rate {} -> {}, channels {} -> {}", id(),
                         av_context_->sample_rate, sample_rate, av_context_->channels, channels);
@@ -1066,7 +1123,17 @@ index 11b83be..993dd67 100644
      av_context_ = avcodec_alloc_context3(av_codec_);
  
      av_context_->sample_rate = sample_rate;
-@@ -668,8 +853,39 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+@@ -544,6 +735,9 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+   }
+ 
+   uint8_t* current_input_buffer = GetCurrentInputBuffer(data);
++  if (!current_input_buffer) {
++    return;
++  }
+ 
+   input_buffer_.fill(0);
+ 
+@@ -668,8 +862,39 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
    PreparePacket(packet_info.current_frame_size_, padding_start);
    const bool decoded = DecodePacket(av_context_, av_packet_, av_frame_);
    if (decoded) {
@@ -1108,7 +1175,27 @@ index 11b83be..993dd67 100644
  
      // Realign the decoder's output onto the bitstream's sample numbering: the
      // samples of the frame just decoded run from kDecoderStartPadding into this
-@@ -742,22 +958,23 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+@@ -728,12 +953,13 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+   if (next_input_offset == kBitsPerPacketHeader) {
+     SwapInputBuffer(data);
+     if (data->IsAnyInputBufferValid()) {
+-      next_input_offset = xma::GetPacketFrameOffset(
+-          memory()->TranslatePhysical(data->GetCurrentInputBufferAddress()));
+-
+-      if (next_input_offset > kMaxFrameSizeinBits) {
+-        SwapInputBuffer(data);
+-        return;
++      uint8_t* in_buf = memory()->TranslatePhysical(data->GetCurrentInputBufferAddress());
++      if (in_buf) {
++        next_input_offset = xma::GetPacketFrameOffset(in_buf);
++        if (next_input_offset > kMaxFrameSizeinBits) {
++          SwapInputBuffer(data);
++          return;
++        }
+       }
+     }
+   }
+@@ -742,22 +968,23 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
  
  void XmaContext::ConvertFrame(const uint8_t** samples, bool is_two_channel,
                                uint8_t* output_buffer) {
@@ -1141,7 +1228,7 @@ index 11b83be..993dd67 100644
      const __m128i shufmask = _mm_set_epi8(14, 15, 6, 7, 12, 13, 4, 5, 10, 11, 2, 3, 8, 9, 0, 1);
      for (uint32_t i = 0; i < kSamplesPerFrame; i += 4) {
        // Load 8 samples, 4 for each channel.
-@@ -800,16 +1017,11 @@ void XmaContext::ConvertFrame(const uint8_t** samples, bool is_two_channel,
+@@ -800,16 +1027,11 @@ void XmaContext::ConvertFrame(const uint8_t** samples, bool is_two_channel,
  #else
    uint32_t o = 0;
    for (uint32_t i = 0; i < kSamplesPerFrame; i++) {
@@ -1654,6 +1741,40 @@ index b52bf39..833df74 100644
    auto full_path = MakeShmName(path);
    shm_unlink(full_path.c_str());
  #endif
+diff --git a/src/core/ring_buffer.cpp b/src/core/ring_buffer.cpp
+index 51340f5..576e271 100644
+--- a/src/core/ring_buffer.cpp
++++ b/src/core/ring_buffer.cpp
+@@ -42,6 +42,9 @@ void RingBuffer::AdvanceWrite(size_t count) {
+ }
+ 
+ RingBuffer::ReadRange RingBuffer::BeginRead(size_t count) {
++  if (!buffer_ || !capacity_) {
++    return {nullptr, nullptr, 0, 0};
++  }
+   ring_size_t cnt = static_cast<ring_size_t>(std::min(count, static_cast<size_t>(capacity_)));
+   if (!cnt) {
+     return {nullptr, nullptr, 0, 0};
+@@ -64,6 +67,9 @@ void RingBuffer::EndRead(ReadRange read_range) {
+ }
+ 
+ size_t RingBuffer::Read(uint8_t* buffer, size_t count) {
++  if (!buffer_ || !capacity_ || !buffer || !count) {
++    return 0;
++  }
+   count = std::min(count, static_cast<size_t>(capacity_));
+   if (!count) {
+     return 0;
+@@ -94,6 +100,9 @@ size_t RingBuffer::Read(uint8_t* buffer, size_t count) {
+ }
+ 
+ size_t RingBuffer::Write(const uint8_t* buffer, size_t count) {
++  if (!buffer_ || !capacity_ || !buffer || !count) {
++    return 0;
++  }
+   count = std::min(count, static_cast<size_t>(capacity_));
+   if (!count) {
+     return 0;
 diff --git a/src/core/seh_posix.cpp b/src/core/seh_posix.cpp
 index 5e0a932..cd75b74 100644
 --- a/src/core/seh_posix.cpp

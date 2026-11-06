@@ -2493,9 +2493,12 @@ struct Backend::Impl {
   bool Init(RenderDevice* dev) {
     device = dev;
     const std::string dev_name = dev ? dev->getDescription().name : "";
+    std::string dev_lower = dev_name;
+    for (char& c : dev_lower) c = std::tolower(c);
     if ((dev && dev->getDescription().vendor == plume::RenderDeviceVendor::ARM) ||
-        dev_name.find("Mali") != std::string::npos ||
-        dev_name.find("Immortal") != std::string::npos) {
+        dev_lower.find("mali") != std::string::npos ||
+        dev_lower.find("immortalis") != std::string::npos ||
+        dev_lower.find("immortal") != std::string::npos) {
       is_mali = true;
     }
     if (is_mali) {
@@ -4104,15 +4107,12 @@ struct Backend::Impl {
       return;
     RenderShader* vs = Shader(d.vs_hash, false);
     RenderShader* ps = Shader(d.ps_hash, true);
-    if (!vs || d.count == 0 || d.element_count == 0) {
+    if (!vs || (!ps && d.ps_hash) || d.count == 0 || d.element_count == 0) {
       stat_skipped++;
       if (!vs && d.count && d.element_count && can_compile_shaders) NoteLost(lost_vs, "vs", d, r);
+      if (!ps && d.ps_hash && can_compile_shaders) NoteLost(lost_ps, "ps", d, r);
       return;
     }
-    // A shader that will never arrive (iPhone: no shader compiler, gtav_native_compile off) is not
-    // waited for: holding frames for it froze the picture to ~1 frame a second in the prologue,
-    // whose shaders the PC had not seen (they are saved to shader_cache for the next PC run).
-    if (!ps && d.ps_hash && can_compile_shaders) NoteLost(lost_ps, "ps", d, r);
     RenderTopologyInfo topo = Topology(d.primitive);
     if (topo.skip) {
       stat_skipped++;

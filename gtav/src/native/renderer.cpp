@@ -463,6 +463,7 @@ class Renderer {
           auto* r = static_cast<Renderer*>(self);
           // --gtav_native=on: the emulated GPU presents nothing, so its window is hidden and
           // this one becomes the game window.
+#ifndef __ANDROID__
           bool on = REXCVAR_GET(gtav_native) == "on";
           if (on) {
             int count = 0;
@@ -471,6 +472,7 @@ class Renderer {
               SDL_free(windows);
             }
           }
+#endif
 #ifdef __ANDROID__
           // Android has one window (SDLActivity's surface): reuse the SDK's if it made one.
           {
@@ -579,9 +581,12 @@ class Renderer {
       return false;
     }
     const std::string dev_name = device_->getDescription().name;
+    std::string dev_lower = dev_name;
+    for (char& c : dev_lower) c = std::tolower(c);
     const bool is_mali = (device_->getDescription().vendor == plume::RenderDeviceVendor::ARM) ||
-                         (dev_name.find("Mali") != std::string::npos ||
-                          dev_name.find("Immortal") != std::string::npos);
+                         (dev_lower.find("mali") != std::string::npos ||
+                          dev_lower.find("immortalis") != std::string::npos ||
+                          dev_lower.find("immortal") != std::string::npos);
     REXLOG_INFO("[native] using {} (Mali compatibility profile: {})", dev_name, is_mali ? "ENABLED" : "DISABLED");
     backend_.SetMali(is_mali);
     {
