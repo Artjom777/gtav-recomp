@@ -47,6 +47,9 @@ class Backend {
   void EndFrame(uint32_t slot);
   void FrameComplete(uint32_t slot);
 
+  void SetMali(bool mali);
+  bool IsMali() const;
+
   // A frame dump is being recorded (the renderer waits for that frame synchronously).
   bool Dumping() const;
   // Dump the next executed frame (F9 in the native window), like --gtav_native_dump_frame.

@@ -578,7 +578,11 @@ class Renderer {
       REXLOG_ERROR("[native] Plume device creation failed");
       return false;
     }
-    REXLOG_INFO("[native] using {}", device_->getDescription().name);
+    const std::string dev_name = device_->getDescription().name;
+    const bool is_mali = (dev_name.find("Mali") != std::string::npos ||
+                          dev_name.find("Immortal") != std::string::npos);
+    REXLOG_INFO("[native] using {} (Mali compatibility profile: {})", dev_name, is_mali ? "ENABLED" : "DISABLED");
+    backend_.SetMali(is_mali);
     {
       const auto& caps = device_->getCapabilities();
       REXLOG_INFO("[native] device caps: geometry shader {}, descriptor indexing {}, scalar layout {}, "

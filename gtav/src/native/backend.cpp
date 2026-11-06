@@ -322,8 +322,8 @@ constexpr uint32_t kSamplerDescriptors = 1024;
 // kOverflow: where a resource goes when the heap is full even after evicting (never sampled on
 // purpose; it used to land on kNull2D, so every "no texture" slot showed the newest texture).
 constexpr uint32_t kNull2D = 0, kNull3D = 1, kNullCube = 2, kOverflow = 3, kFirstTextureDescriptor = 4;
-// Smaller chunks on the phone: three frames in flight each kept 64 MB chunks mostly empty.
-#if defined(__APPLE__) && TARGET_OS_IPHONE
+// Smaller chunks on phones: three frames in flight each kept 64 MB chunks mostly empty.
+#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
 constexpr uint64_t kUploadChunk = 32ull << 20;
 #else
 constexpr uint64_t kUploadChunk = 64ull << 20;
@@ -2252,7 +2252,7 @@ struct Backend::Impl {
   }
 
   void TileAlias(uint32_t base, uint32_t format, uint32_t pitch, RenderTarget* t) {
-    if (!tile_split || !grow_list || t->msaa || Is64bpp(format) || tile_alias_done.count(t)) return;
+    if (is_mali || !tile_split || !grow_list || t->msaa || Is64bpp(format) || tile_alias_done.count(t)) return;
     auto self = tile_resolves.find(base);
     if (self == tile_resolves.end() || self->second.target != t || !self->second.bottom) return;
     // 32-bpp EDRAM tiles are 80x16 samples; tile_split rows further on starts the other surface.
@@ -2462,10 +2462,12 @@ struct Backend::Impl {
     }
     // Attachment use waits at the fragment stage only: the next pass's vertex work need not wait
     // for the previous pass to finish (MoltenVK turns barriers into Metal fences).
+    // On Mali TBDR GPUs, we enforce full GRAPHICS | COPY barrier stages to prevent synchronization stalls.
     const bool attachment = layout == RenderTextureLayout::COLOR_WRITE || layout == RenderTextureLayout::DEPTH_WRITE;
-    list->barriers(attachment && fragment_barriers ? RenderBarrierStage::FRAGMENT
-                                                   : RenderBarrierStage::GRAPHICS | RenderBarrierStage::COPY,
-                   RenderTextureBarrier(t, layout));
+    const auto barrier_stage = (is_mali || !attachment || !fragment_barriers)
+                                   ? (RenderBarrierStage::GRAPHICS | RenderBarrierStage::COPY)
+                                   : RenderBarrierStage::FRAGMENT;
+    list->barriers(barrier_stage, RenderTextureBarrier(t, layout));
     cur = layout;
     bound_fb = nullptr;  // a barrier ends the render pass; rebind before the next draw
   }
@@ -2486,10 +2488,22 @@ struct Backend::Impl {
 #endif
 
   bool fragment_barriers = true;  // --gtav_native_fragment_barriers (live)
+  bool is_mali = false;
 
   bool Init(RenderDevice* dev) {
     device = dev;
-    rs = float(std::clamp(REXCVAR_GET(gtav_native_render_scale), 0.5, 1.0));
+    const std::string dev_name = dev ? dev->getDescription().name : "";
+    if (dev_name.find("Mali") != std::string::npos ||
+        dev_name.find("Immortal") != std::string::npos) {
+      is_mali = true;
+    }
+    if (is_mali) {
+      REXLOG_INFO("[native] ARM Mali GPU detected ({}): applying Mali-G720 compatibility profile", dev_name);
+      rs = 0.5f;
+      fragment_barriers = false;
+    } else {
+      rs = float(std::clamp(REXCVAR_GET(gtav_native_render_scale), 0.5, 1.0));
+    }
     g_pixel_scale_inv = 1.0f / rs;
     if (rs != 1.0f) REXLOG_INFO("[native] render scale {:.3f} (full-width targets)", rs);
     upload.device = dev;
@@ -4271,10 +4285,11 @@ struct Backend::Impl {
       REXLOG_INFO("[native] alpha test function {} first seen (ref {}, ps {:016X})", sc[138], alpha_ref, d.ps_hash);
     }
     // g_AlphaToMask (533): without MSAA the shader applies the Xenos alpha-to-mask dither itself.
+    // On Mali GPUs, disable custom dither to prevent visual glitches and tile pipeline stalls.
     {
       uint32_t colorcontrol = regs::Read(r, regs::RB_COLORCONTROL);
-      sc[133] = count && ((colorcontrol >> 4) & 1) &&
-                        SampleCount(AttachmentMsaa(color, count, depth, r)) == RenderSampleCount::COUNT_1
+      sc[133] = (!is_mali && count && ((colorcontrol >> 4) & 1) &&
+                        SampleCount(AttachmentMsaa(color, count, depth, r)) == RenderSampleCount::COUNT_1)
                     ? (colorcontrol >> 24) | 0x100u
                     : 0u;
     }
@@ -6019,6 +6034,18 @@ void Backend::BeginFrame(uint32_t slot) {
 }
 
 void Backend::EndFrame(uint32_t slot) { impl_->SwapFrameState(impl_->parked[slot]); }
+
+void Backend::SetMali(bool mali) {
+  if (impl_) {
+    impl_->is_mali = mali;
+    if (mali) {
+      impl_->rs = 0.5f;
+      impl_->fragment_barriers = false;
+    }
+  }
+}
+
+bool Backend::IsMali() const { return impl_ ? impl_->is_mali : false; }
 
 bool Backend::Dumping() const { return impl_->dumping; }
 

@@ -59,8 +59,10 @@ fi
 cp "${LIBS[@]}" "$SDK_LIB/librexruntime.so" "$SDK_LIB/librexgpu-xenos.so" \
    "$NDK_LIBCXX" stage/lib/arm64-v8a/
 "$LLVM_STRIP" --strip-debug stage/lib/arm64-v8a/*.so
+mkdir -p stage/assets
+cp "$ROOT/tools/android/args.txt" stage/assets/args.txt
 cp base.apk unaligned.apk
-(cd stage && zip -q -X ../unaligned.apk classes.dex && zip -q -X -0 -r ../unaligned.apk lib)
+(cd stage && zip -q -X ../unaligned.apk classes.dex && zip -q -X -0 -r ../unaligned.apk lib && zip -q -X -r ../unaligned.apk assets)
 
 "$BT/zipalign" -f -P 16 4 unaligned.apk aligned.apk
 if [ ! -f "$KEY" ]; then

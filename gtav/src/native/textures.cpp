@@ -28,17 +28,20 @@ using plume::RenderSwizzle;
 
 enum class Convert { kNone, k565, k1555, k4444, k2_10_10_10, kBC1, kBC2, kBC3, kBC4, kBC5 };
 
-// Apple's phone GPUs have no BC (DXT) formats: on iOS block-compressed textures are decoded on the
-// CPU. A block row of the guest becomes the block's 4 texel rows, one after the other, so a decoded
-// block row is `cols * host_bytes_per_block` bytes like every other conversion here.
+// Apple's phone GPUs and ARM Mali mobile GPUs have no BC (DXT) formats: block-compressed textures
+// are decoded on the CPU. A block row of the guest becomes the block's 4 texel rows, one after
+// the other, so a decoded block row is `cols * host_bytes_per_block` bytes.
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
 #endif
-#if defined(__APPLE__) && TARGET_OS_IPHONE
-constexpr bool kDecodeBC = true;
+#if (defined(__APPLE__) && TARGET_OS_IPHONE) || defined(__ANDROID__)
+#define GTAV_DECODE_BC_DEFAULT true
 #else
-constexpr bool kDecodeBC = false;
+#define GTAV_DECODE_BC_DEFAULT false
 #endif
+
+REXCVAR_DEFINE_BOOL(gtav_native_decode_bc, GTAV_DECODE_BC_DEFAULT, "GTAV",
+                    "Native renderer: decode BC/DXT textures on CPU (required for Mali GPUs and iOS)");
 
 struct HostFormat {
   RenderFormat format;
@@ -47,25 +50,26 @@ struct HostFormat {
 };
 
 bool GetHostFormat(xenos::TextureFormat format, HostFormat* out) {
+  const bool decode_bc = REXCVAR_GET(gtav_native_decode_bc);
   switch (rex::graphics::GetBaseFormat(format)) {
     case xenos::TextureFormat::k_DXT1:
-      *out = kDecodeBC ? HostFormat{RenderFormat::R8G8B8A8_UNORM, Convert::kBC1, 64}
+      *out = decode_bc ? HostFormat{RenderFormat::R8G8B8A8_UNORM, Convert::kBC1, 64}
                        : HostFormat{RenderFormat::BC1_UNORM, Convert::kNone, 8};
       return true;
     case xenos::TextureFormat::k_DXT2_3:
-      *out = kDecodeBC ? HostFormat{RenderFormat::R8G8B8A8_UNORM, Convert::kBC2, 64}
+      *out = decode_bc ? HostFormat{RenderFormat::R8G8B8A8_UNORM, Convert::kBC2, 64}
                        : HostFormat{RenderFormat::BC2_UNORM, Convert::kNone, 16};
       return true;
     case xenos::TextureFormat::k_DXT4_5:
-      *out = kDecodeBC ? HostFormat{RenderFormat::R8G8B8A8_UNORM, Convert::kBC3, 64}
+      *out = decode_bc ? HostFormat{RenderFormat::R8G8B8A8_UNORM, Convert::kBC3, 64}
                        : HostFormat{RenderFormat::BC3_UNORM, Convert::kNone, 16};
       return true;
     case xenos::TextureFormat::k_DXT5A:
-      *out = kDecodeBC ? HostFormat{RenderFormat::R8_UNORM, Convert::kBC4, 16}
+      *out = decode_bc ? HostFormat{RenderFormat::R8_UNORM, Convert::kBC4, 16}
                        : HostFormat{RenderFormat::BC4_UNORM, Convert::kNone, 8};
       return true;
     case xenos::TextureFormat::k_DXN:
-      *out = kDecodeBC ? HostFormat{RenderFormat::R8G8_UNORM, Convert::kBC5, 32}
+      *out = decode_bc ? HostFormat{RenderFormat::R8G8_UNORM, Convert::kBC5, 32}
                        : HostFormat{RenderFormat::BC5_UNORM, Convert::kNone, 16};
       return true;
     case xenos::TextureFormat::k_8_8_8_8: *out = {RenderFormat::R8G8B8A8_UNORM, Convert::kNone, 4}; return true;
@@ -392,7 +396,7 @@ bool Decode3D(const rex::graphics::TextureInfo& info, const HostFormat& host, ui
 // A decoded DXT1 texture without transparent texels -> B5G6R5 (half the memory of RGBA8; the
 // colour came from 5:6:5 endpoints, so only the interpolated texels lose a little precision).
 static void PackOpaqueTo565(DecodedTexture* t) {
-  if (!kDecodeBC || t->format != RenderFormat::R8G8B8A8_UNORM) return;
+  if (!REXCVAR_GET(gtav_native_decode_bc) || t->format != RenderFormat::R8G8B8A8_UNORM) return;
   for (uint32_t m = 0; m < t->mip_count; m++) {  // (not the zero padding between mips)
     const uint8_t* p = t->data.data() + t->mips[m].offset;
     const size_t bytes = size_t(t->mips[m].row_texels) * t->mips[m].height * 4;

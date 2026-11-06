@@ -65,6 +65,19 @@ public class GameActivity extends SDLActivity {
         }
         // args.txt env: lines before super.onCreate loads libmain.so: its static initializers read
         // some variables (GTAV_NATIVE_FETCH_RESOLVE), and getArguments runs only after the load.
+        // First read bundled args.txt from APK assets:
+        try (java.io.InputStream is = getAssets().open("args.txt");
+             BufferedReader reader = new BufferedReader(new java.io.InputStreamReader(is))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                line = line.trim();
+                if (line.startsWith("env:") && line.indexOf('=') > 4) {
+                    int eq = line.indexOf('=');
+                    android.system.Os.setenv(line.substring(4, eq), line.substring(eq + 1), true);
+                }
+            }
+        } catch (Exception ignored) {
+        }
         File[] candidateArgs = {
             new File(getExternalFilesDir(null), "args.txt"),
             new File("/storage/emulated/0/gtav/args.txt"),
@@ -120,7 +133,8 @@ public class GameActivity extends SDLActivity {
         "--gtav_native_hold_lost_frames=false",
         "--gtav_native_async_pipelines=false",
         "--gtav_native_pipeline_wait_ms=60.0",
-        "--gtav_native_render_scale=0.75",
+        "--gtav_native_render_scale=0.50",
+        "--gtav_native_decode_bc=true",
         "--gtav_android_main_prime=true",
         "--audio_maxqframes=32", "--audio_device_frames=512", "--audio_force_stereo=true",
         "--gtav_native_save_missing_shaders=true",
@@ -146,8 +160,19 @@ public class GameActivity extends SDLActivity {
             args.add("--update_data_root=" + root + "/game/update");
             args.add("--user_data_root=" + root + "/userdata");
         }
-        if (isReleaseLayout(this)) {
-            for (String a : RELEASE_ARGS) args.add(a);
+        for (String a : RELEASE_ARGS) args.add(a);
+
+        // Bundled args.txt inside APK assets:
+        try (java.io.InputStream is = getAssets().open("args.txt");
+             BufferedReader reader = new BufferedReader(new java.io.InputStreamReader(is))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                line = line.trim();
+                if (!line.isEmpty() && !line.startsWith("#") && !line.startsWith("env:")) {
+                    args.add(line);
+                }
+            }
+        } catch (Exception ignored) {
         }
         args.add("--gpu_plugin=xenos");
 
