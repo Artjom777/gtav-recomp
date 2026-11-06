@@ -1536,7 +1536,7 @@ index 9329c6d..c52b9f8 100644
    size_t rel_offset_bits = offset_bits_ - (offset_bytes << 3);
    size_t bits_left = num_bits;
 diff --git a/src/core/exception_handler_posix.cpp b/src/core/exception_handler_posix.cpp
-index 8b1c76a..b2beec5 100644
+index 8b1c76a..de33b38 100644
 --- a/src/core/exception_handler_posix.cpp
 +++ b/src/core/exception_handler_posix.cpp
 @@ -28,6 +28,11 @@
@@ -1550,6 +1550,15 @@ index 8b1c76a..b2beec5 100644
 +#endif
  
  #include <ucontext.h>
+ 
+@@ -36,7 +41,7 @@ namespace rex::arch {
+ bool signal_handlers_installed_ = false;
+ struct sigaction original_sigill_handler_;
+ struct sigaction original_sigsegv_handler_;
+-#if REX_PLATFORM_MAC
++#if REX_PLATFORM_MAC || REX_PLATFORM_ANDROID
+ struct sigaction original_sigbus_handler_;
+ #endif
  
 @@ -168,12 +173,10 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
        ex.InitializeIllegalInstruction(&thread_context);
@@ -1644,6 +1653,15 @@ index 8b1c76a..b2beec5 100644
      if (sigaction(SIGBUS, &signal_handler, &original_sigbus_handler_) != 0) {
        assert_always("Failed to install new SIGBUS handler");
      }
+@@ -478,7 +534,7 @@ void ExceptionHandler::Uninstall(Handler fn, void* data) {
+       if (sigaction(SIGSEGV, &original_sigsegv_handler_, NULL) != 0) {
+         assert_always("Failed to restore original SIGSEGV handler");
+       }
+-#if REX_PLATFORM_MAC
++#if REX_PLATFORM_MAC || REX_PLATFORM_ANDROID
+       if (sigaction(SIGBUS, &original_sigbus_handler_, NULL) != 0) {
+         assert_always("Failed to restore original SIGBUS handler");
+       }
 diff --git a/src/core/fiber_posix.cpp b/src/core/fiber_posix.cpp
 index 4fe1ca6..c5a4199 100644
 --- a/src/core/fiber_posix.cpp
