@@ -53,17 +53,28 @@ const ConstantUse* MakeConstantUse(bool pixel, const uint8_t* ucode, uint32_t si
   if (slot) return slot.get();
   uint64_t bits[4];
   auto use = std::make_unique<ConstantUse>();
-  if (size >= 4 && rex_shader_float_constant_bitmap(pixel, reinterpret_cast<const uint32_t*>(ucode), size / 4, bits)) {
-    use->runs.clear();
-    use->count = 0;
-    for (uint32_t r = 0; r < 256; r++) {
-      if (!((bits[r >> 6] >> (r & 63)) & 1)) continue;
-      // Gaps of up to 2 registers are copied too: fewer, longer copies.
-      if (!use->runs.empty() && r - (use->runs.back().first + use->runs.back().count) <= 2)
-        use->runs.back().count = uint16_t(r + 1 - use->runs.back().first);
-      else
-        use->runs.push_back({uint16_t(r), 1});
-      use->count = r + 1;
+  if (ucode && size >= 4) {
+    std::vector<uint32_t> aligned_ucode;
+    const uint32_t* ucode_ptr = nullptr;
+    if ((reinterpret_cast<uintptr_t>(ucode) & 3) != 0) {
+      aligned_ucode.resize(size / 4);
+      std::memcpy(aligned_ucode.data(), ucode, (size / 4) * 4);
+      ucode_ptr = aligned_ucode.data();
+    } else {
+      ucode_ptr = reinterpret_cast<const uint32_t*>(ucode);
+    }
+    if (rex_shader_float_constant_bitmap(pixel, ucode_ptr, size / 4, bits)) {
+      use->runs.clear();
+      use->count = 0;
+      for (uint32_t r = 0; r < 256; r++) {
+        if (!((bits[r >> 6] >> (r & 63)) & 1)) continue;
+        // Gaps of up to 2 registers are copied too: fewer, longer copies.
+        if (!use->runs.empty() && r - (use->runs.back().first + use->runs.back().count) <= 2)
+          use->runs.back().count = uint16_t(r + 1 - use->runs.back().first);
+        else
+          use->runs.push_back({uint16_t(r), 1});
+        use->count = r + 1;
+      }
     }
   }
   slot = std::move(use);
@@ -105,6 +116,7 @@ void OnCreate(const uint8_t* base, uint32_t container, uint32_t object, bool pix
   // Xenia keys shaders by XXH3 of the raw (big-endian) microcode: the container's physical part,
   // located by the shader header (physical offset, size) at container + shaderOffset.
   uint32_t header = be32(c + 0x18);
+  if (header + 8 > size) return;
   uint32_t ucode_offset = be32(c + 4) + be32(c + header), ucode_size = be32(c + header + 4);
   uint64_t ucode_hash = ucode_offset + ucode_size <= size ? XXH3_64bits(c + ucode_offset, ucode_size) : 0;
   {

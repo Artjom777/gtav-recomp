@@ -201,8 +201,14 @@ struct FramePacket {
   uint32_t front_buffer = 0;  // guest texture object passed to Swap
 
   uint32_t Push(const void* data, uint32_t size) {
+    if (!size) return 0;
     uint32_t at = uint32_t(arena.size());
-    std::memcpy(arena.Grow(size), data, size);
+    uint8_t* dst = arena.Grow(size);
+    if (data) {
+      std::memcpy(dst, data, size);
+    } else {
+      std::memset(dst, 0, size);
+    }
     return at;
   }
   // Empties the packet but keeps every buffer's capacity for the next frame.

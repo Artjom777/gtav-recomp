@@ -175,6 +175,7 @@ bool Probing() {
 void ProbeDraw(const char* kind, uint32_t device) {
   g_probe_logged++;
   const uint8_t* dev = Guest(device);
+  if (!dev) return;
   REXLOG_INFO("[native-probe] {} ib={:08X} vs={:08X}/{:016X} ps={:08X}/{:016X}", kind, g_bound.index_buffer,
               g_bound.vertex_shader, ShaderHash(g_bound.vertex_shader), g_bound.pixel_shader,
               ShaderHash(g_bound.pixel_shader));
@@ -242,7 +243,9 @@ static uint32_t GuestPhysical(uint32_t virtual_address) {
 
 // Where the device writes its next PM4 packet: the ring, or a D3D command buffer being recorded.
 static uint32_t WritePointer(uint32_t device) {
-  uint32_t write = be32(Guest(device) + d3d::kDevCmdWrite);
+  const uint8_t* dev = Guest(device);
+  if (!dev) return 0;
+  uint32_t write = be32(dev + d3d::kDevCmdWrite);
   return write ? GuestPhysical(write) : 0;
 }
 
@@ -701,6 +704,7 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
     pm4scan::OnDraw(WritePointer(device), ShaderHash(g_bound.vertex_shader), vs);
   }
   const uint8_t* dev = Guest(device);
+  if (!dev) return nullptr;
   DrawCommand d;
   d.indexed = indexed;
   d.primitive = primitive;
@@ -792,30 +796,36 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
   if (!index_buffer) index_buffer = g_bound.index_buffer;
   if (indexed && index_buffer) {
     const uint8_t* ib = Guest(index_buffer);
-    d.index32 = (be32(ib) & d3d::kIndexBuffer32Flag) != 0;
-    d.index_address = GuestPhysical(be32(ib + kResourceHeader));
-    d.index_size = be32(ib + kResourceHeader + 4);
+    if (ib) {
+      d.index32 = (be32(ib) & d3d::kIndexBuffer32Flag) != 0;
+      d.index_address = GuestPhysical(be32(ib + kResourceHeader));
+      d.index_size = be32(ib + kResourceHeader + 4);
+    }
   }
   if (uint32_t decl = be32(dev + d3d::kDevVertexDeclaration)) {
     const uint8_t* p = Guest(decl);
-    uint32_t n = std::min(be32(p + d3d::kDeclCount), kMaxVertexElements);
-    for (uint32_t i = 0; i < n; i++) {
-      const uint8_t* e = p + d3d::kDeclElements + 12 * i;
-      d.elements[i] = {be16(e), be16(e + 2), be32(e + 4), e[8], e[9], e[10], 0};
+    if (p) {
+      uint32_t n = std::min(be32(p + d3d::kDeclCount), kMaxVertexElements);
+      for (uint32_t i = 0; i < n; i++) {
+        const uint8_t* e = p + d3d::kDeclElements + 12 * i;
+        d.elements[i] = {be16(e), be16(e + 2), be32(e + 4), e[8], e[9], e[10], 0};
+      }
+      d.element_count = n;
     }
-    d.element_count = n;
   }
   for (uint32_t s = 0; s < kStreamCount; s++) {
     if (uint32_t vb = g_bound.streams[s][0]) {
       const uint8_t* v = Guest(vb);
-      // Vertex buffer: its fetch constant (address | type 3, endian | size in dwords).
-      d.streams[s].address = GuestPhysical(be32(v + kResourceHeader) & 0xFFFFFFFC);
-      // Fetch constant dword 1: endian in bits 0-1, size in dwords in bits 2-25.
-      uint32_t word1 = be32(v + kResourceHeader + 4);
-      d.streams[s].size = ((word1 >> 2) & 0x00FFFFFF) * 4;
-      d.streams[s].endian = word1 & 3;
-      d.streams[s].offset = g_bound.streams[s][1];
-      d.streams[s].stride = g_bound.streams[s][2];
+      if (v) {
+        // Vertex buffer: its fetch constant (address | type 3, endian | size in dwords).
+        d.streams[s].address = GuestPhysical(be32(v + kResourceHeader) & 0xFFFFFFFC);
+        // Fetch constant dword 1: endian in bits 0-1, size in dwords in bits 2-25.
+        uint32_t word1 = be32(v + kResourceHeader + 4);
+        d.streams[s].size = ((word1 >> 2) & 0x00FFFFFF) * 4;
+        d.streams[s].endian = word1 & 3;
+        d.streams[s].offset = g_bound.streams[s][1];
+        d.streams[s].stride = g_bound.streams[s][2];
+      }
     }
   }
   for (int i = 0; i < 4; i++) d.render_targets[i] = be32(dev + d3d::kDevRenderTargets + 4 * i);
@@ -886,6 +896,7 @@ void OnBeginIndexedVertices(uint32_t device, uint32_t primitive, int32_t base_ve
                             uint32_t index_count, uint32_t index_format, uint32_t stride) {
   FlushIndexedVertices();
   const uint8_t* dev = Guest(device);
+  if (!dev) return;
   uint32_t vertices = be32(dev + d3d::kDevUpVertices), indices = be32(dev + d3d::kDevUpIndices);
   DrawCommand* d = RecordDraw(device, true, primitive, base_vertex, 0, index_count);
   if (!d || !vertices || !indices) return;
@@ -920,13 +931,17 @@ uint32_t g_probe_draws = 0, g_probe_reports = 0;
 
 void ProbeDrawBefore(uint32_t device) {
   if (g_probe_reports >= 6) return;
-  const uint8_t* shadow = Guest(device) + kRegShadowBegin;
+  const uint8_t* dev = Guest(device);
+  if (!dev) return;
+  const uint8_t* shadow = dev + kRegShadowBegin;
   g_probe_pre.assign(shadow, shadow + kRegShadowSize);
 }
 
 void ProbeDrawAfter(uint32_t device) {
   if (g_probe_reports >= 6 || g_probe_pre.size() != kRegShadowSize) return;
-  const uint8_t* shadow = Guest(device) + kRegShadowBegin;
+  const uint8_t* dev = Guest(device);
+  if (!dev) return;
+  const uint8_t* shadow = dev + kRegShadowBegin;
   for (const auto& b : xenos_regs::kBlocks)
     for (uint32_t i = 0; i < b.count; i++) {
       uint32_t off = b.device_offset - kRegShadowBegin + 4 * i;
@@ -948,7 +963,9 @@ uint32_t g_clear_surface_before = 0, g_clear_depth_before = 0, g_clear_logged = 
 
 void OnClearBegin(uint32_t device) {
   FlushIndexedVertices();
-  const uint8_t* shadow = Guest(device) + kRegShadowBegin;
+  const uint8_t* dev = Guest(device);
+  if (!dev) return;
+  const uint8_t* shadow = dev + kRegShadowBegin;
   g_clear_surface_before = xenos_regs::Read(shadow, xenos_regs::RB_SURFACE_INFO);
   g_clear_depth_before = xenos_regs::Read(shadow, xenos_regs::RB_DEPTH_INFO);
 }
@@ -956,8 +973,10 @@ void OnClearBegin(uint32_t device) {
 void OnClear(uint32_t device, uint32_t flags, uint32_t color, float z, uint32_t stencil, uint32_t rect_count,
              uint32_t rects) {
   if (!Active()) return;
+  const uint8_t* dev = Guest(device);
+  if (!dev) return;
+  const uint8_t* shadow = dev + kRegShadowBegin;
   {
-    const uint8_t* shadow = Guest(device) + kRegShadowBegin;
     uint32_t surface = xenos_regs::Read(shadow, xenos_regs::RB_SURFACE_INFO);
     uint32_t depth = xenos_regs::Read(shadow, xenos_regs::RB_DEPTH_INFO);
     if ((surface != g_clear_surface_before || depth != g_clear_depth_before) && g_clear_logged < 40) {
@@ -966,17 +985,19 @@ void OnClear(uint32_t device, uint32_t flags, uint32_t color, float z, uint32_t 
                   flags, g_clear_surface_before, surface, g_clear_depth_before, depth);
     }
   }
-  ClearCommand c{flags, color, stencil, z, g_packet.Push(Guest(device) + kRegShadowBegin, kRegShadowSize)};
+  ClearCommand c{flags, color, stencil, z, g_packet.Push(shadow, kRegShadowSize)};
   if (rect_count && rects) {
     // More rects than fit: clear their bounding box.
     const uint8_t* p = Guest(rects);
-    c.rect_count = std::min(rect_count, ClearCommand::kMaxRects);
-    for (uint32_t i = 0; i < rect_count; i++) {
-      uint32_t slot = std::min(i, ClearCommand::kMaxRects - 1);
-      for (int k = 0; k < 4; k++) {
-        int32_t v = int32_t(be32(p + 16 * i + 4 * k));
-        c.rects[slot][k] = i < ClearCommand::kMaxRects ? v
-                           : k < 2 ? std::min(c.rects[slot][k], v) : std::max(c.rects[slot][k], v);
+    if (p) {
+      c.rect_count = std::min(rect_count, ClearCommand::kMaxRects);
+      for (uint32_t i = 0; i < rect_count; i++) {
+        uint32_t slot = std::min(i, ClearCommand::kMaxRects - 1);
+        for (int k = 0; k < 4; k++) {
+          int32_t v = int32_t(be32(p + 16 * i + 4 * k));
+          c.rects[slot][k] = i < ClearCommand::kMaxRects ? v
+                             : k < 2 ? std::min(c.rects[slot][k], v) : std::max(c.rects[slot][k], v);
+        }
       }
     }
   }
@@ -988,40 +1009,50 @@ void OnResolve(uint32_t device, uint32_t flags, uint32_t rect, uint32_t dest_tex
                uint32_t clear_color, float clear_z, uint32_t level, uint32_t face) {
   FlushIndexedVertices();
   if (!Active()) return;
+  const uint8_t* dev = Guest(device);
+  if (!dev) return;
   ResolveCommand r;
   r.flags = flags;
   r.dest_texture = dest_texture;
   r.dest_level = level;
   r.dest_face = face;
-  r.regs = g_packet.Push(Guest(device) + kRegShadowBegin, kRegShadowSize);
+  r.regs = g_packet.Push(dev + kRegShadowBegin, kRegShadowSize);
   if (rect) {
     const uint8_t* p = Guest(rect);
-    for (int i = 0; i < 4; i++) r.source_rect[i] = be32(p + 4 * i);
-    r.has_rect = true;
+    if (p) {
+      for (int i = 0; i < 4; i++) r.source_rect[i] = be32(p + 4 * i);
+      r.has_rect = true;
+    }
   }
   r.clear_z = clear_z;
   if (clear_color) {
     const uint8_t* p = Guest(clear_color);
-    for (int i = 0; i < 4; i++) {
-      uint32_t v = be32(p + 4 * i);
-      std::memcpy(&r.clear_color[i], &v, 4);
+    if (p) {
+      for (int i = 0; i < 4; i++) {
+        uint32_t v = be32(p + 4 * i);
+        std::memcpy(&r.clear_color[i], &v, 4);
+      }
     }
   }
   if (dest_point) {
     const uint8_t* p = Guest(dest_point);
-    r.dest_point[0] = be32(p);
-    r.dest_point[1] = be32(p + 4);
-    r.has_point = true;
+    if (p) {
+      r.dest_point[0] = be32(p);
+      r.dest_point[1] = be32(p + 4);
+      r.has_point = true;
+    }
   }
   if (dest_texture) {
     const uint8_t* t = Guest(dest_texture);
-    for (int i = 0; i < 13; i++) r.dest_words[i] = be32(t + 4 * i);
-    // The texture object stores a virtual base address; the fetch constants the GPU samples with
-    // carry the physical one (the 0xE0000000 range maps with a 0x1000 offset). Use the physical
-    // address so resolves and later texture fetches agree.
-    uint32_t& dword1 = r.dest_words[8];
-    uint32_t physical = REX_KERNEL_MEMORY()->GetPhysicalAddress(dword1 & 0xFFFFF000);
-    if (physical != UINT32_MAX) dword1 = (dword1 & 0xFFF) | (physical & 0xFFFFF000);
+    if (t) {
+      for (int i = 0; i < 13; i++) r.dest_words[i] = be32(t + 4 * i);
+      // The texture object stores a virtual base address; the fetch constants the GPU samples with
+      // carry the physical one (the 0xE0000000 range maps with a 0x1000 offset). Use the physical
+      // address so resolves and later texture fetches agree.
+      uint32_t& dword1 = r.dest_words[8];
+      uint32_t physical = REX_KERNEL_MEMORY()->GetPhysicalAddress(dword1 & 0xFFFFF000);
+      if (physical != UINT32_MAX) dword1 = (dword1 & 0xFFF) | (physical & 0xFFFFF000);
+    }
   }
   g_packet.commands.push_back({CommandKind::kResolve, uint32_t(g_packet.resolves.size()), WritePointer(device)});
   g_packet.resolves.push_back(r);
