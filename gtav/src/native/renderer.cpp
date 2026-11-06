@@ -1212,7 +1212,7 @@ class Renderer {
       FlickerCapture(slot, frame.index, front_descriptor, w, h);
     }
     if (key_replay_.exchange(false)) WriteReplay(frame.index);
-    const plume::RenderFormat swapFormat = target->getFormat();
+    const plume::RenderFormat swapFormat = swapchain_ ? swapchain_->getFormat() : (target ? target->getFormat() : kSwapchainFormat);
     if (front) {
 #if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
       // Phone screens are wider than 16:9: keep the game's aspect ratio with black bars.

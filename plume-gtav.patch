@@ -89,10 +89,26 @@ index 1384fe9..3ff79fe 100644
 +
 +#endif  // TARGET_OS_IPHONE
 diff --git a/plume_render_interface.h b/plume_render_interface.h
-index 2048557..6df11cb 100644
+index 2048557..fadb2c4 100644
 --- a/plume_render_interface.h
 +++ b/plume_render_interface.h
-@@ -127,6 +127,8 @@ namespace plume {
+@@ -40,6 +40,7 @@ namespace plume {
+         virtual ~RenderTexture() { }
+         virtual std::unique_ptr<RenderTextureView> createTextureView(const RenderTextureViewDesc &desc) const = 0;
+         virtual void setName(const std::string &name) = 0;
++        virtual RenderFormat getFormat() const { return RenderFormat::R8G8B8A8_UNORM; }
+     };
+ 
+     struct RenderAccelerationStructure {
+@@ -103,6 +104,7 @@ namespace plume {
+ 
+         // Only valid if displayTiming is enabled in capabilities.
+         virtual uint32_t getRefreshRate() const = 0;
++        virtual RenderFormat getFormat() const { return RenderFormat::R8G8B8A8_UNORM; }
+     };
+ 
+     struct RenderFramebuffer {
+@@ -127,6 +129,8 @@ namespace plume {
          virtual void setGraphicsPipelineLayout(const RenderPipelineLayout *pipelineLayout) = 0;
          virtual void setGraphicsPushConstants(uint32_t rangeIndex, const void *data, uint32_t offset = 0, uint32_t size = 0) = 0;
          virtual void setGraphicsDescriptorSet(RenderDescriptorSet *descriptorSet, uint32_t setIndex) = 0;
@@ -101,7 +117,7 @@ index 2048557..6df11cb 100644
          virtual void setGraphicsRootDescriptor(RenderBufferReference bufferReference, uint32_t rootDescriptorIndex) = 0;
          virtual void setRaytracingPipelineLayout(const RenderPipelineLayout *pipelineLayout) = 0;
          virtual void setRaytracingPushConstants(uint32_t rangeIndex, const void *data, uint32_t offset = 0, uint32_t size = 0) = 0;
-@@ -150,6 +152,13 @@ namespace plume {
+@@ -150,6 +154,13 @@ namespace plume {
          virtual void discardTexture(const RenderTexture* texture) = 0; // D3D12 only.
          virtual void resetQueryPool(const RenderQueryPool *queryPool, uint32_t queryFirstIndex, uint32_t queryCount) = 0;
          virtual void writeTimestamp(const RenderQueryPool *queryPool, uint32_t queryIndex) = 0;
@@ -115,7 +131,7 @@ index 2048557..6df11cb 100644
  
          // Concrete implementation shortcuts.
          inline void barriers(RenderBarrierStages stages, const RenderBufferBarrier &barrier) {
-@@ -241,6 +250,8 @@ namespace plume {
+@@ -241,6 +252,8 @@ namespace plume {
          virtual std::unique_ptr<RenderCommandSemaphore> createCommandSemaphore() = 0;
          virtual std::unique_ptr<RenderFramebuffer> createFramebuffer(const RenderFramebufferDesc &desc) = 0;
          virtual std::unique_ptr<RenderQueryPool> createQueryPool(uint32_t queryCount) = 0;
@@ -1328,10 +1344,26 @@ index 58749c4..c697a25 100644
  
  #if defined(PLUME_SDL2_VULKAN_ENABLED)
 diff --git a/plume_vulkan.h b/plume_vulkan.h
-index 1d36b12..0de1495 100644
+index 1d36b12..f89778b 100644
 --- a/plume_vulkan.h
 +++ b/plume_vulkan.h
-@@ -279,14 +279,25 @@ namespace plume {
+@@ -97,6 +97,7 @@ namespace plume {
+         std::unique_ptr<RenderTextureView> createTextureView(const RenderTextureViewDesc &desc) const override;
+         void setName(const std::string &name) override;
+         void fillSubresourceRange();
++        RenderFormat getFormat() const override { return desc.format; }
+     };
+ 
+     struct VulkanTextureView : RenderTextureView {
+@@ -258,6 +259,7 @@ namespace plume {
+         RenderWindow getWindow() const override;
+         bool isEmpty() const override;
+         uint32_t getRefreshRate() const override;
++        RenderFormat getFormat() const override { return desc.format; }
+         void getWindowSize(uint32_t &dstWidth, uint32_t &dstHeight) const;
+         void releaseSwapChain();
+         void releaseImageViews();
+@@ -279,14 +281,25 @@ namespace plume {
          uint32_t getWidth() const override;
          uint32_t getHeight() const override;
          bool contains(const VulkanTexture *attachment) const;
@@ -1358,7 +1390,7 @@ index 1d36b12..0de1495 100644
          virtual ~VulkanQueryPool() override;
          virtual void queryResults() override;
          virtual const uint64_t *getResults() const override;
-@@ -302,6 +313,11 @@ namespace plume {
+@@ -302,6 +315,11 @@ namespace plume {
          const VulkanPipelineLayout *activeGraphicsPipelineLayout = nullptr;
          const VulkanPipelineLayout *activeRaytracingPipelineLayout = nullptr;
          VkRenderPass activeRenderPass = VK_NULL_HANDLE;
@@ -1370,7 +1402,7 @@ index 1d36b12..0de1495 100644
  
          VulkanCommandList(VulkanCommandQueue *queue);
          ~VulkanCommandList() override;
-@@ -319,6 +335,7 @@ namespace plume {
+@@ -319,6 +337,7 @@ namespace plume {
          void setGraphicsPipelineLayout(const RenderPipelineLayout *pipelineLayout) override;
          void setGraphicsPushConstants(uint32_t rangeIndex, const void *data, uint32_t offset = 0, uint32_t size = 0) override;
          void setGraphicsDescriptorSet(RenderDescriptorSet *descriptorSet, uint32_t setIndex) override;
@@ -1378,7 +1410,7 @@ index 1d36b12..0de1495 100644
          void setGraphicsRootDescriptor(RenderBufferReference bufferReference, uint32_t rootDescriptorIndex) override;
          void setRaytracingPipelineLayout(const RenderPipelineLayout *pipelineLayout) override;
          void setRaytracingPushConstants(uint32_t rangeIndex, const void *data, uint32_t offset = 0, uint32_t size = 0) override;
-@@ -342,6 +359,8 @@ namespace plume {
+@@ -342,6 +361,8 @@ namespace plume {
          void discardTexture(const RenderTexture* texture) override;
          void resetQueryPool(const RenderQueryPool *queryPool, uint32_t queryFirstIndex, uint32_t queryCount) override;
          void writeTimestamp(const RenderQueryPool *queryPool, uint32_t queryIndex) override;
@@ -1387,7 +1419,7 @@ index 1d36b12..0de1495 100644
          void checkActiveRenderPass();
          void endActiveRenderPass();
          void setDescriptorSet(VkPipelineBindPoint bindPoint, const VulkanPipelineLayout *pipelineLayout, const RenderDescriptorSet *descriptorSet, uint32_t setIndex);
-@@ -404,9 +423,11 @@ namespace plume {
+@@ -404,9 +425,11 @@ namespace plume {
  
      struct VulkanDevice : RenderDevice {
          VkDevice vk = VK_NULL_HANDLE;
@@ -1399,7 +1431,7 @@ index 1d36b12..0de1495 100644
          VmaAllocator allocator = VK_NULL_HANDLE;
          uint32_t queueFamilyIndices[3] = {};
          std::vector<VulkanQueueFamily> queueFamilies;
-@@ -416,6 +437,7 @@ namespace plume {
+@@ -416,6 +439,7 @@ namespace plume {
          VkPhysicalDeviceSampleLocationsPropertiesEXT sampleLocationProperties = {};
          std::unique_ptr<RenderBuffer> nullBuffer;
          bool loadStoreOpNoneSupported = false;
@@ -1407,7 +1439,7 @@ index 1d36b12..0de1495 100644
          bool nullDescriptorSupported = false;
  
          VulkanDevice(VulkanInterface *renderInterface, const std::string &preferredDeviceName);
-@@ -436,6 +458,7 @@ namespace plume {
+@@ -436,6 +460,7 @@ namespace plume {
          std::unique_ptr<RenderCommandSemaphore> createCommandSemaphore() override;
          std::unique_ptr<RenderFramebuffer> createFramebuffer(const RenderFramebufferDesc &desc) override;
          std::unique_ptr<RenderQueryPool> createQueryPool(uint32_t queryCount) override;
@@ -1415,7 +1447,7 @@ index 1d36b12..0de1495 100644
          void setBottomLevelASBuildInfo(RenderBottomLevelASBuildInfo &buildInfo, const RenderBottomLevelASMesh *meshes, uint32_t meshCount, bool preferFastBuild, bool preferFastTrace) override;
          void setTopLevelASBuildInfo(RenderTopLevelASBuildInfo &buildInfo, const RenderTopLevelASInstance *instances, uint32_t instanceCount, bool preferFastBuild, bool preferFastTrace) override;
          void setShaderBindingTableInfo(RenderShaderBindingTableInfo &tableInfo, const RenderShaderBindingGroups &groups, const RenderPipeline *pipeline, RenderDescriptorSet **descriptorSets, uint32_t descriptorSetCount) override;
-@@ -466,4 +489,9 @@ namespace plume {
+@@ -466,4 +491,9 @@ namespace plume {
          const std::vector<std::string> &getDeviceNames() const override;
          bool isValid() const;
      };
