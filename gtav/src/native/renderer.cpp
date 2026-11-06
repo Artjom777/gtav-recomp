@@ -579,7 +579,8 @@ class Renderer {
       return false;
     }
     const std::string dev_name = device_->getDescription().name;
-    const bool is_mali = (dev_name.find("Mali") != std::string::npos ||
+    const bool is_mali = (device_->getDescription().vendor == plume::RenderDeviceVendor::ARM) ||
+                         (dev_name.find("Mali") != std::string::npos ||
                           dev_name.find("Immortal") != std::string::npos);
     REXLOG_INFO("[native] using {} (Mali compatibility profile: {})", dev_name, is_mali ? "ENABLED" : "DISABLED");
     backend_.SetMali(is_mali);

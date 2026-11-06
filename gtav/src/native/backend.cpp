@@ -2202,7 +2202,7 @@ struct Backend::Impl {
   }
 
   void MsaaAlias(RenderCommandList* list, uint32_t base, uint32_t format, uint32_t pitch, RenderTarget* t) {
-    if (t->msaa || t->depth || pitch < 2 || (pitch & 1) || t->scale != 1.0f) return;
+    if (is_mali || t->msaa || t->depth || pitch < 2 || (pitch & 1) || t->scale != 1.0f) return;
     uint64_t key = uint64_t(base) | uint64_t(StorageFormat(format)) << 12 | uint64_t(pitch / 2) << 17 | uint64_t(2) << 31;
     auto it = targets.find(key);
     if (it == targets.end() || !it->second.texture || it->second.written <= t->written) return;
@@ -2493,7 +2493,8 @@ struct Backend::Impl {
   bool Init(RenderDevice* dev) {
     device = dev;
     const std::string dev_name = dev ? dev->getDescription().name : "";
-    if (dev_name.find("Mali") != std::string::npos ||
+    if ((dev && dev->getDescription().vendor == plume::RenderDeviceVendor::ARM) ||
+        dev_name.find("Mali") != std::string::npos ||
         dev_name.find("Immortal") != std::string::npos) {
       is_mali = true;
     }

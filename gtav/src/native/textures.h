@@ -3,11 +3,14 @@
 #pragma once
 
 #include <plume_render_interface.h>
+#include <rex/cvar.h>
 
 #include <cstdint>
 #include <vector>
 
 namespace gtav::native {
+
+REXCVAR_DECLARE(bool, gtav_native_decode_bc);
 
 struct DecodedTexture {
   struct Mip {

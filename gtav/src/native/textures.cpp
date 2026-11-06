@@ -5,6 +5,7 @@
 
 #include "textures.h"
 
+#include <rex/cvar.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/xenos.h>
@@ -19,18 +20,6 @@
 #include <bit>
 #include <cstring>
 
-namespace gtav::native {
-namespace {
-
-namespace xenos = rex::graphics::xenos;
-using plume::RenderFormat;
-using plume::RenderSwizzle;
-
-enum class Convert { kNone, k565, k1555, k4444, k2_10_10_10, kBC1, kBC2, kBC3, kBC4, kBC5 };
-
-// Apple's phone GPUs and ARM Mali mobile GPUs have no BC (DXT) formats: block-compressed textures
-// are decoded on the CPU. A block row of the guest becomes the block's 4 texel rows, one after
-// the other, so a decoded block row is `cols * host_bytes_per_block` bytes.
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
 #endif
@@ -40,8 +29,18 @@ enum class Convert { kNone, k565, k1555, k4444, k2_10_10_10, kBC1, kBC2, kBC3, k
 #define GTAV_DECODE_BC_DEFAULT false
 #endif
 
+namespace gtav::native {
+
 REXCVAR_DEFINE_BOOL(gtav_native_decode_bc, GTAV_DECODE_BC_DEFAULT, "GTAV",
                     "Native renderer: decode BC/DXT textures on CPU (required for Mali GPUs and iOS)");
+
+namespace {
+
+namespace xenos = rex::graphics::xenos;
+using plume::RenderFormat;
+using plume::RenderSwizzle;
+
+enum class Convert { kNone, k565, k1555, k4444, k2_10_10_10, kBC1, kBC2, kBC3, kBC4, kBC5 };
 
 struct HostFormat {
   RenderFormat format;
