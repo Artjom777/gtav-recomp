@@ -68,7 +68,8 @@ jobs:
       - name: Install Host Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build cmake python3 python3-pip clang lld libvulkan-dev spirv-tools rsync zip unzip pkg-config \
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ninja-build cmake python3 python3-pip clang lld libvulkan-dev spirv-tools rsync zip unzip pkg-config \
             libx11-xcb-dev libwayland-dev libgtk-3-dev libxss-dev libxkbcommon-dev libdecor-0-dev \
             libasound2-dev libpulse-dev libpipewire-0.3-dev
 
