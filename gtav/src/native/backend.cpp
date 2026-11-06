@@ -1344,11 +1344,16 @@ struct UploadRing {
       c.buffer = device->createBuffer(RenderBufferDesc::UploadBuffer(
           kUploadChunk, RenderBufferFlag::CONSTANT | RenderBufferFlag::VERTEX | RenderBufferFlag::INDEX |
                             RenderBufferFlag::DEVICE_ADDRESSABLE));
-      c.cpu = static_cast<uint8_t*>(c.buffer->map());
+      if (!c.buffer) break;
+      void* mapped = c.buffer->map();
+      if (!mapped) break;
+      c.cpu = static_cast<uint8_t*>(mapped);
       c.gpu = c.buffer->getDeviceAddress();
       chunks.push_back(std::move(c));
     }
+    if (chunk >= chunks.size()) return {};
     auto& c = chunks[chunk];
+    if (!c.cpu) return {};
     UploadAllocation a{c.buffer.get(), offset, c.cpu + offset, c.gpu + offset};
     offset += size;
     return a;
@@ -2477,6 +2482,7 @@ struct Backend::Impl {
 
 #if GTAV_MOBILE
   RenderDescriptorSet* ConstantSetImpl(const RenderBuffer* vs, const RenderBuffer* ps, const RenderBuffer* shared) {
+    if (!vs || !ps || !shared) return nullptr;
     auto key = std::make_tuple(vs, ps, shared);
     auto it = ubo_sets.find(key);
     if (it != ubo_sets.end()) return it->second.get();
@@ -2863,6 +2869,7 @@ struct Backend::Impl {
     const uint32_t tw = Sz(t.width, t.scale), th = Sz(t.height, t.scale);
     t.texture = device->createTexture(depth ? RenderTextureDesc::DepthTarget(tw, th, t.format, ms)
                                             : RenderTextureDesc::ColorTarget(tw, th, t.format, ms));
+    if (!t.texture) return nullptr;
     if (!depth && !msaa) ZeroTexture(grow_list, t.texture.get(), t.format, tw, th);
     if (old_texture && grow_list) {
       Transition(grow_list, old_texture.get(), RenderTextureLayout::COPY_SOURCE);
@@ -3189,28 +3196,30 @@ struct Backend::Impl {
       if (bound_fb) PassBegin("target change");
       else PassBegin(fmt::format("{}{}", same_targets ? "RESTART after " : "new targets after ", pass_end).c_str());
     }
-    for (uint32_t i = 0; i < count; i++) Transition(list, color[i]->texture.get(), RenderTextureLayout::COLOR_WRITE);
-    if (depth) Transition(list, depth->texture.get(), RenderTextureLayout::DEPTH_WRITE);
-    uint64_t key = depth ? uint64_t(uintptr_t(depth->texture.get())) : 0;
+    for (uint32_t i = 0; i < count; i++) {
+      if (color[i] && color[i]->texture) Transition(list, color[i]->texture.get(), RenderTextureLayout::COLOR_WRITE);
+    }
+    if (depth && depth->texture) Transition(list, depth->texture.get(), RenderTextureLayout::DEPTH_WRITE);
+    uint64_t key = (depth && depth->texture) ? uint64_t(uintptr_t(depth->texture.get())) : 0;
     const RenderTexture* attachments[4] = {};
     for (uint32_t i = 0; i < count; i++) {
-      attachments[i] = color[i]->texture.get();
+      attachments[i] = (color[i] && color[i]->texture) ? color[i]->texture.get() : nullptr;
       key = Hash(&attachments[i], sizeof(void*), key);
     }
     key = Hash(&count, 4, key);
     auto& fb = framebuffers[key];
     if (!fb) {
-      RenderFramebufferDesc desc(attachments, count, depth ? depth->texture.get() : nullptr);
+      RenderFramebufferDesc desc(attachments, count, (depth && depth->texture) ? depth->texture.get() : nullptr);
       fb = device->createFramebuffer(desc);
     }
-    list->setFramebuffer(fb.get());
+    if (fb) list->setFramebuffer(fb.get());
     if (pass_times)
-      PassStamp(list, fmt::format("targets {}x{} {}c fmt {}{}{}", count ? color[0]->width : depth ? depth->width : 0,
-                                  count ? color[0]->height : depth ? depth->height : 0, count,
-                                  count ? uint32_t(color[0]->format) : 0, depth ? " +depth" : "",
-                                  count && color[0]->msaa ? " msaa" : ""));
+      PassStamp(list, fmt::format("targets {}x{} {}c fmt {}{}{}", count && color[0] ? color[0]->width : (depth ? depth->width : 0),
+                                  count && color[0] ? color[0]->height : (depth ? depth->height : 0), count,
+                                  count && color[0] ? uint32_t(color[0]->format) : 0, depth ? " +depth" : "",
+                                  count && color[0] && color[0]->msaa ? " msaa" : ""));
     bound_fb = fb.get();
-    if (const int32_t coarse = REXCVAR_GET(gtav_native_coarse_shading); coarse > 0 && depth && count &&
+    if (const int32_t coarse = REXCVAR_GET(gtav_native_coarse_shading); coarse > 0 && depth && count && color[0] &&
         color[0]->width >= 640)
       list->setFragmentShadingRate(2, coarse >= 2 ? 2 : 1);
     pass_draws = 0;
@@ -3800,7 +3809,9 @@ struct Backend::Impl {
   GTAV_SWAP16_TARGET UploadAllocation ConstantUpload(const uint8_t* src, uint32_t offset, const ConstantUse* use,
                                                     LastConstants& last) {
     if (last.valid && last.offset == offset && (last.use == use || !last.use)) return last.gpu;
+    if (!src) return last.gpu;
     auto a = upload.Allocate(kAluSize);
+    if (!a.cpu) return last.gpu;
     auto run = [&](uint32_t first, uint32_t count) {
       for (uint32_t i = first * 16; i < (first + count) * 16; i += 16) Swap16Bytes(a.cpu + i, src + i, 4);
     };
@@ -4077,6 +4088,10 @@ struct Backend::Impl {
   void DrawImpl(RenderCommandList* list, const FramePacket& f, const DrawCommand& d, void*) {
     prof.Start();
     const uint8_t* r = f.At(d.regs);
+    if (!r) {
+      stat_skipped++;
+      return;
+    }
     // Did the game rewrite this draw's vertex/index memory since the D3D call? (logged with the
     // record-time profile every 300 frames)
     // Only draws hashed at capture (--gtav_native_check_draw_data).
@@ -4183,8 +4198,10 @@ struct Backend::Impl {
     tprof.cached_blocks += fetch_cached;
     auto slots_start = prof.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     for (uint32_t slot = 0; slot < 32 && !fetch_cached; slot++) {
-      uint32_t words[6];
-      for (int w = 0; w < 6; w++) words[w] = be32(fetch + slot * 24 + w * 4);
+      uint32_t words[6] = {};
+      if (fetch) {
+        for (int w = 0; w < 6; w++) words[w] = be32(fetch + slot * 24 + w * 4);
+      }
       sc[0 * 32 + slot] = kNull2D;
       sc[1 * 32 + slot] = kNull3D;
       sc[2 * 32 + slot] = kNullCube;
@@ -4442,20 +4459,22 @@ struct Backend::Impl {
           const uint8_t* src = inline_data ? f.At(d.inline_vertices) : mem->TranslatePhysical(sb.address + sb.offset);
           if (!src) continue;
           auto a = upload.Allocate(bytes, 16);
-          std::memcpy(a.cpu, src, bytes);
+          if (a.cpu) std::memcpy(a.cpu, src, bytes);
           raw[e.stream] = a.gpu;
         }
         if (dumping) {
           const uint8_t* g = mem->TranslatePhysical(sb.address + sb.offset);
-          dump_log += fmt::format("indirect loc {} stream {} {} addr {:08X} size {} offset {} stride {} endian {} elem+{} "
-                                  "type {:06X} words {:08X} {:08X} {:08X} {:08X}\n",
-                                  location, e.stream, from_resolve[e.stream] ? "gpu-resolve" : "guest-mem", sb.address, sb.size, sb.offset, sb.stride, sb.endian, e.offset,
-                                  e.type, be32(g), be32(g + 4), be32(g + 8), be32(g + 12));
-          for (uint32_t row = 0; row < 8; row++) {
-            uint32_t at = row < 4 ? row * 16 : 0x1000 + (row - 4) * 16;
-            if (at + 16 > sb.size) break;
-            dump_log += fmt::format("  +{:04X}: {:08X} {:08X} {:08X} {:08X}\n", at, be32(g + at), be32(g + at + 4),
-                                    be32(g + at + 8), be32(g + at + 12));
+          if (g) {
+            dump_log += fmt::format("indirect loc {} stream {} {} addr {:08X} size {} offset {} stride {} endian {} elem+{} "
+                                    "type {:06X} words {:08X} {:08X} {:08X} {:08X}\n",
+                                    location, e.stream, from_resolve[e.stream] ? "gpu-resolve" : "guest-mem", sb.address, sb.size, sb.offset, sb.stride, sb.endian, e.offset,
+                                    e.type, be32(g), be32(g + 4), be32(g + 8), be32(g + 12));
+            for (uint32_t row = 0; row < 8; row++) {
+              uint32_t at = row < 4 ? row * 16 : 0x1000 + (row - 4) * 16;
+              if (at + 16 > sb.size) break;
+              dump_log += fmt::format("  +{:04X}: {:08X} {:08X} {:08X} {:08X}\n", at, be32(g + at), be32(g + at + 4),
+                                      be32(g + at + 8), be32(g + at + 12));
+            }
           }
         }
         uint8_t* record = shared_cpu + kIndirectFetchRecords + location * 32;
@@ -4591,9 +4610,11 @@ struct Backend::Impl {
                                      : mem->TranslatePhysical(d.streams[0].address + d.streams[0].offset);
       uint32_t words = d.is_inline ? std::min(d.inline_size / 4, 24u) : 24u;
       std::string v;
-      for (uint32_t i = 0; i < words; i++) {
-        uint32_t u = be32(g + 4 * i);
-        v += fmt::format(" {:g}", std::bit_cast<float>(u));
+      if (g) {
+        for (uint32_t i = 0; i < words; i++) {
+          uint32_t u = be32(g + 4 * i);
+          v += fmt::format(" {:g}", std::bit_cast<float>(u));
+        }
       }
       dump_log += fmt::format("  rect scissor {:08X} {:08X} vtx_cntl={:X} vport scale {:g},{:g} offset {:g},{:g} verts{}\n",
                               regs::Read(r, regs::D3D_WINDOW_SCISSOR_TL), regs::Read(r, regs::D3D_WINDOW_SCISSOR_BR),
@@ -4609,8 +4630,8 @@ struct Backend::Impl {
       dump_draws.push_back(uint32_t(d.ps_ucode_hash >> 32));
       size_t at = dump_draws.size();
       dump_draws.resize(at + 2048);
-      std::memcpy(&dump_draws[at], vsc.cpu, kAluSize);
-      std::memcpy(&dump_draws[at + 1024], psc.cpu, kAluSize);
+      if (vsc.cpu) std::memcpy(&dump_draws[at], vsc.cpu, kAluSize);
+      if (psc.cpu) std::memcpy(&dump_draws[at + 1024], psc.cpu, kAluSize);
     }
     if (msaa_draws_frames && ((bind_count && bind_color[0] && bind_color[0]->msaa) || (depth && depth->msaa))) {
       const RenderTarget* t = bind_count && bind_color[0] ? bind_color[0] : depth;
@@ -4657,13 +4678,15 @@ struct Backend::Impl {
       }
     }
     auto shared = upload.Allocate(kSharedConstantsSize);
-    std::memcpy(shared.cpu, shared_cpu, kSharedConstantsSize);
+    if (shared.cpu) std::memcpy(shared.cpu, shared_cpu, kSharedConstantsSize);
     uint64_t push[3] = {vsc.gpu, psc.gpu, shared.gpu};
     list->setGraphicsPushConstants(0, push, 0, sizeof(push));
 #if GTAV_MOBILE
-    if (RenderDescriptorSet* cs = ConstantSet(vsc.buffer, psc.buffer, shared.buffer)) {
-      const uint32_t offsets[3] = {uint32_t(vsc.offset), uint32_t(psc.offset), uint32_t(shared.offset)};
-      list->setGraphicsDescriptorSetDynamic(cs, kConstantSet, offsets, 3);
+    if (vsc.buffer && psc.buffer && shared.buffer) {
+      if (RenderDescriptorSet* cs = ConstantSet(vsc.buffer, psc.buffer, shared.buffer)) {
+        const uint32_t offsets[3] = {uint32_t(vsc.offset), uint32_t(psc.offset), uint32_t(shared.offset)};
+        list->setGraphicsDescriptorSetDynamic(cs, kConstantSet, offsets, 3);
+      }
     }
 #endif
     // Pipelines with several render targets declare one viewport per target.
@@ -4722,6 +4745,10 @@ struct Backend::Impl {
         return;
       }
       auto a = upload.Allocate(uint64_t(tris) * 3 * 4, 16);
+      if (!a.cpu || !a.buffer) {
+        stat_skipped++;
+        return;
+      }
       uint32_t* out = reinterpret_cast<uint32_t*>(a.cpu);
       const uint8_t* guest = d.indexed ? index_data : nullptr;
       uint32_t unit = d.index32 ? 4 : 2;
@@ -4753,6 +4780,10 @@ struct Backend::Impl {
       RenderBufferReference ib_ref;
       if (inline_indices) {  // CPU-written per draw: per-frame upload memory, never cached
         auto a = upload.Allocate(index_bytes, 16);
+        if (!a.cpu || !a.buffer) {
+          stat_skipped++;
+          return;
+        }
         ConvertInto(a.cpu, index_bytes, swap);
         ib_ref = RenderBufferReference(a.buffer, a.offset);
       } else {
@@ -4829,6 +4860,7 @@ struct Backend::Impl {
   void Clear(RenderCommandList* list, const FramePacket& f, const ClearCommand& c) {
     InvalidateDrawState();
     const uint8_t* r = f.At(c.regs);
+    if (!r) return;
     if (dumping)
       dump_log += fmt::format("clear flags={:X} color={:08X} z={} stencil={} rt0={:03X}/{} depth={:03X} mode={} scissor {:08X} {:08X}\n",
                               c.flags, c.color, c.z, c.stencil, regs::Color(r, 0).base,
@@ -5185,7 +5217,8 @@ struct Backend::Impl {
 
   void EndActiveQuery(RenderCommandList* list) {
     if (active_query < 0) return;
-    list->endOcclusionQuery(query_pools[slot].get(), uint32_t(active_query));
+    RenderQueryPool* pool = query_pools[slot].get();
+    if (pool) list->endOcclusionQuery(pool, uint32_t(active_query));
     active_query = -1;
   }
 
@@ -5236,6 +5269,7 @@ struct Backend::Impl {
       writeback_buffer = device->createBuffer(RenderBufferDesc::ReadbackBuffer(
           kWritebackSize, RenderBufferFlag::STORAGE | RenderBufferFlag::UNORDERED_ACCESS |
                               RenderBufferFlag::DEVICE_ADDRESSABLE));
+      if (!writeback_buffer) return;
       writeback_gpu = writeback_buffer->getDeviceAddress();
     }
     resolve_stamps[address].written_back = true;
@@ -5277,6 +5311,10 @@ struct Backend::Impl {
   std::vector<PendingWriteback> pending_writebacks;
   bool defer_writebacks = false;
   void FlushWritebacks(RenderCommandList* list) {
+    if (!writeback_buffer) {
+      pending_writebacks.clear();
+      return;
+    }
     for (auto& p : pending_writebacks) WriteGuestLayout(list, *p.r, p.g, writeback_buffer.get(), writeback_gpu + p.offset);
     pending_writebacks.clear();
   }
@@ -5545,6 +5583,7 @@ struct Backend::Impl {
     slot_generation++;
     InvalidateDrawState();
     const uint8_t* r = f.At(rc.regs);
+    if (!r) return;
     // Destination: the texture object's fetch constant (header 24 bytes + MipFlush).
     const uint32_t* words = rc.dest_words + 7;
     uint32_t base = FetchBaseAddress(words) & 0x1FFFFFFF;
@@ -5557,11 +5596,12 @@ struct Backend::Impl {
     if (!depth_resolve) {
       auto c = regs::Color(r, int(source));
       src = Target(c.base, uint32_t(c.format), false, surface.pitch, surface.msaa, dh);
+      if (!src) return;
       FlushClears(list, src);
     } else {
       auto d = regs::Depth(r);
       src = Target(d.base, d.float24, true, surface.pitch, surface.msaa, dh);
-      if (src->msaa || !src->descriptor) return;  // TODO: multisampled depth resolves
+      if (!src || src->msaa || !src->descriptor) return;  // TODO: multisampled depth resolves
     }
     RenderFormat guest_dst = ResolveDestFormat(words[1] & 0x3F);
     RenderFormat dst_format = depth_resolve                         ? RenderFormat::R32_FLOAT
@@ -5616,6 +5656,7 @@ struct Backend::Impl {
           fetch_dest_set->setTexture(dst.storage_index, dst.texture.get(), RenderTextureLayout::GENERAL);
         }
       }
+      if (!dst.texture) return;
       dst.mips = mips;
       dst.layers = layers;
       RenderTextureViewDesc view2d = RenderTextureViewDesc::Texture2D(dst_format);
@@ -6111,12 +6152,16 @@ void Backend::FrameComplete(uint32_t slot) {
   }
   if (auto& records = impl_->query_records[slot]; !records.empty()) {
     RenderQueryPool* pool = impl_->query_pools[slot].get();
-    pool->queryResults();
-    const uint64_t* samples = pool->getResults();
-    for (size_t i = 0; i < records.size(); i++)
-      if (records[i].serial)  // in guest pixels (most queries draw into scaled targets)
-        PublishQueryResult(records[i].query, records[i].serial,
-                           impl_->rs == 1.0f ? samples[i] : uint64_t(double(samples[i]) / (impl_->rs * impl_->rs)));
+    if (pool) {
+      pool->queryResults();
+      const uint64_t* samples = pool->getResults();
+      if (samples) {
+        for (size_t i = 0; i < records.size(); i++)
+          if (records[i].serial)  // in guest pixels (most queries draw into scaled targets)
+            PublishQueryResult(records[i].query, records[i].serial,
+                               impl_->rs == 1.0f ? samples[i] : uint64_t(double(samples[i]) / (impl_->rs * impl_->rs)));
+      }
+    }
     records.clear();
   }
   p.upload.Reset();
@@ -6132,13 +6177,17 @@ void Backend::FrameComplete(uint32_t slot) {
   // Resolves the CPU may read (--gtav_native=on): into guest memory now that the GPU wrote them.
   if (!p.writebacks.empty()) {
     auto* mem = REX_KERNEL_MEMORY();
-    const uint8_t* data = static_cast<const uint8_t*>(p.writeback_buffer->map());
-    for (const auto& w : p.writebacks)
-      if (uint8_t* guest = mem->TranslatePhysical(w.address)) {
-        std::memcpy(guest, data + w.offset, w.size);
-        write_watch::Touch(w.address, w.size);  // a physical-view write: no fault to see it
+    if (p.writeback_buffer) {
+      const uint8_t* data = static_cast<const uint8_t*>(p.writeback_buffer->map());
+      if (data) {
+        for (const auto& w : p.writebacks)
+          if (uint8_t* guest = mem->TranslatePhysical(w.address)) {
+            std::memcpy(guest, data + w.offset, w.size);
+            write_watch::Touch(w.address, w.size);  // a physical-view write: no fault to see it
+          }
+        p.writeback_buffer->unmap();
       }
-    p.writeback_buffer->unmap();
+    }
     p.writebacks.clear();
   }
   p.writeback_used = 0;

@@ -162,6 +162,7 @@ uint16_t be16(const uint8_t* p) { return uint16_t(p[0] << 8 | p[1]); }
 const uint8_t* Guest(uint32_t addr) { return REX_KERNEL_MEMORY()->TranslateVirtual(addr); }
 
 std::string Words(const uint8_t* p, int n) {
+  if (!p) return "<null>";
   std::string s;
   for (int i = 0; i < n; i++) s += fmt::format("{:08X} ", be32(p + 4 * i));
   return s;
@@ -740,7 +741,10 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
   // shaders read are copied and compared (the rest of a block is undefined).
   auto push_or_share = [](const uint8_t* src, uint32_t size, const uint32_t* previous, int kind) {
     g_copy_bytes[kind][0] += size;
-    if (previous && std::memcmp(src, g_packet.At(*previous), size) == 0) return *previous;
+    if (previous) {
+      const uint8_t* prev_p = g_packet.At(*previous);
+      if (prev_p && std::memcmp(src, prev_p, size) == 0) return *previous;
+    }
     g_copy_bytes[kind][1] += size;
     return g_packet.Push(src, size);
   };
@@ -772,13 +776,15 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
     g_copy_bytes[1 + bank][0] += bytes;
     if (previous) {
       const uint8_t* old = g_packet.At(*previous);
-      bool same = true;
-      for (const auto& run : use.runs)
-        if (std::memcmp(src + 16 * run.first, old + 16 * run.first, 16 * run.count) != 0) {
-          same = false;
-          break;
-        }
-      if (same) return *previous;
+      if (old) {
+        bool same = true;
+        for (const auto& run : use.runs)
+          if (std::memcmp(src + 16 * run.first, old + 16 * run.first, 16 * run.count) != 0) {
+            same = false;
+            break;
+          }
+        if (same) return *previous;
+      }
     }
     g_copy_bytes[1 + bank][1] += bytes;
     uint32_t at = uint32_t(g_packet.arena.size());
@@ -798,8 +804,12 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
   // --gtav_native_dump_on_collapse: wind-animated tree leaf draws (VS AF15EF63) whose
   // _globalEntityScale (c232) has z = 0 collapse to a point (black tree "orbs"). OnCaptureSwap
   // requests a frame dump once that lasts (to compare with the emulator in shadow mode).
-  if (REXCVAR_GET(gtav_native_dump_on_collapse) && d.vs_hash == 0xAF15EF63BB4B093Full)
-    (be32(g_packet.At(d.vs_consts) + 232 * 16 + 8) == 0 ? g_collapse.frame_bad : g_collapse.frame_good) = true;
+  if (REXCVAR_GET(gtav_native_dump_on_collapse) && d.vs_hash == 0xAF15EF63BB4B093Full) {
+    const uint8_t* vc = g_packet.At(d.vs_consts);
+    if (vc) {
+      (be32(vc + 232 * 16 + 8) == 0 ? g_collapse.frame_bad : g_collapse.frame_good) = true;
+    }
+  }
   // The device's own field, as DrawIndexedVertices reads it: SetIndices (83806E70) is not the
   // only writer, so the hooked value can be stale.
   uint32_t index_buffer = be32(dev + d3d::kDevIndexBuffer);
@@ -1090,6 +1100,7 @@ void OnQueryIssue(uint32_t query, uint32_t flags) {
   FlushIndexedVertices();
   if (!Active() || !query) return;
   const uint8_t* q = Guest(query);
+  if (!q) return;
   constexpr uint32_t kOcclusion = 9;  // D3DQUERYTYPE_OCCLUSION
   if (be32(q + 4) != kOcclusion) return;
   uint32_t device = be32(q);
@@ -1160,9 +1171,14 @@ struct BufferStats {
 } g_buffer_stats;
 
 void CopyCommand(FramePacket& dst, const FramePacket& src, const Command& c, uint32_t pm4) {
-  auto blob = [&](uint32_t at, uint32_t size) { return size ? dst.Push(src.At(at), size) : 0u; };
+  auto blob = [&](uint32_t at, uint32_t size) {
+    if (!size) return 0u;
+    const uint8_t* p = src.At(at);
+    return p ? dst.Push(p, size) : 0u;
+  };
   switch (c.kind) {
     case CommandKind::kDraw: {
+      if (c.index >= src.draws.size()) break;
       DrawCommand d = src.draws[c.index];
       d.regs = blob(d.regs, kRegShadowSize);
       d.fetch = blob(d.fetch, kFetchSize);
@@ -1175,6 +1191,7 @@ void CopyCommand(FramePacket& dst, const FramePacket& src, const Command& c, uin
       break;
     }
     case CommandKind::kClear: {
+      if (c.index >= src.clears.size()) break;
       ClearCommand k = src.clears[c.index];
       k.regs = blob(k.regs, kRegShadowSize);
       dst.commands.push_back({c.kind, uint32_t(dst.clears.size()), pm4});
@@ -1182,11 +1199,13 @@ void CopyCommand(FramePacket& dst, const FramePacket& src, const Command& c, uin
       break;
     }
     case CommandKind::kQuery: {
+      if (c.index >= src.queries.size()) break;
       dst.commands.push_back({c.kind, uint32_t(dst.queries.size()), pm4});
       dst.queries.push_back(src.queries[c.index]);
       break;
     }
     case CommandKind::kResolve: {
+      if (c.index >= src.resolves.size()) break;
       ResolveCommand k = src.resolves[c.index];
       k.regs = blob(k.regs, kRegShadowSize);
       dst.commands.push_back({c.kind, uint32_t(dst.resolves.size()), pm4});
@@ -1232,6 +1251,7 @@ void OnCommandBufferRun(uint32_t device, uint32_t write_before, uint32_t write_a
   FlushIndexedVertices();
   if (!Active() || !write_before || write_after <= write_before || write_after - write_before > 4096) return;
   const uint8_t* p = Guest(write_before);
+  if (!p) return;
   for (uint32_t at = 0; at + 12 <= write_after - write_before; at += 4) {
     if (be32(p + at) != 0xC0013F00) continue;  // PM4 type 3 INDIRECT_BUFFER, 2 dwords
     uint32_t begin = be32(p + at + 4), dwords = be32(p + at + 8) & 0xFFFFF;

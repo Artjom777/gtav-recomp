@@ -224,7 +224,11 @@ struct FramePacket {
     front_buffer = 0;
   }
   const uint8_t* At(uint32_t offset) const {
-    return offset & kFenceBit ? fence_arena.data() + (offset & ~kFenceBit) : arena.data() + offset;
+    if (offset & kFenceBit) {
+      uint32_t o = offset & ~kFenceBit;
+      return (o < fence_arena.size() && fence_arena.data()) ? fence_arena.data() + o : nullptr;
+    }
+    return (offset < arena.size() && arena.data()) ? arena.data() + offset : nullptr;
   }
 };
 

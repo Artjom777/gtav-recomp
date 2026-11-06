@@ -1536,7 +1536,7 @@ index 9329c6d..c52b9f8 100644
    size_t rel_offset_bits = offset_bits_ - (offset_bytes << 3);
    size_t bits_left = num_bits;
 diff --git a/src/core/exception_handler_posix.cpp b/src/core/exception_handler_posix.cpp
-index 8b1c76a..ff8bff1 100644
+index 8b1c76a..b2beec5 100644
 --- a/src/core/exception_handler_posix.cpp
 +++ b/src/core/exception_handler_posix.cpp
 @@ -28,6 +28,11 @@
@@ -1551,7 +1551,24 @@ index 8b1c76a..ff8bff1 100644
  
  #include <ucontext.h>
  
-@@ -225,6 +230,12 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
+@@ -168,12 +173,10 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
+       ex.InitializeIllegalInstruction(&thread_context);
+       break;
+     case SIGBUS:
+-      // On macOS, SIGBUS (KERN_PROTECTION_FAILURE) is raised for writes to
+-      // read-protected pages — the same scenario that raises SIGSEGV on Linux.
+-      // Fall through to treat it as an access violation.
+-#if !REX_PLATFORM_MAC
+-      // On non-Mac POSIX, SIGBUS is a bus error (misaligned access), not a
+-      // protection fault — don't handle it here.
++      // On macOS and Android, SIGBUS is raised for writes to read-protected pages
++      // or unaligned access — treat it as an access violation attempt.
++#if !REX_PLATFORM_MAC && !REX_PLATFORM_ANDROID
++      // On non-Mac/non-Android POSIX, SIGBUS is an unhandled bus error.
+       assert_unhandled_case(signal_number);
+       return;
+ #endif
+@@ -225,6 +228,12 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
          access_violation_operation = (mcontext_esr->esr & (UINT64_C(1) << 6))
                                           ? Exception::AccessViolationOperation::kWrite
                                           : Exception::AccessViolationOperation::kRead;
@@ -1564,7 +1581,7 @@ index 8b1c76a..ff8bff1 100644
        } else {
          // Determine the memory access direction based on which instruction has
          // requested it.
-@@ -417,6 +428,53 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
+@@ -417,6 +426,53 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
        return;
      }
    }
@@ -1607,7 +1624,7 @@ index 8b1c76a..ff8bff1 100644
 +    case SIGSEGV:
 +      sigaction(SIGSEGV, &original_sigsegv_handler_, nullptr);
 +      break;
-+#if REX_PLATFORM_MAC
++#if REX_PLATFORM_MAC || REX_PLATFORM_ANDROID
 +    case SIGBUS:
 +      sigaction(SIGBUS, &original_sigbus_handler_, nullptr);
 +      break;
@@ -1618,6 +1635,15 @@ index 8b1c76a..ff8bff1 100644
  }
  
  void ExceptionHandler::Install(Handler fn, void* data) {
+@@ -433,7 +489,7 @@ void ExceptionHandler::Install(Handler fn, void* data) {
+     if (sigaction(SIGSEGV, &signal_handler, &original_sigsegv_handler_) != 0) {
+       assert_always("Failed to install new SIGSEGV handler");
+     }
+-#if REX_PLATFORM_MAC
++#if REX_PLATFORM_MAC || REX_PLATFORM_ANDROID
+     if (sigaction(SIGBUS, &signal_handler, &original_sigbus_handler_) != 0) {
+       assert_always("Failed to install new SIGBUS handler");
+     }
 diff --git a/src/core/fiber_posix.cpp b/src/core/fiber_posix.cpp
 index 4fe1ca6..c5a4199 100644
 --- a/src/core/fiber_posix.cpp
