@@ -56,7 +56,10 @@ inline std::filesystem::path ExeDir() {
 inline std::string DefaultSpirvDir() {
 #if defined(__ANDROID__)
   std::error_code ec;
-  for (const auto& path : {"/storage/emulated/0/gtav/spirv", "/sdcard/gtav/spirv"}) {
+  for (const auto& path : {"/storage/emulated/0/gtav/spirv",
+                           "/sdcard/gtav/spirv",
+                           "/storage/emulated/0/Download/gtav/spirv",
+                           "/sdcard/Download/gtav/spirv"}) {
     if (std::filesystem::is_directory(path, ec)) return path;
   }
 #elif defined(__APPLE__) && TARGET_OS_IPHONE

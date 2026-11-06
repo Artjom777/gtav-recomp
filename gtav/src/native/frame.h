@@ -108,7 +108,9 @@ uint64_t DrawDataHash(const DrawCommand& d, Translate&& physical) {
     if (!s.address || !s.stride) continue;
     uint64_t lo = s.offset + uint64_t(first) * s.stride, hi = s.offset + uint64_t(last) * s.stride;
     if (hi > s.size || lo >= hi) continue;
-    mix(physical(s.address) + lo, uint32_t(hi - lo));
+    const uint8_t* sp = physical(s.address);
+    if (!sp) continue;
+    mix(sp + lo, uint32_t(hi - lo));
   }
   return h;
 }

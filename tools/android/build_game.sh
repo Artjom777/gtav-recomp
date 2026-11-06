@@ -15,6 +15,7 @@ if [ "$step" = configure ] || [ "$step" = all ]; then
     -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
     -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-30 -DANDROID_STL=c++_shared \
     -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384" \
     -DCMAKE_FIND_ROOT_PATH="$PREFIX" \
     -Drexglue_DIR="$PREFIX/lib/cmake/rexglue" \
     -DSDL3_DIR="$PREFIX/lib/cmake/SDL3" \

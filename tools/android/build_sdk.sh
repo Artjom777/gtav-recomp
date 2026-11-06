@@ -18,7 +18,7 @@ if [ "$step" = configure ] || [ "$step" = all ]; then
     -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-30 -DANDROID_STL=c++_shared \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=23 \
     -DCMAKE_C_FLAGS="-march=${MARCH}" -DCMAKE_CXX_FLAGS="-march=${MARCH} -fno-semantic-interposition" \
-    -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-Bsymbolic-functions" \
+    -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-Bsymbolic-functions -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384" \
     -DCMAKE_INSTALL_PREFIX="$PREFIX" \
     -DREXGLUE_ENABLE_TRACY=OFF -DREXGLUE_BUILD_TESTS=OFF \
     -DSDL_X11=OFF -DSDL_WAYLAND=OFF

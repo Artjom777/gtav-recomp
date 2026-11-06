@@ -1536,10 +1536,10 @@ index 9329c6d..c52b9f8 100644
    size_t rel_offset_bits = offset_bits_ - (offset_bytes << 3);
    size_t bits_left = num_bits;
 diff --git a/src/core/exception_handler_posix.cpp b/src/core/exception_handler_posix.cpp
-index 8b1c76a..de33b38 100644
+index 8b1c76a..9504e3b 100644
 --- a/src/core/exception_handler_posix.cpp
 +++ b/src/core/exception_handler_posix.cpp
-@@ -28,6 +28,11 @@
+@@ -28,6 +28,12 @@
  #include <rex/logging.h>
  #include <rex/math.h>
  #include <rex/platform.h>
@@ -1547,11 +1547,12 @@ index 8b1c76a..de33b38 100644
 +#include <dlfcn.h>
 +#include <unistd.h>
 +#include <cstdio>
++#include <sys/uio.h>
 +#endif
  
  #include <ucontext.h>
  
-@@ -36,7 +41,7 @@ namespace rex::arch {
+@@ -36,7 +42,7 @@ namespace rex::arch {
  bool signal_handlers_installed_ = false;
  struct sigaction original_sigill_handler_;
  struct sigaction original_sigsegv_handler_;
@@ -1560,7 +1561,7 @@ index 8b1c76a..de33b38 100644
  struct sigaction original_sigbus_handler_;
  #endif
  
-@@ -168,12 +173,10 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
+@@ -168,12 +174,10 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
        ex.InitializeIllegalInstruction(&thread_context);
        break;
      case SIGBUS:
@@ -1577,7 +1578,7 @@ index 8b1c76a..de33b38 100644
        assert_unhandled_case(signal_number);
        return;
  #endif
-@@ -225,6 +228,12 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
+@@ -225,6 +229,12 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
          access_violation_operation = (mcontext_esr->esr & (UINT64_C(1) << 6))
                                           ? Exception::AccessViolationOperation::kWrite
                                           : Exception::AccessViolationOperation::kRead;
@@ -1590,7 +1591,7 @@ index 8b1c76a..de33b38 100644
        } else {
          // Determine the memory access direction based on which instruction has
          // requested it.
-@@ -417,6 +426,53 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
+@@ -417,6 +427,56 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
        return;
      }
    }
@@ -1613,8 +1614,11 @@ index 8b1c76a..de33b38 100644
 +    print_frame("lr", thread_context.x[30]);
 +    uint64_t fp = thread_context.x[29];
 +    for (int i = 0; i < 32 && fp && (fp & 7) == 0; i++) {
-+      uint64_t next = reinterpret_cast<uint64_t*>(fp)[0];
-+      uint64_t ret = reinterpret_cast<uint64_t*>(fp)[1];
++      uint64_t frame[2] = {};
++      struct iovec local{&frame, sizeof(frame)}, remote{reinterpret_cast<void*>(fp), sizeof(frame)};
++      if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != sizeof(frame)) break;
++      uint64_t next = frame[0];
++      uint64_t ret = frame[1];
 +      if (!ret) break;
 +      print_frame("fp", ret);
 +      if (next <= fp) break;
@@ -1644,7 +1648,7 @@ index 8b1c76a..de33b38 100644
  }
  
  void ExceptionHandler::Install(Handler fn, void* data) {
-@@ -433,7 +489,7 @@ void ExceptionHandler::Install(Handler fn, void* data) {
+@@ -433,7 +493,7 @@ void ExceptionHandler::Install(Handler fn, void* data) {
      if (sigaction(SIGSEGV, &signal_handler, &original_sigsegv_handler_) != 0) {
        assert_always("Failed to install new SIGSEGV handler");
      }
@@ -1653,7 +1657,7 @@ index 8b1c76a..de33b38 100644
      if (sigaction(SIGBUS, &signal_handler, &original_sigbus_handler_) != 0) {
        assert_always("Failed to install new SIGBUS handler");
      }
-@@ -478,7 +534,7 @@ void ExceptionHandler::Uninstall(Handler fn, void* data) {
+@@ -478,7 +538,7 @@ void ExceptionHandler::Uninstall(Handler fn, void* data) {
        if (sigaction(SIGSEGV, &original_sigsegv_handler_, NULL) != 0) {
          assert_always("Failed to restore original SIGSEGV handler");
        }
@@ -3800,15 +3804,18 @@ index 0000000..913511e
 +}  // namespace ui
 +}  // namespace rex
 diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
-index 8197bb4..c1a9a3a 100644
+index 8197bb4..2295510 100644
 --- a/src/ui/vulkan/vulkan_device.cpp
 +++ b/src/ui/vulkan/vulkan_device.cpp
-@@ -23,20 +23,19 @@
+@@ -22,21 +22,21 @@
+ #include <rex/string.h>
  #include <rex/ui/vulkan/device.h>
  
- REXCVAR_DEFINE_BOOL(vulkan_require_fragment_stores_and_atomics, true, "UI/Vulkan",
+-REXCVAR_DEFINE_BOOL(vulkan_require_fragment_stores_and_atomics, true, "UI/Vulkan",
 -                    "Deprecated and ignored for parity; fragmentStoresAndAtomics is always "
 -                    "required for Vulkan GPU emulation")
++REXCVAR_DEFINE_BOOL(vulkan_require_fragment_stores_and_atomics,
++                    !REX_PLATFORM_MAC && !REX_PLATFORM_ANDROID, "UI/Vulkan",
 +                    "Require fragmentStoresAndAtomics support for Vulkan GPU emulation")
      .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 -REXCVAR_DEFINE_BOOL(vulkan_require_vertex_pipeline_stores_and_atomics, true, "UI/Vulkan",
@@ -3832,7 +3839,7 @@ index 8197bb4..c1a9a3a 100644
                      "Require fillModeNonSolid support for Vulkan GPU emulation (disable to "
                      "allow fallback to solid fill for line/point polygon modes)")
      .lifecycle(rex::cvar::Lifecycle::kInitOnly);
-@@ -109,14 +108,16 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+@@ -109,14 +109,16 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
            properties.deviceName);
        return nullptr;
      }

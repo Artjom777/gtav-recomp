@@ -1161,7 +1161,23 @@ class Renderer {
       return;
     }
     auto acquire_end = std::chrono::steady_clock::now();
-    plume::RenderTexture* target = swapchain_->getTexture(image);
+    plume::RenderTexture* target = (swapchain_ && image < swapchain_->getTextureCount()) ? swapchain_->getTexture(image) : nullptr;
+    if (!target || image >= framebuffers_.size() || !framebuffers_[image]) {
+      list_->end();
+      if (backend_ok_) backend_.EndFrame(slot);
+      const plume::RenderCommandList* lists = list_;
+      plume::RenderCommandFence* fence = fences_[slot].get();
+      submitter_.Push([this, lists, fence] {
+        const plume::RenderCommandList* l = lists;
+        queue_cmd_->executeCommandLists(&l, 1, nullptr, 0, nullptr, 0, fence);
+      });
+      in_flight_[slot] = true;
+      slot_ = (slot + 1) % Backend::kFramesInFlight;
+#ifdef __ANDROID__
+      surface_lost_ = true;
+#endif
+      return;
+    }
     swap_target_ = target;
     swap_image_ = image;
     list_->barriers(plume::RenderBarrierStage::GRAPHICS,
@@ -1250,6 +1266,8 @@ class Renderer {
                     plume::RenderTextureBarrier(target, plume::RenderTextureLayout::PRESENT));
     list_->end();
     if (backend_ok_) backend_.EndFrame(slot);
+    while (release_.size() <= image)
+      release_.push_back(device_->createCommandSemaphore());
     const plume::RenderCommandList* lists = list_;
     plume::RenderCommandSemaphore* wait = acquires_[slot].get();
     plume::RenderCommandSemaphore* signal = release_[image].get();
@@ -1260,7 +1278,11 @@ class Renderer {
       const plume::RenderCommandList* l = lists;
       queue_cmd_->executeCommandLists(&l, 1, &w, 1, &sg, 1, fence);
       std::lock_guard lock(present_mutex_);
-      swapchain_->present(image, &sg, 1);
+      if (!swapchain_->present(image, &sg, 1)) {
+#ifdef __ANDROID__
+        surface_lost_ = true;
+#endif
+      }
     });
     auto submit_end = std::chrono::steady_clock::now();
     auto present_end = submit_end;

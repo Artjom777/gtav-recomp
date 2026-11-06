@@ -442,7 +442,9 @@ static void SnapshotDrawData(DrawCommand& d, Push&& push) {
       if (!sb.address || !sb.stride || sb.size <= sb.offset) continue;
       uint64_t lo = uint64_t(first) * sb.stride, hi = std::min<uint64_t>(uint64_t(last) * sb.stride, sb.size - sb.offset);
       if (lo >= hi) { d.snap_vertices = 0; break; }
-      d.snap_stream[s] = push(mem->TranslatePhysical(sb.address + sb.offset) + lo, uint32_t(hi - lo));
+      const uint8_t* sp = mem->TranslatePhysical(sb.address + sb.offset);
+      if (!sp) { d.snap_vertices = 0; break; }
+      d.snap_stream[s] = push(sp + lo, uint32_t(hi - lo));
       d.snap_vertices = std::min<uint32_t>(d.snap_vertices, uint32_t((hi - lo) / sb.stride));
     }
   }
@@ -1353,7 +1355,10 @@ static void StoreFence(uint32_t address, uint32_t value, uint32_t endian) {
     case 2: value = __builtin_bswap32(value); break;
     case 3: value = (value << 16) | (value >> 16); break;
   }
-  std::memcpy(REX_KERNEL_MEMORY()->TranslatePhysical(address), &value, 4);
+  uint8_t* dst = REX_KERNEL_MEMORY()->TranslatePhysical(address);
+  if (dst) {
+    std::memcpy(dst, &value, 4);
+  }
 }
 
 // Releases every held-back fence (command processor thread: idle, or before its swap).

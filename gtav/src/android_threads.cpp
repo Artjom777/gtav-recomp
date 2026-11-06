@@ -69,7 +69,12 @@ const bool g_main_pinner = [] {
       if (!tid) continue;
       const int want = REXCVAR_GET(gtav_android_main_prime) ? 1 : 0;
       if (want == pinned) continue;
-      if (!(want ? SetAffinity(tid, n - 1, n - 1) : SetAffinity(tid, 0, n - 1))) {
+      bool ok = want ? SetAffinity(tid, n - 1, n - 1) : SetAffinity(tid, 0, n - 1);
+      if (!ok && want) {
+        // Fallback: If prime core (n-1) is throttled/offline, pin to any performance core (n/2 to n-1)
+        ok = SetAffinity(tid, n / 2, n - 1);
+      }
+      if (!ok) {
         tid = 0;  // gone (or a new run of it): look it up again
         continue;
       }

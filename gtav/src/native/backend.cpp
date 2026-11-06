@@ -2512,9 +2512,10 @@ struct Backend::Impl {
     }
     if (is_mali) {
       REXLOG_INFO("[native] ARM Mali GPU detected ({}): applying Mali-G720 compatibility profile", dev_name);
-      rs = 0.5f;
+      rs = float(std::clamp(REXCVAR_GET(gtav_native_render_scale), 0.5, 1.0));
       fragment_barriers = false;
       use_fetch_resolves = false;
+      rect_gs = false;
     } else {
       rs = float(std::clamp(REXCVAR_GET(gtav_native_render_scale), 0.5, 1.0));
     }
@@ -4607,7 +4608,7 @@ struct Backend::Impl {
     if (dumping && d.primitive == 8 && d.count <= 6) {
       // Screen-space rects: the raw vertices (big-endian floats) and the pixel-centre convention.
       const uint8_t* g = d.is_inline ? f.At(d.inline_vertices)
-                                     : mem->TranslatePhysical(d.streams[0].address + d.streams[0].offset);
+                                     : (d.streams[0].address ? mem->TranslatePhysical(d.streams[0].address + d.streams[0].offset) : nullptr);
       uint32_t words = d.is_inline ? std::min(d.inline_size / 4, 24u) : 24u;
       std::string v;
       if (g) {
@@ -6102,9 +6103,10 @@ void Backend::SetMali(bool mali) {
   if (impl_) {
     impl_->is_mali = mali;
     if (mali) {
-      impl_->rs = 0.5f;
+      impl_->rs = float(std::clamp(REXCVAR_GET(gtav_native_render_scale), 0.5, 1.0));
       impl_->use_fetch_resolves = false;
       impl_->fragment_barriers = false;
+      impl_->rect_gs = false;
     }
   }
 }
