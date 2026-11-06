@@ -64,11 +64,14 @@ GTAVFS_EXPORT uint64_t gtavfs_global_lock_check() {
 }
 
 GTAVFS_EXPORT void gtavfs_trap(PPCContext* ctx, uint8_t* base, uint16_t trap_type) {
+  if (!ctx || !base) return;
   switch (trap_type) {
     case 20:
     case 26: {
-      std::string_view str(reinterpret_cast<const char*>(base + ctx->r3.u32), ctx->r4.u16);
-      REXCPU_DEBUG("(service trap) {}", str);
+      if (ctx->r3.u32) {
+        std::string_view str(reinterpret_cast<const char*>(base + ctx->r3.u32), ctx->r4.u16);
+        REXCPU_DEBUG("(service trap) {}", str);
+      }
       break;
     }
     case 0:

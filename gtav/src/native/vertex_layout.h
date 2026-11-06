@@ -124,6 +124,7 @@ inline void Build(const DrawCommand& d, HostLayout* out) {
     TypeInfo info;
     uint32_t location = Location(e.usage, e.usage_index);
     if (e.stream >= kMaxStreams || !Lookup(e.type, &info) || location == ~0u) continue;
+    if (out->element_count >= kMaxVertexElements) break;
     uint32_t n = out->element_count++;
     out->info[n] = info;
     out->guest_index[n] = i;

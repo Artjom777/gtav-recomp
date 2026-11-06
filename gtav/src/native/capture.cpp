@@ -695,16 +695,16 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
                                uint32_t start, uint32_t count) {
   FlushIndexedVertices();
   if (!Active()) return nullptr;
+  const uint8_t* dev = Guest(device);
+  if (!dev) return nullptr;
   if (REXCVAR_GET(gtav_native_pm4_scan)) {
     FlushInlineConstants();
     uint8_t vs[256 * 16];
-    std::memcpy(vs, Guest(device) + d3d::kDevVsConstants, sizeof(vs));
+    std::memcpy(vs, dev + d3d::kDevVsConstants, sizeof(vs));
     for (uint32_t i = 0; i < 256; i++)
       if (g_inline_consts.valid[0][i]) std::memcpy(vs + 16 * i, g_inline_consts.data[0][i], 16);
     pm4scan::OnDraw(WritePointer(device), ShaderHash(g_bound.vertex_shader), vs);
   }
-  const uint8_t* dev = Guest(device);
-  if (!dev) return nullptr;
   DrawCommand d;
   d.indexed = indexed;
   d.primitive = primitive;
@@ -751,10 +751,20 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
     const uint8_t* src = shadow;
     alignas(16) uint8_t patched[kAluSize];
     if (g_inline_consts.any) {
-      for (const auto& run : use.runs) std::memcpy(patched + 16 * run.first, shadow + 16 * run.first, 16 * run.count);
-      for (const auto& run : use.runs)
-        for (uint32_t i = run.first; i < uint32_t(run.first + run.count); i++)
-          if (g_inline_consts.valid[bank][i]) std::memcpy(patched + 16 * i, g_inline_consts.data[bank][i], 16);
+      for (const auto& run : use.runs) {
+        if (run.first < 256) {
+          uint32_t cnt = std::min<uint32_t>(run.count, 256 - run.first);
+          std::memcpy(patched + 16 * run.first, shadow + 16 * run.first, 16 * cnt);
+        }
+      }
+      for (const auto& run : use.runs) {
+        if (run.first < 256) {
+          uint32_t cnt = std::min<uint32_t>(run.count, 256 - run.first);
+          for (uint32_t i = run.first; i < run.first + cnt; i++) {
+            if (g_inline_consts.valid[bank][i]) std::memcpy(patched + 16 * i, g_inline_consts.data[bank][i], 16);
+          }
+        }
+      }
       src = patched;
     }
     uint32_t bytes = 0;

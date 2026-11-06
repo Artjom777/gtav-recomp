@@ -20,6 +20,7 @@ constexpr uint32_t kAudioObj = 0x83A320F8;   // cutscene audio entity (controlle
 constexpr uint32_t kStreamSlots = 0x83A320C0 + 10296;
 
 uint32_t be32(const uint8_t* base, uint32_t addr) {
+  if (!base) return 0;
   const uint8_t* p = base + addr;
   return uint32_t(p[0]) << 24 | p[1] << 16 | p[2] << 8 | p[3];
 }
@@ -37,6 +38,7 @@ bool StreamAtEnd(const uint8_t* base, int32_t slot_index) {
 REX_EXTERN(__imp__sub_823F30F0);
 
 static void UnstickCutsceneAudio(PPCContext& ctx, uint8_t* base) {
+  if (!base) return;
   if (be32(base, kAudioObj + 5068) != 5 || !base[kAudioObj + 5072]) return;
   int32_t a = int32_t(be32(base, kAudioObj + 5044)), b = int32_t(be32(base, kAudioObj + 5048));
   if (!StreamAtEnd(base, a) || !StreamAtEnd(base, b)) return;

@@ -1974,6 +1974,7 @@ struct Backend::Impl {
       desc.renderTargetBlend[0] = RenderBlendDesc::Copy();
       pipeline = device->createGraphicsPipeline(desc);
     }
+    if (!pipeline) return;
     list->setGraphicsPipelineLayout(layout.get());
     list->setPipeline(pipeline.get());
     list->setGraphicsDescriptorSet(texture_set.get(), 0);
@@ -2006,6 +2007,7 @@ struct Backend::Impl {
       digits_pipeline = device->createGraphicsPipeline(desc);
       digits_format = format;
     }
+    if (!digits_pipeline) return;
     // Four 14x24 digits 18 apart plus a 4 px margin, at `scale`.
     uint32_t w = (4 * 18 + 4) * scale, h = (24 + 8) * scale;
     list->setViewports(RenderViewport(float(x), float(y), float(w), float(h)));
