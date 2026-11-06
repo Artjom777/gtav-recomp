@@ -54,7 +54,12 @@ inline std::filesystem::path ExeDir() {
 // SPIR-V of the game's shaders (census output): <exe dir>/spirv. iPhone release: inside the app
 // bundle (the player's Mac translated them into the ipa); a Documents/spirv (dev builds) wins.
 inline std::string DefaultSpirvDir() {
-#if defined(__APPLE__) && TARGET_OS_IPHONE
+#if defined(__ANDROID__)
+  std::error_code ec;
+  for (const auto& path : {"/storage/emulated/0/gtav/spirv", "/sdcard/gtav/spirv"}) {
+    if (std::filesystem::is_directory(path, ec)) return path;
+  }
+#elif defined(__APPLE__) && TARGET_OS_IPHONE
   std::error_code ec;
   if (!std::filesystem::is_directory(ExeDir() / "spirv", ec)) {
     char buf[4096];

@@ -98,6 +98,7 @@ const CachedLookup& Lookup(uint32_t guest_object) {
 void OnCreate(const uint8_t* base, uint32_t container, uint32_t object, bool pixel) {
   if (!object || !container) return;
   const uint8_t* c = REX_KERNEL_MEMORY()->TranslateVirtual(container);
+  if (!c) return;
   uint32_t flags = be32(c), size = be32(c + 4) + be32(c + 8);
   if ((flags & 0xFFFFFF00) != 0x102A1100 || size > (16u << 20)) return;
   uint64_t hash = XXH3_64bits(c, size);
@@ -123,6 +124,7 @@ void OnCreate(const uint8_t* base, uint32_t container, uint32_t object, bool pix
     const uint8_t* phys = c + be32(c + 4);
     auto* mem = REX_KERNEL_MEMORY();
     const uint8_t* obj = mem->TranslateVirtual(object);
+    if (!obj) return;
     for (uint32_t off = 0; off < 872; off += 4) {
       uint32_t v = be32(obj + off);
       if (v < 0x1000) continue;

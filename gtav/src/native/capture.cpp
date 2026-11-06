@@ -137,6 +137,10 @@ void FlushInlineConstants() {
   auto& c = g_inline_consts;
   if (!c.pending_ptr) return;
   const uint8_t* src = REX_KERNEL_MEMORY()->TranslateVirtual(c.pending_ptr);
+  if (!src) {
+    c.pending_ptr = 0;
+    return;
+  }
   for (uint32_t i = 0; i < c.pending_count && c.pending_start + i < 256; i++) {
     std::memcpy(c.data[c.pending_bank][c.pending_start + i], src + 16 * i, 16);
     c.valid[c.pending_bank][c.pending_start + i] = true;

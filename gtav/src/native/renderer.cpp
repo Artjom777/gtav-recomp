@@ -1212,6 +1212,7 @@ class Renderer {
       FlickerCapture(slot, frame.index, front_descriptor, w, h);
     }
     if (key_replay_.exchange(false)) WriteReplay(frame.index);
+    const plume::RenderFormat swapFormat = target->getFormat();
     if (front) {
 #if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
       // Phone screens are wider than 16:9: keep the game's aspect ratio with black bars.
@@ -1222,7 +1223,7 @@ class Renderer {
         list_->setViewports(plume::RenderViewport((fw - vw) * 0.5f, (fh - vh) * 0.5f, vw, vh));
       }
 #endif
-      backend_.Blit(list_, front_descriptor, kSwapchainFormat);
+      backend_.Blit(list_, front_descriptor, swapFormat);
 #if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
       list_->setViewports(plume::RenderViewport(0, 0, float(w), float(h)));
 #endif
@@ -1239,11 +1240,11 @@ class Renderer {
       fps_since_ = now;
     }
     if (backend_ok_ && REXCVAR_GET(gtav_native_fps))
-      backend_.DrawCounter(list_, fps_value_, 8, 8, std::max(1u, h / 720), kSwapchainFormat);
+      backend_.DrawCounter(list_, fps_value_, 8, 8, std::max(1u, h / 720), swapFormat);
     if (backend_ok_) {
       double frame_ms = fps_value_ ? 1000.0 / fps_value_ : 0.0;
       if (ImDrawData* menu_data = menu::Frame(w, h, fps_value_, frame_ms))
-        backend_.DrawMenu(list_, menu_data, kSwapchainFormat);
+        backend_.DrawMenu(list_, menu_data, swapFormat);
     }
     list_->barriers(plume::RenderBarrierStage::NONE,
                     plume::RenderTextureBarrier(target, plume::RenderTextureLayout::PRESENT));

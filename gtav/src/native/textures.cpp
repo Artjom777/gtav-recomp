@@ -304,7 +304,9 @@ uint64_t HashGuestTexture(const uint32_t words[6], bool sampled) {
   auto* mem = REX_KERNEL_MEMORY();
   auto hash_range = [&](uint32_t addr, uint32_t size, uint64_t seed) {
     if (!addr || !size || size > (64u << 20) || (addr & 0x1FFFFFFF) + uint64_t(size) > 0x20000000) return seed;
-    return XXH3_64bits_withSeed(mem->TranslatePhysical(addr), size, seed);
+    const uint8_t* p = mem->TranslatePhysical(addr);
+    if (!p) return seed;
+    return XXH3_64bits_withSeed(p, size, seed);
   };
   if (sampled) {
     // 16 runs of 256 bytes spread over the base level and 4 over the mips: catches a streaming
@@ -358,6 +360,7 @@ bool Decode3D(const rex::graphics::TextureInfo& info, const HostFormat& host, ui
   const uint32_t src_size = info.memory.base_size;
   if ((info.memory.base_address & 0x1FFFFFFF) + uint64_t(src_size) > 0x20000000) return false;
   const uint8_t* guest = REX_KERNEL_MEMORY()->TranslatePhysical(info.memory.base_address);
+  if (!guest) return false;
   const uint32_t host_bpb = host.convert == Convert::kNone ? bpb : host.host_bytes_per_block;
   out->format = host.format;
   out->width = cols * bw;
@@ -392,9 +395,14 @@ bool Decode3D(const rex::graphics::TextureInfo& info, const HostFormat& host, ui
   return true;
 }
 
-// A decoded DXT1 texture without transparent texels -> B5G6R5 (half the memory of RGBA8; the
-// colour came from 5:6:5 endpoints, so only the interpolated texels lose a little precision).
+// A decoded DXT1 texture without transparent texels -> B5G6R5 (iOS/Metal optimization).
+// On Android and Mali GPUs, B5G6R5_UNORM is rejected or unsupported for optimal sampling,
+// so decoded DXT1 textures remain standard RenderFormat::R8G8B8A8_UNORM.
 static void PackOpaqueTo565(DecodedTexture* t) {
+#if !defined(__APPLE__) || !TARGET_OS_IPHONE
+  (void)t;
+  return;
+#else
   if (!REXCVAR_GET(gtav_native_decode_bc) || t->format != RenderFormat::R8G8B8A8_UNORM) return;
   for (uint32_t m = 0; m < t->mip_count; m++) {  // (not the zero padding between mips)
     const uint8_t* p = t->data.data() + t->mips[m].offset;
@@ -420,6 +428,7 @@ static void PackOpaqueTo565(DecodedTexture* t) {
   std::memcpy(t->mips, mips, sizeof(mips));
   t->data = std::move(packed);
   t->format = RenderFormat::B5G6R5_UNORM;
+#endif
 }
 
 bool DecodeGuestTexture(const uint32_t words[6], DecodedTexture* out) {
@@ -485,6 +494,7 @@ bool DecodeGuestTexture(const uint32_t words[6], DecodedTexture* out) {
                                         cols + ox, rows + oy, pitch_blocks, bpb_log2));
     if ((addr & 0x1FFFFFFF) + uint64_t(src_size) > 0x20000000) return false;
     const uint8_t* guest = mem->TranslatePhysical(addr);
+    if (!guest) return false;
 
     const uint32_t host_bpb = host.convert == Convert::kNone ? bpb : host.host_bytes_per_block;
     auto& mip = out->mips[m];

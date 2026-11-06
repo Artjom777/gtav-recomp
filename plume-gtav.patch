@@ -217,7 +217,7 @@ index ad63e0e..d12e59f 100644
          RenderFramebufferDesc() = default;
  
 diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
-index 58749c4..7e93215 100644
+index 58749c4..c697a25 100644
 --- a/plume_vulkan.cpp
 +++ b/plume_vulkan.cpp
 @@ -11,7 +11,16 @@
@@ -413,7 +413,81 @@ index 58749c4..7e93215 100644
  
          if (depthTargetFormat != VK_FORMAT_UNDEFINED) {
              depthReference.attachment = uint32_t(attachments.size());
-@@ -2330,33 +2409,75 @@ namespace plume {
+@@ -2071,6 +2150,21 @@ namespace plume {
+         }
+     }
+ 
++    static RenderFormat fromVk(VkFormat format) {
++        switch (format) {
++        case VK_FORMAT_R8G8B8A8_UNORM:
++            return RenderFormat::R8G8B8A8_UNORM;
++        case VK_FORMAT_B8G8R8A8_UNORM:
++            return RenderFormat::B8G8R8A8_UNORM;
++        case VK_FORMAT_R8G8B8A8_SRGB:
++            return RenderFormat::R8G8B8A8_UNORM;
++        case VK_FORMAT_B8G8R8A8_SRGB:
++            return RenderFormat::B8G8R8A8_UNORM;
++        default:
++            return RenderFormat::R8G8B8A8_UNORM;
++        }
++    }
++
+     // VulkanSwapChain
+ 
+     VulkanSwapChain::VulkanSwapChain(VulkanCommandQueue *commandQueue, const RenderSwapChainDesc &desc) {
+@@ -2210,23 +2304,38 @@ namespace plume {
+             }
+         }
+ 
+-        if (compatibleSurfaceFormats.empty()) {
++        if (surfaceFormatCount == 1 && surfaceFormats[0].format == VK_FORMAT_UNDEFINED) {
++            pickedSurfaceFormat.format = requestedFormat;
++            pickedSurfaceFormat.colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
++        } else if (!compatibleSurfaceFormats.empty()) {
++            for (const VkSurfaceFormatKHR &surfaceFormat : compatibleSurfaceFormats) {
++                if (surfaceFormat.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
++                    pickedSurfaceFormat = surfaceFormat;
++                    break;
++                }
++            }
++            if (pickedSurfaceFormat.format == VK_FORMAT_UNDEFINED) {
++                pickedSurfaceFormat = compatibleSurfaceFormats[0];
++            }
++        } else if (surfaceFormatCount > 0) {
++            // Fallback for mobile GPUs (Mali) where the driver might only offer BGRA8, SRGB or 10-bit HDR
++            for (uint32_t i = 0; i < surfaceFormatCount; i++) {
++                VkFormat f = surfaceFormats[i].format;
++                if (f == VK_FORMAT_R8G8B8A8_UNORM || f == VK_FORMAT_R8G8B8A8_SRGB ||
++                    f == VK_FORMAT_B8G8R8A8_UNORM || f == VK_FORMAT_B8G8R8A8_SRGB) {
++                    pickedSurfaceFormat = surfaceFormats[i];
++                    break;
++                }
++            }
++            if (pickedSurfaceFormat.format == VK_FORMAT_UNDEFINED) {
++                pickedSurfaceFormat = surfaceFormats[0];
++            }
++            this->desc.format = fromVk(pickedSurfaceFormat.format);
++        } else {
+             fprintf(stderr, "No compatible surface formats were found.\n");
+             return;
+         }
+ 
+-        // Pick the preferred color space, if not available, pick whatever first shows up on the list.
+-        for (const VkSurfaceFormatKHR &surfaceFormat : compatibleSurfaceFormats) {
+-            if (surfaceFormat.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+-                pickedSurfaceFormat = surfaceFormat;
+-                break;
+-            }
+-        }
+-
+-        if (pickedSurfaceFormat.format == VK_FORMAT_UNDEFINED) {
+-            pickedSurfaceFormat = compatibleSurfaceFormats[0];
+-        }
+-
+         // Sets the required presentation mode.
+         setVsyncEnabled(true);
+ 
+@@ -2330,33 +2439,75 @@ namespace plume {
          VkSurfaceCapabilitiesKHR surfaceCapabilities = {};
          vkGetPhysicalDeviceSurfaceCapabilitiesKHR(commandQueue->device->physicalDevice, surface, &surfaceCapabilities);
  
@@ -498,7 +572,7 @@ index 58749c4..7e93215 100644
  
          // Store the chosen present mode to identify later whether the swapchain needs to be recreated.
          createdPresentMode = requiredPresentMode;
-@@ -2472,8 +2593,10 @@ namespace plume {
+@@ -2472,8 +2623,10 @@ namespace plume {
  #   elif defined(PLUME_SDL_VULKAN_ENABLED)
          SDL_GetWindowSizeInPixels(desc.renderWindow, (int *)(&dstWidth), (int *)(&dstHeight));
  #   elif defined(__ANDROID__)
@@ -511,7 +585,7 @@ index 58749c4..7e93215 100644
  #   elif defined(__linux__)
          XWindowAttributes attributes;
          XGetWindowAttributes(desc.renderWindow.display, desc.renderWindow.window, &attributes);
-@@ -2548,8 +2671,11 @@ namespace plume {
+@@ -2548,8 +2701,11 @@ namespace plume {
              imageViews.emplace_back(colorAttachmentImageView);
  
              if (i == 0) {
@@ -525,7 +599,7 @@ index 58749c4..7e93215 100644
              }
  
              VkAttachmentReference reference = {};
-@@ -2560,7 +2686,7 @@ namespace plume {
+@@ -2560,7 +2716,7 @@ namespace plume {
              VkAttachmentDescription attachment = {};
              attachment.format = toVk(colorAttachmentFormat);
              attachment.samples = VkSampleCountFlagBits(colorAttachment->desc.multisampling.sampleCount);
@@ -534,7 +608,7 @@ index 58749c4..7e93215 100644
              attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
              attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
              attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-@@ -2619,6 +2745,16 @@ namespace plume {
+@@ -2619,6 +2775,16 @@ namespace plume {
          subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
          subpass.pColorAttachments = !colorReferences.empty() ? colorReferences.data() : nullptr;
          subpass.colorAttachmentCount = uint32_t(colorReferences.size());
@@ -551,7 +625,7 @@ index 58749c4..7e93215 100644
  
          if (desc.depthAttachment != nullptr || desc.depthAttachmentView != nullptr) {
              subpass.pDepthStencilAttachment = &depthReference;
-@@ -2636,6 +2772,11 @@ namespace plume {
+@@ -2636,6 +2802,11 @@ namespace plume {
              fprintf(stderr, "vkCreateRenderPass failed with error code 0x%X.\n", res);
              return;
          }
@@ -563,7 +637,7 @@ index 58749c4..7e93215 100644
          
          VkFramebufferCreateInfo fbInfo = {};
          fbInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-@@ -2658,11 +2799,65 @@ namespace plume {
+@@ -2658,11 +2829,65 @@ namespace plume {
              vkDestroyFramebuffer(device->vk, vk, nullptr);
          }
  
@@ -629,7 +703,7 @@ index 58749c4..7e93215 100644
      uint32_t VulkanFramebuffer::getWidth() const {
          return width;
      }
-@@ -2685,15 +2880,16 @@ namespace plume {
+@@ -2685,15 +2910,16 @@ namespace plume {
  
      // VulkanQueryPool
  
@@ -648,7 +722,7 @@ index 58749c4..7e93215 100644
          createInfo.queryCount = queryCount;
          
          VkResult res = vkCreateQueryPool(device->vk, &createInfo, nullptr, &vk);
-@@ -2711,11 +2907,17 @@ namespace plume {
+@@ -2711,11 +2937,17 @@ namespace plume {
  
      void VulkanQueryPool::queryResults() {
  	    VkResult res = vkGetQueryPoolResults(device->vk, vk, 0, uint32_t(results.size()), sizeof(uint64_t) * results.size(), results.data(), sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
@@ -667,7 +741,7 @@ index 58749c4..7e93215 100644
          // Conversion sourced from Godot Engine's Vulkan Rendering Driver.
          auto mult64to128 = [](uint64_t u, uint64_t v, uint64_t &h, uint64_t &l) {
              uint64_t u1 = (u & 0xffffffff);
-@@ -2800,6 +3002,8 @@ namespace plume {
+@@ -2800,6 +3032,8 @@ namespace plume {
  
      void VulkanCommandList::begin() {
          vkResetCommandBuffer(vk, 0);
@@ -676,7 +750,7 @@ index 58749c4..7e93215 100644
  
          VkCommandBufferBeginInfo beginInfo = {};
          beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-@@ -2810,6 +3014,11 @@ namespace plume {
+@@ -2810,6 +3044,11 @@ namespace plume {
              fprintf(stderr, "vkBeginCommandBuffer failed with error code 0x%X.\n", res);
              return;
          }
@@ -688,7 +762,7 @@ index 58749c4..7e93215 100644
      }
  
      void VulkanCommandList::end() {
-@@ -2866,15 +3075,73 @@ namespace plume {
+@@ -2866,15 +3105,73 @@ namespace plume {
          for (uint32_t i = 0; i < textureBarriersCount; i++) {
              const RenderTextureBarrier &textureBarrier = textureBarriers[i];
              VulkanTexture *interfaceTexture = static_cast<VulkanTexture *>(textureBarrier.texture);
@@ -766,7 +840,7 @@ index 58749c4..7e93215 100644
              imageMemoryBarrier.subresourceRange.levelCount = interfaceTexture->desc.mipLevels;
              imageMemoryBarrier.subresourceRange.layerCount = interfaceTexture->desc.arraySize;
              imageMemoryBarrier.subresourceRange.aspectMask = toAspectFlags(interfaceTexture->desc.format, interfaceTexture->desc.flags);
-@@ -2888,7 +3155,27 @@ namespace plume {
+@@ -2888,7 +3185,27 @@ namespace plume {
              return;
          }
  
@@ -794,21 +868,91 @@ index 58749c4..7e93215 100644
      }
  
      void VulkanCommandList::dispatch(uint32_t threadGroupCountX, uint32_t threadGroupCountY, uint32_t threadGroupCountZ) {
-@@ -3007,6 +3294,13 @@ namespace plume {
+@@ -2946,23 +3263,31 @@ namespace plume {
+     }
+ 
+     void VulkanCommandList::setPipeline(const RenderPipeline *pipeline) {
+-        assert(pipeline != nullptr);
++        if (pipeline == nullptr) {
++            return;
++        }
+ 
+         const VulkanPipeline *interfacePipeline = static_cast<const VulkanPipeline *>(pipeline);
+         switch (interfacePipeline->type) {
+         case VulkanPipeline::Type::Compute: {
+             const VulkanComputePipeline *computePipeline = static_cast<const VulkanComputePipeline *>(interfacePipeline);
+-            vkCmdBindPipeline(vk, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline->vk);
++            if (computePipeline->vk != VK_NULL_HANDLE) {
++                vkCmdBindPipeline(vk, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline->vk);
++            }
+             break;
+         }
+         case VulkanPipeline::Type::Graphics: {
+             const VulkanGraphicsPipeline *graphicsPipeline = static_cast<const VulkanGraphicsPipeline *>(interfacePipeline);
+-            vkCmdBindPipeline(vk, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline->vk);
++            if (graphicsPipeline->vk != VK_NULL_HANDLE) {
++                vkCmdBindPipeline(vk, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline->vk);
++            }
+             break;
+         }
+         case VulkanPipeline::Type::Raytracing: {
+             const VulkanRaytracingPipeline *raytracingPipeline = static_cast<const VulkanRaytracingPipeline *>(interfacePipeline);
+-            vkCmdBindPipeline(vk, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, raytracingPipeline->vk);
++            if (raytracingPipeline->vk != VK_NULL_HANDLE) {
++                vkCmdBindPipeline(vk, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, raytracingPipeline->vk);
++            }
+             break;
+         }
+         default:
+@@ -2972,14 +3297,13 @@ namespace plume {
+     }
+ 
+     void VulkanCommandList::setComputePipelineLayout(const RenderPipelineLayout *pipelineLayout) {
+-        assert(pipelineLayout != nullptr);
++        if (pipelineLayout == nullptr) return;
+ 
+         activeComputePipelineLayout = static_cast<const VulkanPipelineLayout *>(pipelineLayout);
+     }
+ 
+     void VulkanCommandList::setComputePushConstants(uint32_t rangeIndex, const void *data, uint32_t offset, uint32_t size) {
+-        assert(activeComputePipelineLayout != nullptr);
+-        assert(rangeIndex < activeComputePipelineLayout->pushConstantRanges.size());
++        if (!activeComputePipelineLayout || rangeIndex >= activeComputePipelineLayout->pushConstantRanges.size()) return;
+         
+         const VkPushConstantRange &range = activeComputePipelineLayout->pushConstantRanges[rangeIndex];
+         vkCmdPushConstants(vk, activeComputePipelineLayout->vk, range.stageFlags & VK_SHADER_STAGE_COMPUTE_BIT, range.offset + offset, size == 0 ? range.size : size, data);
+@@ -2990,14 +3314,13 @@ namespace plume {
+     }
+ 
+     void VulkanCommandList::setGraphicsPipelineLayout(const RenderPipelineLayout *pipelineLayout) {
+-        assert(pipelineLayout != nullptr);
++        if (pipelineLayout == nullptr) return;
+ 
+         activeGraphicsPipelineLayout = static_cast<const VulkanPipelineLayout *>(pipelineLayout);
+     }
+ 
+     void VulkanCommandList::setGraphicsPushConstants(uint32_t rangeIndex, const void *data, uint32_t offset, uint32_t size) {
+-        assert(activeGraphicsPipelineLayout != nullptr);
+-        assert(rangeIndex < activeGraphicsPipelineLayout->pushConstantRanges.size());
++        if (!activeGraphicsPipelineLayout || rangeIndex >= activeGraphicsPipelineLayout->pushConstantRanges.size()) return;
+ 
+         const VkPushConstantRange &range = activeGraphicsPipelineLayout->pushConstantRanges[rangeIndex];
+         vkCmdPushConstants(vk, activeGraphicsPipelineLayout->vk, range.stageFlags & VK_SHADER_STAGE_ALL_GRAPHICS, range.offset + offset, size == 0 ? range.size : size, data);
+@@ -3007,6 +3330,13 @@ namespace plume {
          setDescriptorSet(VK_PIPELINE_BIND_POINT_GRAPHICS, activeGraphicsPipelineLayout, descriptorSet, setIndex);
      }
  
 +    void VulkanCommandList::setGraphicsDescriptorSetDynamic(RenderDescriptorSet *descriptorSet, uint32_t setIndex, const uint32_t *dynamicOffsets, uint32_t dynamicOffsetCount) {
-+        assert(activeGraphicsPipelineLayout != nullptr);
-+        assert(descriptorSet != nullptr);
++        if (!activeGraphicsPipelineLayout || !descriptorSet) return;
 +        const VulkanDescriptorSet *interfaceSet = static_cast<const VulkanDescriptorSet *>(descriptorSet);
++        if (interfaceSet->vk == VK_NULL_HANDLE || activeGraphicsPipelineLayout->vk == VK_NULL_HANDLE) return;
 +        vkCmdBindDescriptorSets(vk, VK_PIPELINE_BIND_POINT_GRAPHICS, activeGraphicsPipelineLayout->vk, setIndex, 1, &interfaceSet->vk, dynamicOffsetCount, dynamicOffsets);
 +    }
 +
      void VulkanCommandList::setGraphicsRootDescriptor(RenderBufferReference bufferReference, uint32_t rootDescriptorIndex) {
          assert(false && "Root descriptors are not supported in Vulkan.");
      }
-@@ -3104,6 +3398,7 @@ namespace plume {
+@@ -3104,6 +3434,7 @@ namespace plume {
  
      void VulkanCommandList::setFramebuffer(const RenderFramebuffer *framebuffer) {
          endActiveRenderPass();
@@ -816,7 +960,7 @@ index 58749c4..7e93215 100644
  
          if (framebuffer != nullptr) {
              const VulkanFramebuffer *interfaceFramebuffer = static_cast<const VulkanFramebuffer *>(framebuffer);
-@@ -3150,6 +3445,16 @@ namespace plume {
+@@ -3150,6 +3481,16 @@ namespace plume {
          assert(attachmentIndex < targetFramebuffer->colorAttachments.size());
          assert((clearRectsCount == 0) || (clearRects != nullptr));
  
@@ -833,7 +977,7 @@ index 58749c4..7e93215 100644
          checkActiveRenderPass();
  
          thread_local std::vector<VkClearRect> rectVector;
-@@ -3170,6 +3475,19 @@ namespace plume {
+@@ -3170,6 +3511,19 @@ namespace plume {
          assert(targetFramebuffer != nullptr);
          assert((clearRectsCount == 0) || (clearRects != nullptr));
  
@@ -853,7 +997,7 @@ index 58749c4..7e93215 100644
          checkActiveRenderPass();
  
          thread_local std::vector<VkClearRect> rectVector;
-@@ -3488,6 +3806,8 @@ namespace plume {
+@@ -3488,6 +3842,8 @@ namespace plume {
      void VulkanCommandList::resetQueryPool(const RenderQueryPool *queryPool, uint32_t queryFirstIndex, uint32_t queryCount) {
          assert(queryPool != nullptr);
  
@@ -862,7 +1006,7 @@ index 58749c4..7e93215 100644
          const VulkanQueryPool *interfaceQueryPool = static_cast<const VulkanQueryPool *>(queryPool);
          vkCmdResetQueryPool(vk, interfaceQueryPool->vk, queryFirstIndex, queryCount);
      }
-@@ -3499,6 +3819,22 @@ namespace plume {
+@@ -3499,6 +3855,22 @@ namespace plume {
          vkCmdWriteTimestamp(vk, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, interfaceQueryPool->vk, queryIndex);
      }
  
@@ -885,7 +1029,7 @@ index 58749c4..7e93215 100644
      void VulkanCommandList::checkActiveRenderPass() {
          assert(targetFramebuffer != nullptr);
          
-@@ -3509,12 +3845,68 @@ namespace plume {
+@@ -3509,12 +3881,68 @@ namespace plume {
              beginInfo.framebuffer = targetFramebuffer->vk;
              beginInfo.renderArea.extent.width = targetFramebuffer->width;
              beginInfo.renderArea.extent.height = targetFramebuffer->height;
@@ -915,7 +1059,7 @@ index 58749c4..7e93215 100644
 +        const uint32_t rate = (width << 4) | height;
 +        if (!queue->device->fragmentShadingRateSupported || rate == shadingRate) {
 +            return;
-         }
++        }
 +        shadingRate = rate;
 +        const VkExtent2D size = { width, height };
 +        const VkFragmentShadingRateCombinerOpKHR ops[2] = { VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR, VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR };
@@ -926,7 +1070,7 @@ index 58749c4..7e93215 100644
 +    bool VulkanCommandList::deferClear(const RenderRect *clearRects, uint32_t clearRectsCount) {
 +        if (!g_clearLoadOps || targetFramebuffer == nullptr) {
 +            return false;
-+        }
+         }
 +        if (activeRenderPass != VK_NULL_HANDLE) {
 +            g_statClearsInPass++;
 +            return false;
@@ -955,7 +1099,21 @@ index 58749c4..7e93215 100644
          if (activeRenderPass != VK_NULL_HANDLE) {
              vkCmdEndRenderPass(vk);
              activeRenderPass = VK_NULL_HANDLE;
-@@ -3668,7 +4060,22 @@ namespace plume {
+@@ -3522,11 +3950,10 @@ namespace plume {
+     }
+ 
+     void VulkanCommandList::setDescriptorSet(VkPipelineBindPoint bindPoint, const VulkanPipelineLayout *pipelineLayout, const RenderDescriptorSet *descriptorSet, uint32_t setIndex) {
+-        assert(pipelineLayout != nullptr);
+-        assert(descriptorSet != nullptr);
+-        assert(setIndex < pipelineLayout->descriptorSetLayouts.size());
++        if (!pipelineLayout || !descriptorSet || setIndex >= pipelineLayout->descriptorSetLayouts.size()) return;
+ 
+         const VulkanDescriptorSet *interfaceSet = static_cast<const VulkanDescriptorSet *>(descriptorSet);
++        if (interfaceSet->vk == VK_NULL_HANDLE || pipelineLayout->vk == VK_NULL_HANDLE) return;
+         vkCmdBindDescriptorSets(vk, bindPoint, pipelineLayout->vk, setIndex, 1, &interfaceSet->vk, 0, nullptr);
+     }
+ 
+@@ -3668,7 +4095,22 @@ namespace plume {
          assert(fence != nullptr);
  
          VulkanCommandFence *interfaceFence = static_cast<VulkanCommandFence *>(fence);
@@ -979,13 +1137,22 @@ index 58749c4..7e93215 100644
          if (res != VK_SUCCESS) {
              fprintf(stderr, "vkWaitForFences failed with error code 0x%X.\n", res);
              return;
-@@ -3916,6 +4323,18 @@ namespace plume {
+@@ -3916,6 +4358,27 @@ namespace plume {
              featuresChain = &portabilityFeatures;
          }
  
++        std::string devNameLower = physicalDeviceProperties.deviceName;
++        for (char& c : devNameLower) c = std::tolower(c);
 +        const bool isMali = (physicalDeviceProperties.vendorID == 0x13B5) ||
-+                            (std::string(physicalDeviceProperties.deviceName).find("Mali") != std::string::npos) ||
-+                            (std::string(physicalDeviceProperties.deviceName).find("Immortal") != std::string::npos);
++                            (devNameLower.find("mali") != std::string::npos) ||
++                            (devNameLower.find("immortalis") != std::string::npos) ||
++                            (devNameLower.find("immortal") != std::string::npos);
++
++        if (isMali) {
++            supportedOptionalExtensions.erase(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME);
++            supportedOptionalExtensions.erase(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME);
++            supportedOptionalExtensions.erase(VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME);
++        }
 +
 +        VkPhysicalDeviceFragmentShadingRateFeaturesKHR shadingRateFeatures = {};
 +        const bool shadingRateFound = !isMali && supportedOptionalExtensions.find(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME) != supportedOptionalExtensions.end() && supportedOptionalExtensions.find(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME) != supportedOptionalExtensions.end();
@@ -998,7 +1165,7 @@ index 58749c4..7e93215 100644
          VkPhysicalDeviceRayTracingPipelineFeaturesKHR rayTracingPipelineFeatures = {};
          VkPhysicalDeviceAccelerationStructureFeaturesKHR accelerationStructureFeatures = {};
          const bool rayTracingFound = (supportedOptionalExtensions.find(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) != supportedOptionalExtensions.end()) && (supportedOptionalExtensions.find(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) != supportedOptionalExtensions.end());
-@@ -3933,6 +4352,7 @@ namespace plume {
+@@ -3933,6 +4396,7 @@ namespace plume {
          deviceFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
          deviceFeatures.pNext = featuresChain;
          vkGetPhysicalDeviceFeatures2(physicalDevice, &deviceFeatures);
@@ -1006,7 +1173,7 @@ index 58749c4..7e93215 100644
  
          // Check for properties.
          if (rayTracingFound) {
-@@ -4003,6 +4423,15 @@ namespace plume {
+@@ -4003,6 +4467,15 @@ namespace plume {
              createDeviceChain = &portabilityFeatures;
          }
  
@@ -1022,7 +1189,7 @@ index 58749c4..7e93215 100644
          // Retrieve the information for the queue families.
          uint32_t queueFamilyCount = 0;
          vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamilyCount, nullptr);
-@@ -4094,6 +4523,22 @@ namespace plume {
+@@ -4094,6 +4567,22 @@ namespace plume {
              }
          }
  
@@ -1045,7 +1212,7 @@ index 58749c4..7e93215 100644
          VmaVulkanFunctions vmaFunctions = {};
          vmaFunctions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
          vmaFunctions.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
-@@ -4122,6 +4567,11 @@ namespace plume {
+@@ -4122,6 +4611,11 @@ namespace plume {
          allocatorInfo.pVulkanFunctions = &vmaFunctions;
          allocatorInfo.instance = renderInterface->instance;
          allocatorInfo.vulkanApiVersion = renderInterface->appInfo.apiVersion;
@@ -1057,7 +1224,7 @@ index 58749c4..7e93215 100644
  
          res = vmaCreateAllocator(&allocatorInfo, &allocator);
          if (res != VK_SUCCESS) {
-@@ -4205,12 +4655,22 @@ namespace plume {
+@@ -4205,12 +4699,22 @@ namespace plume {
          return std::make_unique<VulkanSampler>(this, desc);
      }
  
@@ -1082,7 +1249,7 @@ index 58749c4..7e93215 100644
      }
  
      std::unique_ptr<RenderPipeline> VulkanDevice::createRaytracingPipeline(const RenderRaytracingPipelineDesc &desc, const RenderPipeline *previousPipeline) {
-@@ -4257,6 +4717,10 @@ namespace plume {
+@@ -4257,6 +4761,10 @@ namespace plume {
          return std::make_unique<VulkanQueryPool>(this, queryCount);
      }
  
@@ -1093,7 +1260,7 @@ index 58749c4..7e93215 100644
      void VulkanDevice::setBottomLevelASBuildInfo(RenderBottomLevelASBuildInfo &buildInfo, const RenderBottomLevelASMesh *meshes, uint32_t meshCount, bool preferFastBuild, bool preferFastTrace) {
          assert(meshes != nullptr);
          assert(meshCount > 0);
-@@ -4465,6 +4929,11 @@ namespace plume {
+@@ -4465,6 +4973,11 @@ namespace plume {
      void VulkanDevice::release() {
          nullBuffer = nullptr; // force destruction before destroying allocator
  
@@ -1105,7 +1272,7 @@ index 58749c4..7e93215 100644
          if (allocator != VK_NULL_HANDLE) {
              vmaDestroyAllocator(allocator);
              allocator = VK_NULL_HANDLE;
-@@ -4497,7 +4966,27 @@ namespace plume {
+@@ -4497,7 +5010,27 @@ namespace plume {
  #else
      VulkanInterface::VulkanInterface() {
  #endif
@@ -1133,7 +1300,7 @@ index 58749c4..7e93215 100644
          if (res != VK_SUCCESS) {
              fprintf(stderr, "volkInitialize failed with error code 0x%X.\n", res);
              return;
-@@ -4668,6 +5157,26 @@ namespace plume {
+@@ -4668,6 +5201,26 @@ namespace plume {
          return instance != nullptr;
      }
  

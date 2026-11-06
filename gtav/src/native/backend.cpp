@@ -436,6 +436,7 @@ struct StreamJob {
 };
 
 void ConvertStream(const StreamJob& j) {
+  if (!j.guest || !j.out || !j.vertices || !j.stride) return;
   const uint32_t stride = j.stride, vertices = j.vertices;
   const uint8_t* guest = j.guest;
   uint8_t* out = j.out;
@@ -2505,6 +2506,7 @@ struct Backend::Impl {
       REXLOG_INFO("[native] ARM Mali GPU detected ({}): applying Mali-G720 compatibility profile", dev_name);
       rs = 0.5f;
       fragment_barriers = false;
+      use_fetch_resolves = false;
     } else {
       rs = float(std::clamp(REXCVAR_GET(gtav_native_render_scale), 0.5, 1.0));
     }
@@ -2907,6 +2909,7 @@ struct Backend::Impl {
   template <class F>
   const RenderBuffer* GuestBuffer(uint64_t key, uint32_t physical, const uint8_t* guest, uint64_t guest_size,
                                   uint64_t host_size, const F& convert) {
+    if (!guest || !guest_size || !host_size) return nullptr;
     auto& memo = buffer_memo[(key ^ (key >> 29)) & (buffer_memo.size() - 1)];
     if (memo.first != key || !memo.second) memo = {key, &buffers[key]};
     auto& b = *memo.second;
@@ -3812,6 +3815,7 @@ struct Backend::Impl {
 
   // Big-endian 16- or 32-bit indices to host order, 16 bytes at a time.
   GTAV_SWAP16_TARGET static void SwapIndices(uint8_t* out, const uint8_t* in, uint32_t bytes, uint32_t unit) {
+    if (!out || !in || !bytes || !unit) return;
     uint32_t i = 0;
     for (; i + 16 <= bytes; i += 16) Swap16Bytes(out + i, in + i, unit);
     for (; i + unit <= bytes; i += unit)
@@ -4371,6 +4375,10 @@ struct Backend::Impl {
       const uint8_t* guest = inline_data ? f.At(d.inline_vertices)
                              : snapped   ? f.At(d.snap_stream[s])
                                          : mem->TranslatePhysical(sb.address + sb.offset);
+      if (!guest) {
+        stat_skipped++;
+        return;
+      }
       uint64_t key = Hash(&sb, sizeof(sb), decl.stream_hash[s]);
       StreamJob job;
       job.guest = guest, job.stride = stride, job.host_stride = host_stride, job.vertices = vertices;
@@ -4429,9 +4437,10 @@ struct Backend::Impl {
         if (!raw[e.stream]) {
           uint32_t bytes = inline_data ? d.inline_size : sb.size > sb.offset && sb.address ? sb.size - sb.offset : 0;
           if (!bytes) continue;
+          const uint8_t* src = inline_data ? f.At(d.inline_vertices) : mem->TranslatePhysical(sb.address + sb.offset);
+          if (!src) continue;
           auto a = upload.Allocate(bytes, 16);
-          std::memcpy(a.cpu, inline_data ? f.At(d.inline_vertices) : mem->TranslatePhysical(sb.address + sb.offset),
-                      bytes);
+          std::memcpy(a.cpu, src, bytes);
           raw[e.stream] = a.gpu;
         }
         if (dumping) {
@@ -4746,7 +4755,12 @@ struct Backend::Impl {
         ib_ref = RenderBufferReference(a.buffer, a.offset);
       } else {
         uint64_t key = Hash(&d.index_address, 4, d.index_size ^ (uint64_t(unit) << 40));
-        ib_ref = RenderBufferReference(GuestBuffer(key, d.index_address, guest, d.index_size, d.index_size, swap));
+        const RenderBuffer* gb = GuestBuffer(key, d.index_address, guest, d.index_size, d.index_size, swap);
+        if (!gb) {
+          stat_skipped++;
+          return;
+        }
+        ib_ref = RenderBufferReference(gb);
       }
       RenderIndexBufferView view(ib_ref, index_bytes, d.index32 ? RenderFormat::R32_UINT : RenderFormat::R16_UINT);
       BindIndexBuffer(list, view);
@@ -5702,7 +5716,12 @@ struct Backend::Impl {
       list->setViewports(RenderViewport(float(spx), float(spy), float(sx2 - sx1), float(sy2 - sy1)));
       list->setScissors(RenderRect(spx, spy, spx + sx2 - sx1, spy + sy2 - sy1));
       list->setGraphicsPipelineLayout(layout.get());
-      list->setPipeline(depth_resolve ? depth_copy_pipeline.get() : ResolvePipeline(dst_format));
+      auto resolvePipe = depth_resolve ? depth_copy_pipeline.get() : ResolvePipeline(dst_format);
+      if (!resolvePipe) {
+        if (!in_pass) Transition(list, dst.texture.get(), RenderTextureLayout::SHADER_READ);
+        return;
+      }
+      list->setPipeline(resolvePipe);
       list->setGraphicsDescriptorSet(texture_set.get(), 0);
       list->setGraphicsDescriptorSet(texture_set.get(), 1);
       list->setGraphicsDescriptorSet(texture_set.get(), 2);
@@ -6028,8 +6047,8 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
 void Backend::BeginFrame(uint32_t slot) {
   impl_->slot = slot;
   impl_->defer_clears = REXCVAR_GET(gtav_native_defer_clears);
-  impl_->use_fetch_resolves = REXCVAR_GET(gtav_native_fetch_resolves);
-  impl_->fragment_barriers = REXCVAR_GET(gtav_native_fragment_barriers);
+  impl_->use_fetch_resolves = impl_->is_mali ? false : REXCVAR_GET(gtav_native_fetch_resolves);
+  impl_->fragment_barriers = impl_->is_mali ? false : REXCVAR_GET(gtav_native_fragment_barriers);
   impl_->slot_targets = REXCVAR_GET(gtav_native_slot_targets);  // live; EndFrame swaps the same way
   impl_->SwapFrameState(impl_->parked[slot]);
 }
@@ -6041,6 +6060,7 @@ void Backend::SetMali(bool mali) {
     impl_->is_mali = mali;
     if (mali) {
       impl_->rs = 0.5f;
+      impl_->use_fetch_resolves = false;
       impl_->fragment_barriers = false;
     }
   }
