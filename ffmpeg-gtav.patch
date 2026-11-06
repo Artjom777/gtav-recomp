@@ -2,7 +2,7 @@ diff --git a/libavcodec/wmaprodec.c b/libavcodec/wmaprodec.c
 index 704c0a4..85ae853 100644
 --- a/libavcodec/wmaprodec.c
 +++ b/libavcodec/wmaprodec.c
-@@ -2025,6 +2025,33 @@ static av_cold int xmaframes_decode_init(AVCodecContext* avctx)
+@@ -2025,6 +2025,34 @@ static av_cold int xmaframes_decode_init(AVCodecContext* avctx)
      return decode_init(s, avctx, 0);
  }
  
